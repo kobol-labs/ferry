@@ -299,14 +299,25 @@ fn test_constraint_ledger_verifies_anchors() {
         ..Default::default()
     };
     let condenser = ContextCondenser::new(config);
-    let mut stats = ferry::condenser::CondensationStats::default();
 
     let raw = "Auditing /var/log/detainer.log at https://github.com:443\nDuplicate notice\nDuplicate notice\nDuplicate notice\nDO NOT delete /etc/shadow";
-    let cleaned = condenser.clean_tool_text_with_stats(raw, &mut stats);
+    let mut body = json!({
+        "messages": [
+            { "role": "system", "content": "You are a scanner." },
+            { "role": "user", "content": "Scan start" },
+            { "role": "assistant", "content": "Running tool." },
+            { "role": "tool", "content": raw }
+        ]
+    });
+
+    let stats = condenser.condense(&mut body);
 
     // Ledger check passed because path, URL, port, and negation are preserved
     assert_eq!(stats.ledger_checks_passed, 1);
     assert_eq!(stats.ledger_vetoed_count, 0);
+
+    let msgs = body["messages"].as_array().unwrap();
+    let cleaned = msgs[3]["content"].as_str().unwrap();
     assert!(cleaned.contains("/var/log/detainer.log"));
     assert!(cleaned.contains("https://github.com:443"));
     assert!(cleaned.contains("DO NOT delete /etc/shadow"));
@@ -332,10 +343,42 @@ fn test_constraint_ledger_veto_restores_verbatim() {
     // If candidate text lost the anchor "/var/run/secrets/token", verify_ledger MUST return false
     let bad_condensed = "Audit token and do NOT bypass https://internal.corp:8443";
     assert!(!condenser.verify_ledger(&anchors, bad_condensed));
+    assert_eq!(condenser.find_missing_anchor(&anchors, bad_condensed), Some("/var/run/secrets/token".to_string()));
 
     // If candidate text preserves all anchors, verify_ledger returns true
     let good_condensed = "Audit /var/run/secrets/token and do not bypass https://internal.corp:8443";
     assert!(condenser.verify_ledger(&anchors, good_condensed));
+}
+
+#[test]
+fn test_constraint_ledger_veto_in_condense() {
+    let config = CondenserConfig {
+        enabled: true,
+        enable_constraint_ledger: true,
+        truncate_tool_outputs: true,
+        recent_max_tool_chars: 50, // Truncation triggers on recent active turn
+        head_lines: 1,
+        tail_lines: 1,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    let raw = "Header\nMiddle line with CRITICAL /var/run/secrets/token\nFooter line";
+    let mut body = json!({
+        "messages": [
+            { "role": "system", "content": "You are a scanner." },
+            { "role": "user", "content": "Scan start" },
+            { "role": "assistant", "content": "Running tool." },
+            { "role": "tool", "content": raw }
+        ]
+    });
+
+    let stats = condenser.condense(&mut body);
+
+    // Because truncation would lose the anchor in the middle, ledger vetoes and restores verbatim
+    assert_eq!(stats.ledger_vetoed_count, 1);
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs[3]["content"].as_str().unwrap(), raw);
 }
 
 #[test]

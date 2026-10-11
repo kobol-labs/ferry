@@ -156,15 +156,7 @@ impl ContextCondenser {
                         if !is_historical {
                             // In the recent active turn, 100% of critical anchors must survive
                             let anchors = extract_critical_anchors(&initial_text);
-                            let mut missing_anchor = None;
-                            for anchor in &anchors {
-                                if !processed.contains(anchor) {
-                                    missing_anchor = Some(anchor.clone());
-                                    break;
-                                }
-                            }
-
-                            if let Some(missing) = missing_anchor {
+                            if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
                                 warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
                                 stats.ledger_vetoed_count += 1;
                                 processed = initial_text.clone();
@@ -233,13 +225,24 @@ impl ContextCondenser {
         extract_critical_anchors(text)
     }
 
-    pub fn verify_ledger(&self, anchors: &[String], text: &str) -> bool {
+    pub fn find_missing_anchor(&self, anchors: &[String], text: &str) -> Option<String> {
+        let text_upper = text.to_ascii_uppercase();
         for anchor in anchors {
-            if !text.contains(anchor) {
-                return false;
+            if anchor.starts_with('/') {
+                if !text.contains(anchor) {
+                    return Some(anchor.clone());
+                }
+            } else {
+                if !text.contains(anchor) && !text_upper.contains(&anchor.to_ascii_uppercase()) {
+                    return Some(anchor.clone());
+                }
             }
         }
-        true
+        None
+    }
+
+    pub fn verify_ledger(&self, anchors: &[String], text: &str) -> bool {
+        self.find_missing_anchor(anchors, text).is_none()
     }
 
     fn clean_single_chunk(&self, input: &str, stats: &mut CondensationStats) -> String {
