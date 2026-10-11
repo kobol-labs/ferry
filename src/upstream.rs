@@ -105,6 +105,17 @@ impl UpstreamClient {
                         );
                         self.handle_upstream_response(resp, is_stream, true)
                     }
+                    Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
+                        let status = resp.status();
+                        let duration = start.elapsed();
+                        warn!(
+                            req_id = req_id,
+                            status = status.as_u16(),
+                            duration_ms = duration.as_millis(),
+                            "Local provider returned client error (forwarding to client, not failing over)"
+                        );
+                        self.handle_upstream_response(resp, is_stream, true)
+                    }
                     Ok(resp) => {
                         let status = resp.status();
                         let error_text = resp.text().await.unwrap_or_default();
@@ -112,7 +123,7 @@ impl UpstreamClient {
                             req_id = req_id,
                             status = status.as_u16(),
                             error = %error_text,
-                            "Local provider returned error. Failing over to cloud..."
+                            "Local provider returned server error. Failing over to cloud..."
                         );
                         self.metrics.dec_local();
                         self.metrics.inc_failover();

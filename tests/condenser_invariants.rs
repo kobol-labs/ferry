@@ -420,3 +420,91 @@ fn test_prefix_cache_alignment_preserves_initial_turn_bytes() {
     assert_eq!(msgs[1]["content"].as_str().unwrap(), initial_user_prompt);
 }
 
+#[test]
+fn test_multibyte_utf8_truncation_no_panic() {
+    let config = CondenserConfig {
+        enabled: true,
+        truncate_tool_outputs: true,
+        keep_recent_turns: 0,
+        max_tool_chars: 100,
+        head_lines: 5,
+        tail_lines: 5,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    // Multi-byte Chinese chars on a single line: byte offset 300 will land inside a 3-byte char
+    let raw = "a".to_string() + &"测试中文日志数据".repeat(100);
+    let mut body = json!({
+        "messages": [
+            { "role": "system", "content": "System" },
+            { "role": "user", "content": "Start" },
+            { "role": "assistant", "content": "Run" },
+            { "role": "tool", "content": raw }
+        ]
+    });
+
+    // Invariant: this MUST NOT panic on non-char-boundary slicing
+    let stats = condenser.condense(&mut body);
+    assert!(stats.tool_outputs_truncated >= 1);
+    let msgs = body["messages"].as_array().unwrap();
+    let content = msgs[3]["content"].as_str().unwrap();
+    assert!(content.contains("Ferry Proxy: truncated"));
+}
+
+#[test]
+fn test_strip_multiple_think_tags() {
+    let raw = "<think>first thought</think>Middle text <think>second thought</think>Final answer.";
+    let stripped = ferry::condenser::strip_think_tags(raw).unwrap();
+    assert_eq!(stripped, "Middle text Final answer.");
+}
+
+#[test]
+fn test_strip_unclosed_think_tag() {
+    let raw = "Intro text <think>Unfinished thoughts cut off by token limit";
+    let stripped = ferry::condenser::strip_think_tags(raw).unwrap();
+    assert_eq!(stripped, "Intro text");
+}
+
+#[test]
+fn test_developer_role_prefix_protected() {
+    let config = CondenserConfig {
+        enabled: true,
+        protect_static_prefix: true,
+        drop_historical_reasoning: true,
+        truncate_tool_outputs: true,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    let dev_content = "You are a developer system prompt.\n<think>do not remove</think>\n{\n  \"rule\": 1\n}";
+    let mut body = json!({
+        "messages": [
+            { "role": "developer", "content": dev_content },
+            { "role": "user", "content": "Hello" }
+        ]
+    });
+
+    let _stats = condenser.condense(&mut body);
+    let msgs = body["messages"].as_array().unwrap();
+    // Invariant: developer role is 100% byte-for-byte protected
+    assert_eq!(msgs[0]["content"].as_str().unwrap(), dev_content);
+}
+
+#[test]
+fn test_security_anchors_cve_ip_port_and_configs() {
+    let config = CondenserConfig::default();
+    let condenser = ContextCondenser::new(config);
+
+    let text = "Discovered CVE-2024-38063 and GHSA-42x-99 on 192.168.1.50:8080. Open port 443/tcp in Dockerfile and Cargo.toml.";
+    let anchors = condenser.extract_critical_anchors(text);
+
+    assert!(anchors.iter().any(|a| a == "CVE-2024-38063"));
+    assert!(anchors.iter().any(|a| a == "GHSA-42x-99"));
+    assert!(anchors.iter().any(|a| a == "192.168.1.50:8080"));
+    assert!(anchors.iter().any(|a| a == "443/tcp"));
+    assert!(anchors.iter().any(|a| a == "Dockerfile"));
+    assert!(anchors.iter().any(|a| a == "Cargo.toml"));
+}
+
+

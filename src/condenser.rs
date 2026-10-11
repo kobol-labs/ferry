@@ -74,9 +74,9 @@ impl ContextCondenser {
             let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
 
             // CRITICAL INVARIANT: Prefix-cache alignment guard.
-            // Never mutate system rules or user prompts across ANY turn.
+            // Never mutate system rules, developer messages, or user prompts across ANY turn.
             // Preserves KV cache prefixes to ensure 90%+ cache hit rate on local GPU and cloud.
-            if self.config.protect_static_prefix && (role == "system" || role == "user") {
+            if self.config.protect_static_prefix && (role == "system" || role == "user" || role == "developer") {
                 continue;
             }
 
@@ -355,28 +355,44 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
             continue;
         }
 
-        // URLs
+        // 1. URLs
         if clean.starts_with("http://") || clean.starts_with("https://") {
             anchors.push(clean.to_string());
             continue;
         }
 
-        // File paths with directories
+        // 2. CVE & Advisory identifiers (e.g., CVE-2024-1234, GHSA-xxxx-xxxx)
+        if upper.starts_with("CVE-") || upper.starts_with("GHSA-") {
+            anchors.push(clean.to_string());
+            continue;
+        }
+
+        // 3. File paths with directories
         if (clean.starts_with('/') && clean.contains('/'))
-            || (clean.contains('/') && (clean.ends_with(".go") || clean.ends_with(".rs") || clean.ends_with(".py") || clean.ends_with(".js") || clean.ends_with(".json") || clean.ends_with(".toml") || clean.ends_with(".yaml") || clean.ends_with(".yml") || clean.ends_with(".sql") || clean.ends_with(".sh"))) {
+            || (clean.contains('/') && (clean.ends_with(".go") || clean.ends_with(".rs") || clean.ends_with(".py") || clean.ends_with(".js") || clean.ends_with(".ts") || clean.ends_with(".json") || clean.ends_with(".toml") || clean.ends_with(".yaml") || clean.ends_with(".yml") || clean.ends_with(".sql") || clean.ends_with(".sh"))) {
             anchors.push(clean.to_string());
             continue;
         }
 
-        // Port bindings
-        if clean.starts_with(':') && clean[1..].chars().all(|c| c.is_ascii_digit()) && clean.len() <= 6 {
+        // 4. Critical standalone configuration files
+        if clean == "Dockerfile" || clean == "Makefile" || clean == "Cargo.toml" || clean == "go.mod" || clean == "package.json" || clean == ".env" {
             anchors.push(clean.to_string());
             continue;
         }
 
-        // Security keywords and imperatives
-        let upper = clean.to_ascii_uppercase();
-        if upper == "CRITICAL" || upper == "CVSS" || upper == "CVE" || upper == "NOT" || upper == "NEVER" || upper == "MUST" || upper == "DENY" {
+        // 5. Host:Port, IPv4 addresses, and Port bindings (:8080, 8080/tcp)
+        let is_port_binding = clean.starts_with(':') && clean[1..].chars().all(|c| c.is_ascii_digit()) && clean.len() <= 6;
+        let is_port_proto = clean.contains("/tcp") || clean.contains("/udp");
+        let is_ipv4 = clean.split('.').count() == 4 && clean.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+        let is_host_port = clean.contains(':') && clean.split(':').count() == 2 && clean.split(':').nth(1).unwrap().chars().all(|c| c.is_ascii_digit());
+
+        if is_port_binding || is_port_proto || is_ipv4 || is_host_port {
+            anchors.push(clean.to_string());
+            continue;
+        }
+
+        // 6. Security keywords and imperatives
+        if upper == "CRITICAL" || upper == "CVSS" || upper == "HIGH" || upper == "NOT" || upper == "NEVER" || upper == "MUST" || upper == "DENY" || upper == "DO NOT" {
             anchors.push(clean.to_string());
             continue;
         }
@@ -385,37 +401,81 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
     anchors
 }
 
-/// Strips inline `<think>...</think>` tags
+/// Strips all inline `<think>...</think>` tags from assistant text
 pub fn strip_think_tags(text: &str) -> Option<String> {
     let open_tag = "<think>";
     let close_tag = "</think>";
 
-    let start = text.find(open_tag)?;
-    let end = text.find(close_tag)?;
-
-    if end <= start {
+    if !text.contains(open_tag) {
         return None;
     }
 
-    let before = &text[..start];
-    let after = &text[end + close_tag.len()..];
-    let combined = format!("{}{}", before.trim_end(), after);
-    Some(combined.trim().to_string())
+    let mut current = text.to_string();
+    let mut modified = false;
+
+    while let Some(start) = current.find(open_tag) {
+        if let Some(end_offset) = current[start..].find(close_tag) {
+            let end = start + end_offset + close_tag.len();
+            let before = &current[..start];
+            let after = &current[end..];
+            current = format!("{}{}", before.trim_end(), after);
+            modified = true;
+        } else {
+            // Unclosed <think> tag: strip from <think> to end of text
+            current = current[..start].trim_end().to_string();
+            modified = true;
+            break;
+        }
+    }
+
+    if modified {
+        Some(current.trim().to_string())
+    } else {
+        None
+    }
 }
 
-/// Truncates long tool content keeping head and tail lines with omission indicator
+fn safe_floor_char_boundary(s: &str, mut index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn safe_ceil_char_boundary(s: &str, mut index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    while index < s.len() && !s.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Truncates long tool content keeping head and tail lines with omission indicator.
+/// Guarantees 100% panic-freedom on multi-byte UTF-8 inputs.
 pub fn truncate_tool_content(text: &str, head_lines: usize, tail_lines: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= head_lines + tail_lines {
-        // Line count is small, do byte/char boundary truncation
-        let head_chars = 300.min(text.len() / 4);
-        let tail_chars = 300.min(text.len() / 4);
-        let dropped = text.len().saturating_sub(head_chars + tail_chars);
+        // Line count is small, do byte/char boundary truncation safely on UTF-8 boundaries
+        let head_target = 300.min(text.len() / 4);
+        let tail_target = 300.min(text.len() / 4);
+        let head_idx = safe_floor_char_boundary(text, head_target);
+        let tail_start = text.len().saturating_sub(tail_target);
+        let tail_idx = safe_ceil_char_boundary(text, tail_start);
+
+        let head_str = &text[..head_idx];
+        let tail_str = &text[tail_idx..];
+        let dropped = text.len().saturating_sub(head_str.len() + tail_str.len());
+
         return format!(
             "{}\n\n[... Ferry Proxy: truncated {} characters of earlier tool output ...]\n\n{}",
-            &text[..head_chars],
+            head_str,
             dropped,
-            &text[text.len() - tail_chars..]
+            tail_str
         );
     }
 

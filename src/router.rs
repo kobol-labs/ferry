@@ -40,6 +40,10 @@ impl Router {
                         }
                     }
                 }
+                // Handle OpenAI Responses format and dual-key tool outputs
+                if let Some(output) = msg.get("output").and_then(|o| o.as_str()) {
+                    char_count += output.len();
+                }
             }
         }
         (char_count as f64 / 3.0).ceil() as u64
