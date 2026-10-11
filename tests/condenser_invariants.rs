@@ -425,8 +425,8 @@ fn test_multibyte_utf8_truncation_no_panic() {
     let config = CondenserConfig {
         enabled: true,
         truncate_tool_outputs: true,
-        keep_recent_turns: 0,
         max_tool_chars: 100,
+        recent_max_tool_chars: 100,
         head_lines: 5,
         tail_lines: 5,
         ..Default::default()

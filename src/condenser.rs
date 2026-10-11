@@ -350,6 +350,8 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
 
     for token in text.split_whitespace() {
         let clean = token.trim_matches(|c: char| c == ',' || c == ';' || c == '(' || c == ')' || c == '"' || c == '\'' || c == '[' || c == ']' || c == '<' || c == '>');
+        let clean = clean.strip_suffix('.').unwrap_or(clean);
+        let clean = clean.strip_suffix(':').unwrap_or(clean);
 
         if clean.len() < 3 {
             continue;
@@ -420,7 +422,9 @@ pub fn strip_think_tags(text: &str) -> Option<String> {
             let end = start + end_offset + close_tag.len();
             let before = &current[..start];
             let after = &current[end..];
-            current = format!("{}{}", before.trim_end(), after);
+            let had_space = before.ends_with(char::is_whitespace) || after.starts_with(char::is_whitespace);
+            let sep = if had_space && !before.is_empty() && !after.is_empty() { " " } else { "" };
+            current = format!("{}{}{}", before.trim_end(), sep, after.trim_start());
             modified = true;
         } else {
             // Unclosed <think> tag: strip from <think> to end of text
