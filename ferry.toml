@@ -5,13 +5,16 @@ bind = "0.0.0.0:4000"
 api_base = "http://192.168.9.99:8080/v1"
 api_key = "sk-strata-stevegaming"
 model = "qwen3.8-flash-next-iq2_xs"
-max_slots = 3
-max_context_tokens = 65000
+max_slots = 2
+max_context_tokens = 128000
+total_kv_token_budget = 260000
+adaptive_squeezing = true
+adaptive_squeeze_ratio = 1.35
 timeout_secs = 90
 connect_timeout_secs = 3
 circuit_breaker_threshold = 3
 probe_interval_secs = 5
-queue_timeout_ms = 500
+queue_timeout_ms = 3500
 
 [cloud]
 api_base = "https://api.minimax.io/v1"

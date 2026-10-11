@@ -13,8 +13,9 @@ When running autonomous multi-agent swarms (e.g., Strix, Cursor agents, AutoGen)
 3. **Redundant History Bloat**: Past chain-of-thought `<think>` blocks and massive historical tool command outputs permanently inflate turns, wasting bandwidth, degrading inference speeds, and triggering unnecessary cloud spend.
 
 **Ferry** solves this by acting as an ultra-lean, OpenAI-compatible proxy between your clients and your models:
-* **Atomic Slot Reservation & Leak-Proof Lifecycle**: Atomic Compare-And-Swap (CAS) ensures hardware slots are never oversubscribed. Full RAII guards guarantee slots are immediately released even if a client disconnects, times out, or cancels mid-stream.
-* **Short Contention Queue**: Instead of immediately dumping bursts to expensive cloud APIs when all local slots are momentarily occupied, Ferry holds requests in a lightweight 20ms polling queue (e.g. up to 500ms) to capture freeing GPU slots locally.
+* **Elastic KV Token-Budget Routing & Atomic Slot Guards**: Allocates GPU capacity based on an aggregate concurrent token pool (`total_kv_token_budget`) rather than naive integer slot counts. Dynamic requests share the hardware pool smoothly (e.g. 2 x 128k, or 1 x 220k + 1 x 40k). Atomic Compare-And-Swap (CAS) and RAII slot guards ensure memory is never overcommitted and tokens are instantly freed upon completion or client disconnect.
+* **Adaptive "Fit-to-Local" Squeezing**: When an agent's prompt size slightly exceeds the local context limit (e.g. 130k–160k tokens vs 128k limit), Ferry dynamically applies a secondary compression pass on older historical turns, squeezing 20k–40k extra tokens so the request can execute locally instead of falling back to cloud APIs.
+* **Extended Contention Hold-and-Wait Queue**: Instead of immediately dumping bursts to expensive cloud APIs when all local slots or token budgets are momentarily occupied, Ferry holds requests in a lightweight polling queue (up to 3.5s) to capture freeing GPU slots locally.
 * **Transparent Context Condensation**: Strips historical `<think>` reasoning blocks and safely truncates stale tool outputs from older turns in $<0.01\text{ ms}$, saving 30%–60% of tokens before routing.
 * **Built-in Safety & Cache Invariants**:
   * **Static Prefix Alignment**: Preserves 100% byte-for-byte immutability across system prompts, developer messages, and initial user instructions to guarantee 90%+ KV cache hit rates on GPU and Cloud engines.
@@ -58,13 +59,16 @@ bind = "0.0.0.0:4000"
 api_base = "http://192.168.9.99:8080/v1"
 api_key = "sk-strata-stevegaming"
 model = "qwen3.8-flash-next-iq2_xs"
-max_slots = 3
-max_context_tokens = 65000
+max_slots = 2
+max_context_tokens = 128000
+total_kv_token_budget = 260000
+adaptive_squeezing = true
+adaptive_squeeze_ratio = 1.35
 timeout_secs = 90
 connect_timeout_secs = 3
 circuit_breaker_threshold = 3
 probe_interval_secs = 5
-queue_timeout_ms = 500
+queue_timeout_ms = 3500
 
 [cloud]
 api_base = "https://api.minimax.io/v1"

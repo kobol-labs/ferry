@@ -1,6 +1,9 @@
 use ferry::condenser::ContextCondenser;
 use ferry::config::CondenserConfig;
+use ferry::stats::MetricsTracker;
+use ferry::router::Router;
 use serde_json::json;
+use std::sync::Arc;
 
 #[test]
 fn test_system_prompt_never_mutated() {
@@ -878,6 +881,82 @@ fn test_runaway_repetition_folding_collapses_duplicate_historical_failures() {
     assert!(msgs[7]["content"].as_str().unwrap().contains("Repeated identical tool failure suppressed"));
     // Recent turn (Attempt 4): untouched
     assert_eq!(msgs[9]["content"], repeated_error);
+}
+
+#[tokio::test]
+async fn test_elastic_token_budget_allocation_and_release() {
+    let metrics = Arc::new(MetricsTracker::default());
+    let max_slots = 2;
+    let total_budget = 200_000u64;
+
+    // 1. Allocate 120,000 tokens for Slot 1 -> Succeeds
+    assert!(metrics.try_acquire_local_capacity(120_000, max_slots, total_budget));
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed), 120_000);
+
+    // 2. Try to allocate 100,000 tokens for Slot 2 -> Fails (120k + 100k = 220k > 200k budget)
+    assert!(!metrics.try_acquire_local_capacity(100_000, max_slots, total_budget));
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // 3. Allocate 60,000 tokens for Slot 2 -> Succeeds (120k + 60k = 180k <= 200k budget)
+    assert!(metrics.try_acquire_local_capacity(60_000, max_slots, total_budget));
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed), 180_000);
+
+    // 4. Try to allocate for Slot 3 -> Fails (exceeds max_slots = 2)
+    assert!(!metrics.try_acquire_local_capacity(10_000, max_slots, total_budget));
+
+    // 5. Release Slot 1 (120k tokens)
+    metrics.release_local_capacity(120_000);
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed), 60_000);
+
+    // 6. Now Slot 2 can allocate up to 140,000 tokens
+    assert!(metrics.try_acquire_local_capacity(130_000, max_slots, total_budget));
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed), 190_000);
+
+    // Clean up
+    metrics.release_local_capacity(60_000);
+    metrics.release_local_capacity(130_000);
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_adaptive_squeeze_pass() {
+    let mut config = CondenserConfig::default();
+    config.keep_recent_turns = 1;
+    let condenser = ContextCondenser::new(config);
+
+    let large_historical_tool = "INFO: Testing vulnerability target\n".repeat(80); // ~2800 chars
+    let recent_tool = "RECENT: Fuzzing response status 200 OK\n".repeat(40);
+
+    let mut body = json!({
+        "messages": [
+            { "role": "system", "content": "You are a scanner." },
+            { "role": "user", "content": "Run scan" },
+            { "role": "assistant", "content": "Checking historical target" },
+            { "role": "tool", "content": large_historical_tool },
+            { "role": "assistant", "content": "Checking recent target" },
+            { "role": "tool", "content": recent_tool }
+        ]
+    });
+
+    // Target a token budget smaller than current
+    let orig_tokens = Router::estimate_tokens(&body);
+    let target = orig_tokens - 100;
+
+    let extra_saved = condenser.adaptive_squeeze(&mut body, target);
+    assert!(extra_saved.is_some());
+    assert!(extra_saved.unwrap() > 0);
+
+    let new_tokens = Router::estimate_tokens(&body);
+    assert!(new_tokens < orig_tokens);
+
+    // Verify recent turn was NOT touched by adaptive squeeze
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs[5]["content"], recent_tool);
 }
 
 

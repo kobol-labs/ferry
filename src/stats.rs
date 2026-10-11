@@ -9,6 +9,8 @@ pub struct MetricsTracker {
     pub spillover_requests: AtomicU64,
     pub failover_requests: AtomicU64,
     pub active_local_slots: AtomicUsize,
+    pub active_local_tokens: AtomicU64,
+    pub adaptive_squeezed_count: AtomicU64,
     pub total_tokens_est: AtomicU64,
     pub local_tokens_est: AtomicU64,
     pub cloud_tokens_est: AtomicU64,
@@ -54,6 +56,8 @@ impl Default for MetricsTracker {
             spillover_requests: AtomicU64::new(0),
             failover_requests: AtomicU64::new(0),
             active_local_slots: AtomicUsize::new(0),
+            active_local_tokens: AtomicU64::new(0),
+            adaptive_squeezed_count: AtomicU64::new(0),
             total_tokens_est: AtomicU64::new(0),
             local_tokens_est: AtomicU64::new(0),
             cloud_tokens_est: AtomicU64::new(0),
@@ -97,6 +101,8 @@ pub struct StatsSnapshot {
     pub spillover_requests: u64,
     pub failover_requests: u64,
     pub active_local_slots: usize,
+    pub active_local_tokens: u64,
+    pub adaptive_squeezed_count: u64,
     pub total_tokens_est: u64,
     pub local_tokens_est: u64,
     pub cloud_tokens_est: u64,
@@ -138,18 +144,49 @@ impl MetricsTracker {
     }
 
     pub fn try_acquire_local_slot(&self, max_slots: usize) -> bool {
-        let mut curr = self.active_local_slots.load(Ordering::SeqCst);
+        self.try_acquire_local_capacity(0, max_slots, 0)
+    }
+
+    pub fn try_acquire_local_capacity(&self, tokens: u64, max_slots: usize, max_token_budget: u64) -> bool {
+        let mut curr_slots = self.active_local_slots.load(Ordering::SeqCst);
+        let mut curr_tokens = self.active_local_tokens.load(Ordering::SeqCst);
         loop {
-            if curr >= max_slots {
+            if curr_slots >= max_slots {
+                return false;
+            }
+            if max_token_budget > 0 && curr_tokens.saturating_add(tokens) > max_token_budget {
                 return false;
             }
             match self.active_local_slots.compare_exchange_weak(
-                curr,
-                curr + 1,
+                curr_slots,
+                curr_slots + 1,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    self.active_local_tokens.fetch_add(tokens, Ordering::SeqCst);
+                    return true;
+                }
+                Err(actual) => {
+                    curr_slots = actual;
+                    curr_tokens = self.active_local_tokens.load(Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    pub fn release_local_capacity(&self, tokens: u64) {
+        self.dec_local();
+        let mut curr = self.active_local_tokens.load(Ordering::SeqCst);
+        while curr > 0 {
+            let next = curr.saturating_sub(tokens);
+            match self.active_local_tokens.compare_exchange_weak(
+                curr,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
                 Err(actual) => curr = actual,
             }
         }
@@ -321,6 +358,8 @@ impl MetricsTracker {
             spillover_requests: self.spillover_requests.load(Ordering::Relaxed),
             failover_requests: self.failover_requests.load(Ordering::Relaxed),
             active_local_slots: self.active_local_slots.load(Ordering::Relaxed),
+            active_local_tokens: self.active_local_tokens.load(Ordering::Relaxed),
+            adaptive_squeezed_count: self.adaptive_squeezed_count.load(Ordering::Relaxed),
             total_tokens_est: self.total_tokens_est.load(Ordering::Relaxed),
             local_tokens_est: self.local_tokens_est.load(Ordering::Relaxed),
             cloud_tokens_est: self.cloud_tokens_est.load(Ordering::Relaxed),
@@ -370,6 +409,12 @@ impl MetricsTracker {
              # HELP ferry_active_slots Current active local hardware slots\n\
              # TYPE ferry_active_slots gauge\n\
              ferry_active_slots {slots}\n\
+             # HELP ferry_active_local_tokens Current estimated tokens locked in active local slots\n\
+             # TYPE ferry_active_local_tokens gauge\n\
+             ferry_active_local_tokens {active_tokens}\n\
+             # HELP ferry_adaptive_squeezed_total Total requests rescued for local execution via adaptive squeezing\n\
+             # TYPE ferry_adaptive_squeezed_total counter\n\
+             ferry_adaptive_squeezed_total {adaptive_squeezed}\n\
              # HELP ferry_strata_online Health status of the local hardware provider (1 = online, 0 = offline)\n\
              # TYPE ferry_strata_online gauge\n\
              ferry_strata_online {strata_online}\n\
@@ -435,6 +480,8 @@ impl MetricsTracker {
             spill = s.spillover_requests,
             fail = s.failover_requests,
             slots = s.active_local_slots,
+            active_tokens = s.active_local_tokens,
+            adaptive_squeezed = s.adaptive_squeezed_count,
             strata_online = if s.strata_online { 1 } else { 0 },
             circuit_open = if s.circuit_open { 1 } else { 0 },
             circuit_trips = s.circuit_trips_total,

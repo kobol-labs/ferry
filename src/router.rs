@@ -12,12 +12,14 @@ pub enum TargetProvider {
 #[derive(Debug)]
 pub struct LocalSlotGuard {
     metrics: Option<Arc<MetricsTracker>>,
+    tokens: u64,
 }
 
 impl LocalSlotGuard {
-    pub fn new(metrics: Arc<MetricsTracker>) -> Self {
+    pub fn new(metrics: Arc<MetricsTracker>, tokens: u64) -> Self {
         Self {
             metrics: Some(metrics),
+            tokens,
         }
     }
 
@@ -29,7 +31,7 @@ impl LocalSlotGuard {
 impl Drop for LocalSlotGuard {
     fn drop(&mut self) {
         if let Some(m) = self.metrics.take() {
-            m.dec_local();
+            m.release_local_capacity(self.tokens);
         }
     }
 }
@@ -110,6 +112,7 @@ impl Router {
 
         let max_context = self.config.local.max_context_tokens as u64;
         let max_slots = self.config.local.max_slots;
+        let total_kv_budget = self.config.local.total_kv_token_budget as u64;
 
         // 4. Context window threshold check
         if est_tokens > max_context {
@@ -123,18 +126,19 @@ impl Router {
             };
         }
 
-        // 5. Atomic local slot acquisition with contention queue support
+        // 5. Atomic local slot & token capacity acquisition with contention queue support
         let queue_timeout_ms = self.config.local.queue_timeout_ms;
 
-        if self.metrics.try_acquire_local_slot(max_slots) {
+        if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
             let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+            let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
             return RouteDecision {
                 target: TargetProvider::Local,
                 est_tokens,
                 is_spillover: false,
-                reason: format!("local slot acquired ({active}/{max_slots})"),
+                reason: format!("local capacity acquired ({active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
                 local_only,
-                slot_guard: Some(LocalSlotGuard::new(self.metrics.clone())),
+                slot_guard: Some(LocalSlotGuard::new(self.metrics.clone(), est_tokens)),
             };
         }
 
@@ -142,27 +146,29 @@ impl Router {
             let start = std::time::Instant::now();
             let wait_limit = std::time::Duration::from_millis(queue_timeout_ms);
             while start.elapsed() < wait_limit {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                if self.metrics.try_acquire_local_slot(max_slots) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
                     let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+                    let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
                     return RouteDecision {
                         target: TargetProvider::Local,
                         est_tokens,
                         is_spillover: false,
-                        reason: format!("local slot acquired from contention queue ({active}/{max_slots})"),
+                        reason: format!("local capacity acquired from contention queue ({active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
                         local_only,
-                        slot_guard: Some(LocalSlotGuard::new(self.metrics.clone())),
+                        slot_guard: Some(LocalSlotGuard::new(self.metrics.clone(), est_tokens)),
                     };
                 }
             }
         }
 
         let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+        let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
         RouteDecision {
             target: TargetProvider::Cloud,
             est_tokens,
             is_spillover: true,
-            reason: format!("local slots saturated ({active}/{max_slots}) -> cloud spillover"),
+            reason: format!("local capacity saturated ({active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens) -> cloud spillover"),
             local_only,
             slot_guard: None,
         }

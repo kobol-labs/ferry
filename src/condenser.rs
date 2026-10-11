@@ -337,6 +337,58 @@ impl ContextCondenser {
         self.find_missing_anchor(anchors, text).is_none()
     }
 
+    /// Secondary adaptive squeezing pass: shrinks older historical tool outputs from 2000 chars down to 500 chars
+    /// to attempt fitting prompts within the local context limit.
+    pub fn adaptive_squeeze(
+        &self,
+        body: &mut Value,
+        target_max_tokens: u64,
+    ) -> Option<usize> {
+        let messages = body.get_mut("messages")?.as_array_mut()?;
+        let orig_chars = count_message_chars(messages);
+        let orig_tokens = estimate_tokens_from_chars(orig_chars);
+
+        if orig_tokens <= target_max_tokens {
+            return None;
+        }
+
+        let mut total_squeezed_chars = 0;
+        let num_messages = messages.len();
+        let recent_boundary = if num_messages > self.config.keep_recent_turns * 2 {
+            num_messages - (self.config.keep_recent_turns * 2)
+        } else {
+            0
+        };
+
+        for (idx, msg) in messages.iter_mut().enumerate() {
+            if idx >= recent_boundary {
+                continue; // Preserve recent active context verbatim
+            }
+
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "tool" || role == "function" {
+                if let Some(content) = msg.get_mut("content") {
+                    if let Some(s) = content.as_str() {
+                        if s.len() > 600 {
+                            let mut dummy_signals = 0;
+                            let squeezed = truncate_tool_content_smart(s, 5, 5, &mut dummy_signals);
+                            if squeezed.len() < s.len() {
+                                total_squeezed_chars += s.len() - squeezed.len();
+                                *content = Value::String(squeezed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if total_squeezed_chars > 0 {
+            Some(total_squeezed_chars)
+        } else {
+            None
+        }
+    }
+
     fn clean_single_chunk(&self, input: &str, stats: &mut CondensationStats) -> String {
         let mut text = input.to_string();
 

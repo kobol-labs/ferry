@@ -43,6 +43,12 @@ pub struct LocalConfig {
     pub max_slots: usize,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+    #[serde(default = "default_total_kv_token_budget")]
+    pub total_kv_token_budget: usize,
+    #[serde(default = "default_adaptive_squeezing")]
+    pub adaptive_squeezing: bool,
+    #[serde(default = "default_adaptive_squeeze_ratio")]
+    pub adaptive_squeeze_ratio: f64,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default = "default_connect_timeout_secs")]
@@ -58,13 +64,16 @@ pub struct LocalConfig {
 fn default_local_base() -> String { "http://192.168.9.99:8080/v1".to_string() }
 fn default_local_key() -> String { "sk-strata-stevegaming".to_string() }
 fn default_local_model() -> String { "qwen3.8-flash-next-iq2_xs".to_string() }
-fn default_max_slots() -> usize { 3 }
-fn default_max_context_tokens() -> usize { 65000 }
+fn default_max_slots() -> usize { 2 }
+fn default_max_context_tokens() -> usize { 128000 }
+fn default_total_kv_token_budget() -> usize { 260000 }
+fn default_adaptive_squeezing() -> bool { true }
+fn default_adaptive_squeeze_ratio() -> f64 { 1.35 }
 fn default_timeout_secs() -> u64 { 90 }
 fn default_connect_timeout_secs() -> u64 { 3 }
 fn default_circuit_breaker_threshold() -> u32 { 3 }
 fn default_probe_interval_secs() -> u64 { 5 }
-fn default_queue_timeout_ms() -> u64 { 0 }
+fn default_queue_timeout_ms() -> u64 { 3500 }
 
 impl Default for LocalConfig {
     fn default() -> Self {
@@ -74,6 +83,9 @@ impl Default for LocalConfig {
             model: default_local_model(),
             max_slots: default_max_slots(),
             max_context_tokens: default_max_context_tokens(),
+            total_kv_token_budget: default_total_kv_token_budget(),
+            adaptive_squeezing: default_adaptive_squeezing(),
+            adaptive_squeeze_ratio: default_adaptive_squeeze_ratio(),
             timeout_secs: default_timeout_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
@@ -213,6 +225,15 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_LOCAL_QUEUE_TIMEOUT_MS") {
             if let Ok(n) = v.parse() { self.local.queue_timeout_ms = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_TOTAL_KV_TOKEN_BUDGET") {
+            if let Ok(n) = v.parse() { self.local.total_kv_token_budget = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_ADAPTIVE_SQUEEZING") {
+            if let Some(b) = parse_bool(&v) { self.local.adaptive_squeezing = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_ADAPTIVE_SQUEEZE_RATIO") {
+            if let Ok(f) = v.parse() { self.local.adaptive_squeeze_ratio = f; }
         }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { if !v.trim().is_empty() { self.cloud.api_base = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { if !v.trim().is_empty() { self.cloud.api_key = v; } }

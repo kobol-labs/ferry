@@ -238,8 +238,32 @@ async fn chat_completions_handler(
         );
     }
 
-    let savings_pct = if cond_stats.orig_chars > 0 && cond_stats.chars_saved > 0 {
-        (cond_stats.chars_saved as f64 / cond_stats.orig_chars as f64) * 100.0
+    let mut total_chars_saved = cond_stats.chars_saved;
+    let max_context = state.config.local.max_context_tokens as u64;
+    let squeeze_ratio = state.config.local.adaptive_squeeze_ratio;
+
+    if state.config.local.adaptive_squeezing {
+        let est_tokens = ferry::router::Router::estimate_tokens(&body);
+        if est_tokens > max_context && est_tokens <= (max_context as f64 * squeeze_ratio) as u64 {
+            if let Some(extra_saved) = state.condenser.adaptive_squeeze(&mut body, max_context) {
+                total_chars_saved += extra_saved;
+                let new_tokens = ferry::router::Router::estimate_tokens(&body);
+                if new_tokens <= max_context {
+                    state.metrics.adaptive_squeezed_count.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        before = est_tokens,
+                        after = new_tokens,
+                        max = max_context,
+                        extra_saved,
+                        "Adaptive squeezing successfully fit prompt into local context"
+                    );
+                }
+            }
+        }
+    }
+
+    let savings_pct = if cond_stats.orig_chars > 0 && total_chars_saved > 0 {
+        (total_chars_saved as f64 / cond_stats.orig_chars as f64) * 100.0
     } else {
         0.0
     };
@@ -266,5 +290,5 @@ async fn chat_completions_handler(
         ).into_response();
     }
 
-    state.upstream.forward_chat(body, decision, req_id, cond_stats.chars_saved, savings_pct).await
+    state.upstream.forward_chat(body, decision, req_id, total_chars_saved, savings_pct).await
 }
