@@ -7,25 +7,96 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::stream::Stream;
-use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde_json::Value;
+use pin_project_lite::pin_project;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tracing::{error, info, warn};
 
-pub struct GuardedStream<S> {
-    inner: S,
-    _guard: Option<crate::router::LocalSlotGuard>,
+pin_project! {
+    pub struct GuardedStream<S> {
+        #[pin]
+        inner: S,
+        #[pin]
+        sleep: tokio::time::Sleep,
+        _guard: Option<crate::router::LocalSlotGuard>,
+        is_sse: bool,
+        keepalive_duration: std::time::Duration,
+        ended: bool,
+    }
 }
 
-impl<S: Stream + Unpin> Stream for GuardedStream<S> {
-    type Item = S::Item;
+impl<S> GuardedStream<S> {
+    pub fn new(
+        inner: S,
+        guard: Option<crate::router::LocalSlotGuard>,
+        is_sse: bool,
+        keepalive_duration: std::time::Duration,
+    ) -> Self {
+        Self {
+            inner,
+            sleep: tokio::time::sleep(keepalive_duration),
+            _guard: guard,
+            is_sse,
+            keepalive_duration,
+            ended: false,
+        }
+    }
+}
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+impl<S, E> Stream for GuardedStream<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+
+        if *this.ended {
+            return Poll::Ready(None);
+        }
+
+        // 1. Poll the upstream data stream first
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+            Poll::Ready(Some(Err(err))) => {
+                if *this.is_sse {
+                    warn!(error = %err, "Upstream stream closed or errored mid-transfer; cleanly terminating SSE stream with [DONE]");
+                    *this.ended = true;
+                    return Poll::Ready(Some(Ok(bytes::Bytes::from("\n\ndata: [DONE]\n\n"))));
+                } else {
+                    *this.ended = true;
+                    return Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))));
+                }
+            }
+            Poll::Ready(None) => {
+                *this.ended = true;
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {}
+        }
+
+        // 2. If inner stream is pending and this is an SSE connection, poll the keepalive timer
+        if *this.is_sse {
+            match Future::poll(this.sleep.as_mut(), cx) {
+                Poll::Ready(()) => {
+                    this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
+                    Poll::Ready(Some(Ok(bytes::Bytes::from(": keepalive\n\n"))))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -317,15 +388,16 @@ impl UpstreamClient {
             HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover"),
         );
 
-        let raw_stream = Box::pin(
-            resp.bytes_stream()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-        );
+        let is_sse = _is_stream
+            || resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.contains("text/event-stream"))
+                .unwrap_or(false);
 
-        let guarded = GuardedStream {
-            inner: raw_stream,
-            _guard: guard,
-        };
+        let keepalive_duration = std::time::Duration::from_secs(3);
+        let guarded = GuardedStream::new(resp.bytes_stream(), guard, is_sse, keepalive_duration);
 
         let body = Body::from_stream(guarded);
         (status, headers, body).into_response()

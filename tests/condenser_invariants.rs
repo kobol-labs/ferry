@@ -551,7 +551,7 @@ fn test_windows_path_anchors_preserved() {
 #[tokio::test]
 async fn test_explicit_cloud_model_selection_router() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -574,7 +574,7 @@ async fn test_explicit_cloud_model_selection_router() {
 #[tokio::test]
 async fn test_circuit_breaker_trip_and_recovery() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -590,7 +590,7 @@ async fn test_circuit_breaker_trip_and_recovery() {
 
     // 1. Initial healthy state: routes to local
     let d1 = router.decide(&body, None).await;
-    assert_eq!(d1.target, TargetProvider::Local);
+    assert_eq!(d1.target, ferry::router::TargetProvider::Local);
     assert!(!metrics.is_circuit_open());
     assert!(metrics.strata_online.load(std::sync::atomic::Ordering::Relaxed));
 
@@ -619,13 +619,13 @@ async fn test_circuit_breaker_trip_and_recovery() {
 
     // 6. Router immediately resumes local GPU routing!
     let d3 = router.decide(&body, None).await;
-    assert_eq!(d3.target, TargetProvider::Local);
+    assert_eq!(d3.target, ferry::router::TargetProvider::Local);
 }
 
 #[tokio::test]
 async fn test_route_override_client_headers() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -646,7 +646,7 @@ async fn test_route_override_client_headers() {
 
     // Local-only override when healthy
     let d_local = router.decide(&body, Some("local-only")).await;
-    assert_eq!(d_local.target, TargetProvider::Local);
+    assert_eq!(d_local.target, ferry::router::TargetProvider::Local);
     assert!(d_local.local_only);
 
     // Local-only override when circuit is open
@@ -659,7 +659,7 @@ async fn test_route_override_client_headers() {
 #[tokio::test]
 async fn test_queue_contention_slot_release() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -688,7 +688,7 @@ async fn test_queue_contention_slot_release() {
 
     // Router should wait in queue, notice slot free, and route to Local!
     let d = router.decide(&body, None).await;
-    assert_eq!(d.target, TargetProvider::Local);
+    assert_eq!(d.target, ferry::router::TargetProvider::Local);
     assert!(d.slot_guard.is_some());
     assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 1);
 
@@ -700,7 +700,7 @@ async fn test_queue_contention_slot_release() {
 #[tokio::test]
 async fn test_atomic_slot_concurrency_no_oversubscription() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -733,7 +733,7 @@ async fn test_atomic_slot_concurrency_no_oversubscription() {
     for handle in handles {
         let decision = handle.await.unwrap();
         match decision.target {
-            TargetProvider::Local => {
+            ferry::router::TargetProvider::Local => {
                 local_count += 1;
                 retained_decisions.push(decision);
             }
@@ -962,3 +962,55 @@ async fn test_adaptive_squeeze_pass() {
 
 
 
+
+#[tokio::test]
+async fn test_guarded_stream_sse_graceful_done_on_upstream_error() {
+    use futures_util::StreamExt;
+    let err_stream = futures_util::stream::iter(vec![
+        Ok(bytes::Bytes::from("data: {\"chunk\": 1}\n\n")),
+        Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer")),
+    ]);
+
+    let guarded = ferry::upstream::GuardedStream::new(
+        err_stream,
+        None,
+        true,
+        std::time::Duration::from_secs(10),
+    );
+
+    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = guarded.collect().await;
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].as_ref().unwrap(), &bytes::Bytes::from("data: {\"chunk\": 1}\n\n"));
+    assert_eq!(chunks[1].as_ref().unwrap(), &bytes::Bytes::from("\n\ndata: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn test_short_context_priority_queueing_wait_limit() {
+    let mut config = ferry::config::Config::default();
+    config.local.queue_timeout_ms = 200; // base wait
+    config.local.max_slots = 1;
+    let metrics = Arc::new(MetricsTracker::default());
+    let router = Router::new(Arc::new(config), metrics.clone());
+
+    // Acquire the only slot
+    assert!(metrics.try_acquire_local_capacity(1000, 1, 390000));
+
+    // A short request (<= 35000 tokens) should have extended patience (12000ms max, tested with quick release)
+    let body = serde_json::json!({
+        "messages": [{ "role": "user", "content": "quick tool check" }]
+    });
+
+    let est = Router::estimate_tokens(&body);
+    assert!(est <= 35000);
+
+    // Release slot after 80ms in background
+    let m = metrics.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        m.release_local_capacity(1000);
+    });
+
+    let decision = router.decide(&body, None).await;
+    assert_eq!(decision.target, ferry::router::TargetProvider::Local);
+    assert!(decision.reason.contains("contention queue"));
+}

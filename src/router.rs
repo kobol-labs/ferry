@@ -142,9 +142,17 @@ impl Router {
             };
         }
 
-        if queue_timeout_ms > 0 {
+        // Short-context priority: if prompt <= 35,000 tokens, grant an extended contention wait
+        // because short turns take <1s to run and keeping them local maximizes throughput and reduces cloud cost.
+        let effective_wait_ms = if est_tokens <= 35000 {
+            queue_timeout_ms.max(12000)
+        } else {
+            queue_timeout_ms
+        };
+
+        if effective_wait_ms > 0 {
             let start = std::time::Instant::now();
-            let wait_limit = std::time::Duration::from_millis(queue_timeout_ms);
+            let wait_limit = std::time::Duration::from_millis(effective_wait_ms);
             while start.elapsed() < wait_limit {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
