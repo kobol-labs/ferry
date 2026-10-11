@@ -114,19 +114,37 @@ pub struct CondenserConfig {
     pub keep_recent_turns: usize,
     #[serde(default = "default_max_tool_chars")]
     pub max_tool_chars: usize,
+    #[serde(default = "default_recent_max_tool_chars")]
+    pub recent_max_tool_chars: usize,
     #[serde(default = "default_head_lines")]
     pub head_lines: usize,
     #[serde(default = "default_tail_lines")]
     pub tail_lines: usize,
+    #[serde(default = "default_strip_ansi_escapes")]
+    pub strip_ansi_escapes: bool,
+    #[serde(default = "default_strip_progress_bars")]
+    pub strip_progress_bars: bool,
+    #[serde(default = "default_collapse_whitespace")]
+    pub collapse_whitespace: bool,
+    #[serde(default = "default_deduplicate_lines")]
+    pub deduplicate_lines: bool,
+    #[serde(default = "default_minify_json_outputs")]
+    pub minify_json_outputs: bool,
 }
 
 fn default_condensation_enabled() -> bool { true }
 fn default_drop_historical_reasoning() -> bool { true }
 fn default_truncate_tool_outputs() -> bool { true }
-fn default_keep_recent_turns() -> usize { 2 }
-fn default_max_tool_chars() -> usize { 1500 }
-fn default_head_lines() -> usize { 15 }
-fn default_tail_lines() -> usize { 15 }
+fn default_keep_recent_turns() -> usize { 1 }
+fn default_max_tool_chars() -> usize { 800 }
+fn default_recent_max_tool_chars() -> usize { 12000 }
+fn default_head_lines() -> usize { 5 }
+fn default_tail_lines() -> usize { 3 }
+fn default_strip_ansi_escapes() -> bool { true }
+fn default_strip_progress_bars() -> bool { true }
+fn default_collapse_whitespace() -> bool { true }
+fn default_deduplicate_lines() -> bool { true }
+fn default_minify_json_outputs() -> bool { true }
 
 impl Default for CondenserConfig {
     fn default() -> Self {
@@ -136,8 +154,14 @@ impl Default for CondenserConfig {
             truncate_tool_outputs: default_truncate_tool_outputs(),
             keep_recent_turns: default_keep_recent_turns(),
             max_tool_chars: default_max_tool_chars(),
+            recent_max_tool_chars: default_recent_max_tool_chars(),
             head_lines: default_head_lines(),
             tail_lines: default_tail_lines(),
+            strip_ansi_escapes: default_strip_ansi_escapes(),
+            strip_progress_bars: default_strip_progress_bars(),
+            collapse_whitespace: default_collapse_whitespace(),
+            deduplicate_lines: default_deduplicate_lines(),
+            minify_json_outputs: default_minify_json_outputs(),
         }
     }
 }
@@ -194,6 +218,18 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_MAX_TOOL_CHARS") {
             if let Ok(n) = v.parse() { self.condensation.max_tool_chars = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_RECENT_MAX_TOOL_CHARS") {
+            if let Ok(n) = v.parse() { self.condensation.recent_max_tool_chars = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_STRIP_ANSI") {
+            if let Ok(b) = v.parse() { self.condensation.strip_ansi_escapes = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_DEDUPLICATE_LINES") {
+            if let Ok(b) = v.parse() { self.condensation.deduplicate_lines = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_MINIFY_JSON") {
+            if let Ok(b) = v.parse() { self.condensation.minify_json_outputs = b; }
         }
     }
 }

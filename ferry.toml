@@ -25,9 +25,17 @@ drop_historical_reasoning = true
 # Truncate large tool / command outputs from older turns
 truncate_tool_outputs = true
 # Number of most recent turns to keep 100% byte-for-byte untouched (immediate context)
-keep_recent_turns = 2
-# Character threshold before an older tool output is truncated (default: 1500 chars)
-max_tool_chars = 1500
+keep_recent_turns = 1
+# Character threshold before an older tool output is truncated (default: 800 chars)
+max_tool_chars = 800
+# Sanity cap on any single tool output even in recent turns (default: 12000 chars)
+recent_max_tool_chars = 12000
 # Lines to preserve from the head and tail of truncated tool outputs
-head_lines = 15
-tail_lines = 15
+head_lines = 5
+tail_lines = 3
+# RTK-inspired inline stream cleaners:
+strip_ansi_escapes = true       # Strip ANSI terminal colors and cursor codes
+strip_progress_bars = true      # Remove carriage-return overwrites and progress bars
+collapse_whitespace = true      # Collapse 3+ newlines to \n\n and trim trailing whitespace
+deduplicate_lines = true        # Collapse consecutive identical lines with repeat count
+minify_json_outputs = true      # Minify pretty-printed JSON tool outputs (saves ~30%)
