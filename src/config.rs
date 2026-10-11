@@ -309,7 +309,7 @@ impl Config {
             if let Ok(f) = v.parse() { self.local.adaptive_squeeze_ratio = f; }
         }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { if !v.trim().is_empty() { self.cloud.api_base = v; } }
-        if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { if !v.trim().is_empty() { self.cloud.api_key = v; } }
+        if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY").or_else(|_| std::env::var("MINIMAX_API_KEY")) { if !v.trim().is_empty() { self.cloud.api_key = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_MODEL") { if !v.trim().is_empty() { self.cloud.model = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_TIMEOUT_SECS") {
             if let Ok(n) = v.parse() { self.cloud.timeout_secs = n; }

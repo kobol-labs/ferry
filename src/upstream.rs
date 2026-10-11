@@ -109,6 +109,7 @@ pub struct ResponseMeta {
     pub is_failover: bool,
     pub slot_id: Option<usize>,
     pub is_affinity_hit: bool,
+    pub affinity_type: crate::affinity::AffinityType,
     pub session_id: String,
 }
 
@@ -203,6 +204,7 @@ impl UpstreamClient {
                             is_failover: false,
                             slot_id: decision.slot_id,
                             is_affinity_hit: decision.is_affinity_hit,
+                            affinity_type: decision.affinity_type,
                             session_id: decision.session_id.clone(),
                         };
                         self.handle_upstream_response(resp, is_stream, slot_guard, meta, cache_key).await
@@ -228,6 +230,7 @@ impl UpstreamClient {
                             is_failover: false,
                             slot_id: decision.slot_id,
                             is_affinity_hit: decision.is_affinity_hit,
+                            affinity_type: decision.affinity_type,
                             session_id: decision.session_id.clone(),
                         };
                         self.handle_upstream_response(resp, is_stream, slot_guard, meta, None).await
@@ -343,6 +346,7 @@ impl UpstreamClient {
                     is_failover,
                     slot_id: None,
                     is_affinity_hit: false,
+                    affinity_type: crate::affinity::AffinityType::NewSlot,
                     session_id: decision.session_id,
                 };
                 self.handle_upstream_response(resp, is_stream, None, meta, cache_key).await
@@ -419,7 +423,7 @@ impl UpstreamClient {
             }
             headers.insert(
                 HeaderName::from_static("x-ferry-affinity"),
-                HeaderValue::from_static(if meta.is_affinity_hit { "HIT" } else { "NEW" }),
+                HeaderValue::from_static(meta.affinity_type.as_str()),
             );
         }
         if !meta.session_id.is_empty() {

@@ -1,13 +1,21 @@
-use crate::affinity::SessionAffinityTracker;
+use std::sync::Arc;
+use serde_json::Value;
+
+use crate::affinity::{AffinityType, SessionAffinityTracker, compute_prefix_hash};
 use crate::config::Config;
 use crate::stats::MetricsTracker;
-use serde_json::Value;
-use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetProvider {
     Local,
     Cloud,
+}
+
+pub struct RouteOverride {
+    pub route: Option<String>,
+    pub queue_timeout_ms: Option<u64>,
+    pub session_id: Option<String>,
+    pub priority: Option<String>,
 }
 
 #[derive(Debug)]
@@ -32,20 +40,12 @@ impl LocalSlotGuard {
             tokens,
         }
     }
-
-    pub fn disarm(&mut self) {
-        self.metrics = None;
-        self.affinity_tracker = None;
-        self.slot_id = None;
-    }
 }
 
 impl Drop for LocalSlotGuard {
     fn drop(&mut self) {
-        if let Some(slot) = self.slot_id.take() {
-            if let Some(tracker) = self.affinity_tracker.take() {
-                tracker.release_slot(slot);
-            }
+        if let (Some(ref tracker), Some(slot)) = (&self.affinity_tracker, self.slot_id) {
+            tracker.release_slot(slot);
         }
         if let Some(m) = self.metrics.take() {
             m.release_local_capacity(self.tokens);
@@ -63,6 +63,7 @@ pub struct RouteDecision {
     pub slot_guard: Option<LocalSlotGuard>,
     pub slot_id: Option<usize>,
     pub is_affinity_hit: bool,
+    pub affinity_type: AffinityType,
     pub session_id: String,
 }
 
@@ -93,16 +94,54 @@ impl Router {
         }
     }
 
+    pub fn affinity_tracker(&self) -> &Arc<SessionAffinityTracker> {
+        &self.affinity_tracker
+    }
+
     pub fn estimate_tokens(body: &Value) -> u64 {
+        let mut total_chars: usize = 0;
+
         if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            crate::condenser::estimate_message_tokens(messages)
-        } else {
-            0
+            for msg in messages {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    total_chars += content.len();
+                } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            total_chars += text.len();
+                        }
+                    }
+                }
+                if let Some(calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for call in calls {
+                        if let Some(func) = call.get("function") {
+                            if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                total_chars += args.len();
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+            for tool in tools {
+                if let Some(func) = tool.get("function") {
+                    if let Some(desc) = func.get("description").and_then(|d| d.as_str()) {
+                        total_chars += desc.len();
+                    }
+                    if let Some(params) = func.get("parameters") {
+                        total_chars += params.to_string().len();
+                    }
+                }
+            }
+        }
+
+        crate::condenser::estimate_tokens_from_chars(total_chars)
     }
 
     pub async fn decide(&self, body: &Value, route_override: Option<&str>) -> RouteDecision {
-        self.decide_with_timeout(body, route_override, None).await
+        self.decide_for_session(body, route_override, None, "default").await
     }
 
     pub async fn decide_with_timeout(
@@ -111,10 +150,20 @@ impl Router {
         route_override: Option<&str>,
         explicit_timeout_ms: Option<u64>,
     ) -> RouteDecision {
-        self.decide_for_session(body, route_override, explicit_timeout_ms, "session-default").await
+        self.decide_for_session(body, route_override, explicit_timeout_ms, "default").await
     }
 
     pub async fn decide_for_session(
+        &self,
+        body: &Value,
+        route_override: Option<&str>,
+        explicit_timeout_ms: Option<u64>,
+        session_id: &str,
+    ) -> RouteDecision {
+        self.decide_with_session(body, route_override, explicit_timeout_ms, session_id).await
+    }
+
+    pub async fn decide_with_session(
         &self,
         body: &Value,
         route_override: Option<&str>,
@@ -127,6 +176,13 @@ impl Router {
         let cloud_only = matches!(route_override, Some("cloud-only") | Some("cloud"));
         let fast_mode = matches!(route_override, Some("fast") | Some("low-latency"));
 
+        // Extract system prompt prefix hash to enable warm KV cache reuse across subagents
+        let prefix_hash = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| compute_prefix_hash(arr))
+            .unwrap_or(0);
+
         // 1. Force Cloud if client header requested cloud-only
         if cloud_only {
             return RouteDecision {
@@ -138,6 +194,7 @@ impl Router {
                 slot_guard: None,
                 slot_id: None,
                 is_affinity_hit: false,
+                affinity_type: AffinityType::NewSlot,
                 session_id: session_id.to_string(),
             };
         }
@@ -154,6 +211,7 @@ impl Router {
                 slot_guard: None,
                 slot_id: None,
                 is_affinity_hit: false,
+                affinity_type: AffinityType::NewSlot,
                 session_id: session_id.to_string(),
             };
         }
@@ -171,6 +229,7 @@ impl Router {
                         slot_guard: None,
                         slot_id: None,
                         is_affinity_hit: false,
+                        affinity_type: AffinityType::NewSlot,
                         session_id: session_id.to_string(),
                     };
                 }
@@ -192,17 +251,23 @@ impl Router {
                 slot_guard: None,
                 slot_id: None,
                 is_affinity_hit: false,
+                affinity_type: AffinityType::NewSlot,
                 session_id: session_id.to_string(),
             };
         }
 
-        // 5. Atomic local slot & token capacity acquisition with session affinity
-        if let Some((slot_id, is_hit)) = self.affinity_tracker.try_acquire_slot(session_id) {
+        // 5. Atomic local slot & token capacity acquisition with session & prefix affinity
+        if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_with_prefix(session_id, prefix_hash) {
+            let is_hit = aff_type.is_hit();
             if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
                 self.metrics.record_affinity(is_hit);
                 let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
                 let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
-                let aff_desc = if is_hit { "affinity hit" } else { "affinity assigned" };
+                let aff_desc = match aff_type {
+                    AffinityType::SessionHit => "session affinity hit",
+                    AffinityType::PrefixHit => "prefix cache affinity hit",
+                    AffinityType::NewSlot => "new slot assigned",
+                };
                 return RouteDecision {
                     target: TargetProvider::Local,
                     est_tokens,
@@ -217,6 +282,7 @@ impl Router {
                     )),
                     slot_id: Some(slot_id),
                     is_affinity_hit: is_hit,
+                    affinity_type: aff_type,
                     session_id: session_id.to_string(),
                 };
             } else {
@@ -231,11 +297,11 @@ impl Router {
         } else if fast_mode {
             500
         } else if local_only {
-            30000
+            60000
         } else if local_prefer {
-            25000
+            45000
         } else if est_tokens <= max_context {
-            queue_timeout_ms.max(15000)
+            queue_timeout_ms.max(35000)
         } else {
             queue_timeout_ms
         };
@@ -243,14 +309,20 @@ impl Router {
         if effective_wait_ms > 0 {
             let start = std::time::Instant::now();
             let wait_limit = std::time::Duration::from_millis(effective_wait_ms);
+            let poll_interval = if fast_mode { 10 } else { 25 };
             while start.elapsed() < wait_limit {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                if let Some((slot_id, is_hit)) = self.affinity_tracker.try_acquire_slot(session_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(poll_interval)).await;
+                if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_with_prefix(session_id, prefix_hash) {
+                    let is_hit = aff_type.is_hit();
                     if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
                         self.metrics.record_affinity(is_hit);
                         let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
                         let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
-                        let aff_desc = if is_hit { "affinity hit" } else { "affinity assigned" };
+                        let aff_desc = match aff_type {
+                            AffinityType::SessionHit => "session affinity hit",
+                            AffinityType::PrefixHit => "prefix cache affinity hit",
+                            AffinityType::NewSlot => "new slot assigned",
+                        };
                         return RouteDecision {
                             target: TargetProvider::Local,
                             est_tokens,
@@ -265,6 +337,7 @@ impl Router {
                             )),
                             slot_id: Some(slot_id),
                             is_affinity_hit: is_hit,
+                            affinity_type: aff_type,
                             session_id: session_id.to_string(),
                         };
                     } else {
@@ -285,6 +358,7 @@ impl Router {
             slot_guard: None,
             slot_id: None,
             is_affinity_hit: false,
+            affinity_type: AffinityType::NewSlot,
             session_id: session_id.to_string(),
         }
     }
