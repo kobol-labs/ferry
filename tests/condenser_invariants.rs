@@ -18,6 +18,7 @@ fn test_system_prompt_never_mutated() {
         collapse_whitespace: true,
         deduplicate_lines: true,
         minify_json_outputs: true,
+        ..Default::default()
     };
     let condenser = ContextCondenser::new(config);
 
