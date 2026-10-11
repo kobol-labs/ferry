@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let probe_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(probe_state.config.local.connect_timeout_secs))
             .timeout(std::time::Duration::from_secs(5))
+            .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_default();
 
@@ -75,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match res {
                 Ok(resp) if resp.status().is_success() => {
+                    let _ = resp.bytes().await;
                     let was_open = probe_state.metrics.is_circuit_open();
                     probe_state.metrics.record_local_success();
                     if was_open {
@@ -82,7 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Ok(resp) => {
-                    tracing::debug!(status = resp.status().as_u16(), "Strata probe returned non-200");
+                    let status = resp.status().as_u16();
+                    let _ = resp.bytes().await;
+                    tracing::debug!(status = status, "Strata probe returned non-200");
                     let tripped = probe_state.metrics.record_local_failure(probe_state.config.local.circuit_breaker_threshold);
                     if tripped {
                         tracing::warn!("Circuit breaker TRIPPED by background probe (non-200 response). Strata marked offline.");
@@ -108,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/chat/completions",
             post(chat_completions_handler).options(cors_options_handler),
         )
-        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.server.bind).await?;

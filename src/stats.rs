@@ -29,8 +29,12 @@ pub struct MetricsTracker {
     // Last request gauges (for real-time Grafana observation)
     pub last_prompt_tokens_original: AtomicU64,
     pub last_prompt_tokens_condensed: AtomicU64,
-    pub last_chars_saved: AtomicU64,
     pub last_savings_percent: AtomicU64, // scaled by 100, e.g. 2550 = 25.50%
+    pub last_chars_saved: AtomicU64,
+    // Latency & duration tracking (for Grafana p50/p90/p99 & rate queries)
+    pub local_duration_ms: AtomicU64,
+    pub cloud_duration_ms: AtomicU64,
+    pub last_duration_ms: AtomicU64,
 
     // Circuit breaker & upstream hardware health
     pub strata_online: AtomicBool,
@@ -68,6 +72,10 @@ impl Default for MetricsTracker {
             last_prompt_tokens_condensed: AtomicU64::new(0),
             last_chars_saved: AtomicU64::new(0),
             last_savings_percent: AtomicU64::new(0),
+
+            local_duration_ms: AtomicU64::new(0),
+            cloud_duration_ms: AtomicU64::new(0),
+            last_duration_ms: AtomicU64::new(0),
 
             strata_online: AtomicBool::new(true),
             circuit_open: AtomicBool::new(false),
@@ -107,6 +115,10 @@ pub struct StatsSnapshot {
     pub last_prompt_tokens_condensed: u64,
     pub last_chars_saved: u64,
     pub last_savings_percent: f64,
+
+    pub local_duration_ms_total: u64,
+    pub cloud_duration_ms_total: u64,
+    pub last_duration_ms: u64,
 
     pub strata_online: bool,
     pub circuit_open: bool,
@@ -176,6 +188,16 @@ impl MetricsTracker {
 
     pub fn inc_failover(&self) {
         self.failover_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_local_completion(&self, duration_ms: u128) {
+        self.local_duration_ms.fetch_add(duration_ms as u64, Ordering::Relaxed);
+        self.last_duration_ms.store(duration_ms as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_cloud_completion(&self, duration_ms: u128) {
+        self.cloud_duration_ms.fetch_add(duration_ms as u64, Ordering::Relaxed);
+        self.last_duration_ms.store(duration_ms as u64, Ordering::Relaxed);
     }
 
     pub fn record_local_success(&self) {
@@ -308,6 +330,10 @@ impl MetricsTracker {
             last_chars_saved: self.last_chars_saved.load(Ordering::Relaxed),
             last_savings_percent: pct_scaled as f64 / 100.0,
 
+            local_duration_ms_total: self.local_duration_ms.load(Ordering::Relaxed),
+            cloud_duration_ms_total: self.cloud_duration_ms.load(Ordering::Relaxed),
+            last_duration_ms: self.last_duration_ms.load(Ordering::Relaxed),
+
             strata_online: self.strata_online.load(Ordering::Relaxed),
             circuit_open: self.circuit_open.load(Ordering::Relaxed),
             consecutive_local_failures: self.consecutive_local_failures.load(Ordering::Relaxed),
@@ -342,6 +368,13 @@ impl MetricsTracker {
              ferry_tokens_estimated {tokens}\n\
              ferry_tokens_estimated{{provider=\"local\"}} {ltokens}\n\
              ferry_tokens_estimated{{provider=\"cloud\"}} {ctokens}\n\
+             # HELP ferry_request_duration_ms_total Total latency of completed LLM requests in milliseconds\n\
+             # TYPE ferry_request_duration_ms_total counter\n\
+             ferry_request_duration_ms_total{{provider=\"local\"}} {local_ms}\n\
+             ferry_request_duration_ms_total{{provider=\"cloud\"}} {cloud_ms}\n\
+             # HELP ferry_last_request_duration_ms Latency of most recent completed request in milliseconds\n\
+             # TYPE ferry_last_request_duration_ms gauge\n\
+             ferry_last_request_duration_ms {last_ms}\n\
              # HELP ferry_condensed_requests_total Total requests optimized by condensation\n\
              # TYPE ferry_condensed_requests_total counter\n\
              ferry_condensed_requests_total {condensed_reqs}\n\
@@ -390,6 +423,9 @@ impl MetricsTracker {
             tokens = s.total_tokens_est,
             ltokens = s.local_tokens_est,
             ctokens = s.cloud_tokens_est,
+            local_ms = s.local_duration_ms_total,
+            cloud_ms = s.cloud_duration_ms_total,
+            last_ms = s.last_duration_ms,
             condensed_reqs = s.condensed_requests,
             chars_saved = s.chars_saved,
             tokens_saved = s.tokens_saved_est,

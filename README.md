@@ -310,7 +310,51 @@ ferry_chars_saved_total 8452100
 # HELP ferry_tokens_saved_estimated_total Total tokens estimated saved
 # TYPE ferry_tokens_saved_estimated_total counter
 ferry_tokens_saved_estimated_total 2113025
+
+# HELP ferry_request_duration_ms_total Total latency of completed LLM requests in milliseconds
+# TYPE ferry_request_duration_ms_total counter
+ferry_request_duration_ms_total{provider="local"} 95200
+ferry_request_duration_ms_total{provider="cloud"} 1105400
+
+# HELP ferry_last_request_duration_ms Latency of most recent completed request in milliseconds
+# TYPE ferry_last_request_duration_ms gauge
+ferry_last_request_duration_ms 822
 ```
+
+### 4. Grafana Integration & Dashboard
+
+A production-ready Grafana dashboard is included in [`grafana/dashboard.json`](file:///Users/steve/local/ferry/grafana/dashboard.json).
+
+#### Prometheus Scrape Config
+Add Ferry to your `prometheus.yml`:
+```yaml
+scrape_configs:
+  - job_name: 'ferry'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['192.168.9.99:4000'] # or your Ferry host/IP
+```
+
+#### Importing Dashboard
+1. Open Grafana -> **Dashboards** -> **New** -> **Import**.
+2. Upload `grafana/dashboard.json` or paste the JSON content.
+3. Select your Prometheus data source.
+4. Visualize live slot saturation, circuit breaker status, local vs. cloud latency curves, and token savings in real time.
+
+---
+
+## Alternative Use Cases
+
+Beyond autonomous pentesting agents, Ferry is designed as a universal edge router for LLM workloads:
+
+1. **Local Developer Co-pilot / Cursor Gateway**:
+   Point Cursor, VS Code Continue, Claude Code, or Aider to `http://localhost:4000/v1`. Instant code completions run 100% free on local GPUs, while huge multi-file refactors seamlessly burst to Cloud APIs without reconfiguring your IDE.
+2. **CI/CD Test Runner & Cost Protector**:
+   Enforce zero unexpected cloud bills in automated test suites by injecting `X-Ferry-Route: local-only`. If local rigs are offline or busy, test runs fail fast with HTTP 503 instead of charging your credit card.
+3. **RTK (Real-Time Terminal Cleaner) for Agent Swarms**:
+   DevOps and automation swarms running noisy CLI tools (`nmap`, `docker`, `terraform`, `git`) output thousands of repetitive log lines, ANSI codes, and progress bars. Ferry transparently sanitizes and compacts these tool payloads on-the-fly, reducing downstream LLM prompt sizes by 40%–60%.
+4. **Multi-Node Cluster Ingress**:
+   Deploy Ferry as the front door for on-prem clusters (Ollama, vLLM, Strata/llama.cpp) across LAN servers, handling health checking, circuit breaking, and load balancing to Cloud providers.
 
 ---
 

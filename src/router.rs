@@ -55,33 +55,12 @@ impl Router {
     }
 
     pub fn estimate_tokens(body: &Value) -> u64 {
-        let mut char_count = 0usize;
         if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            for msg in messages {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    char_count += content.len();
-                } else if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
-                    for part in content_arr {
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            char_count += text.len();
-                        }
-                    }
-                }
-                // Handle OpenAI Responses format and dual-key tool outputs
-                if let Some(output) = msg.get("output").and_then(|o| o.as_str()) {
-                    char_count += output.len();
-                }
-                // Handle tool_calls arguments from assistant messages
-                if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
-                    for call in tool_calls {
-                        if let Some(args) = call.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
-                            char_count += args.len();
-                        }
-                    }
-                }
-            }
+            let char_count = crate::condenser::count_message_chars(messages);
+            (char_count as f64 / 3.0).ceil() as u64
+        } else {
+            0
         }
-        (char_count as f64 / 3.0).ceil() as u64
     }
 
     pub async fn decide(&self, body: &Value, route_override: Option<&str>) -> RouteDecision {

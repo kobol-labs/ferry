@@ -46,7 +46,7 @@ impl ContextCondenser {
             return CondensationStats::default();
         }
 
-        let orig_chars = serde_json::to_string(&messages).map(|s| s.len()).unwrap_or(0);
+        let orig_chars = count_message_chars(messages);
 
         // 1. Identify assistant turn boundaries.
         // We preserve the last `keep_recent_turns` assistant messages from historical truncation.
@@ -151,7 +151,7 @@ impl ContextCondenser {
             }
         }
 
-        let cond_chars = serde_json::to_string(&messages).map(|s| s.len()).unwrap_or(0);
+        let cond_chars = count_message_chars(messages);
         stats.orig_chars = orig_chars;
         stats.cond_chars = cond_chars;
         if orig_chars > cond_chars {
@@ -708,6 +708,40 @@ pub fn collapse_excess_whitespace(input: &str) -> (String, bool) {
     }
 
     (out, modified)
+}
+
+/// Zero-allocation character counter across all OpenAI-compatible message formats.
+/// Traverses existing in-memory JSON values without serializing to strings.
+pub fn count_message_chars(messages: &[Value]) -> usize {
+    let mut total = 0;
+    for msg in messages {
+        if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+            total += c.len();
+        } else if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            for part in arr {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    total += t.len();
+                }
+            }
+        }
+        if let Some(o) = msg.get("output").and_then(|o| o.as_str()) {
+            total += o.len();
+        }
+        if let Some(r) = msg.get("reasoning").and_then(|r| r.as_str()) {
+            total += r.len();
+        }
+        if let Some(rc) = msg.get("reasoning_content").and_then(|rc| rc.as_str()) {
+            total += rc.len();
+        }
+        if let Some(tc) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+            for call in tc {
+                if let Some(args) = call.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
+                    total += args.len();
+                }
+            }
+        }
+    }
+    total
 }
 
 #[cfg(test)]

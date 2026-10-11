@@ -50,6 +50,7 @@ impl UpstreamClient {
     pub fn new(config: Arc<Config>, metrics: Arc<MetricsTracker>) -> Self {
         let client = Client::builder()
             .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(10)
             .tcp_nodelay(true)
             .connect_timeout(std::time::Duration::from_secs(config.local.connect_timeout_secs))
             .build()
@@ -101,6 +102,7 @@ impl UpstreamClient {
                     Ok(resp) if resp.status().is_success() => {
                         self.metrics.record_local_success();
                         let duration = start.elapsed();
+                        self.metrics.record_local_completion(duration.as_millis());
                         info!(
                             req_id = req_id,
                             target = "local",
@@ -123,6 +125,7 @@ impl UpstreamClient {
                         self.metrics.record_local_success();
                         let status = resp.status();
                         let duration = start.elapsed();
+                        self.metrics.record_local_completion(duration.as_millis());
                         warn!(
                             req_id = req_id,
                             status = status.as_u16(),
@@ -227,6 +230,7 @@ impl UpstreamClient {
             Ok(resp) => {
                 let status = resp.status();
                 let duration = start.elapsed();
+                self.metrics.record_cloud_completion(duration.as_millis());
                 info!(
                     req_id = req_id,
                     target = "cloud",

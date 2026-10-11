@@ -766,5 +766,52 @@ async fn test_atomic_slot_concurrency_no_oversubscription() {
     assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
+#[test]
+fn test_latency_and_duration_prometheus_metrics() {
+    use ferry::stats::MetricsTracker;
+
+    let metrics = MetricsTracker::new();
+    metrics.record_local_completion(450);
+    metrics.record_local_completion(550);
+    metrics.record_cloud_completion(1200);
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.local_duration_ms_total, 1000);
+    assert_eq!(snap.cloud_duration_ms_total, 1200);
+    assert_eq!(snap.last_duration_ms, 1200);
+
+    let prom = metrics.prometheus_metrics();
+    assert!(prom.contains("ferry_request_duration_ms_total{provider=\"local\"} 1000"));
+    assert!(prom.contains("ferry_request_duration_ms_total{provider=\"cloud\"} 1200"));
+    assert!(prom.contains("ferry_last_request_duration_ms 1200"));
+}
+
+#[test]
+fn test_zero_allocation_char_counting_parity() {
+    use ferry::condenser::count_message_chars;
+
+    let messages = json!([
+        { "role": "system", "content": "System prompt" },
+        { "role": "user", "content": [{"type": "text", "text": "Part 1 "}, {"type": "text", "text": "Part 2"}] },
+        {
+            "role": "assistant",
+            "content": "Assistant msg",
+            "reasoning": "internal thought",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": { "name": "foo", "arguments": "{\"x\": 1}" }
+                }
+            ]
+        },
+        { "type": "function_call_output", "output": "command output" }
+    ]);
+
+    let count = count_message_chars(messages.as_array().unwrap());
+    // "System prompt" (13) + "Part 1 " (7) + "Part 2" (6) + "Assistant msg" (13) +
+    // "internal thought" (16) + "{\"x\": 1}" (8) + "command output" (14) = 77
+    assert_eq!(count, 77);
+}
+
 
 
