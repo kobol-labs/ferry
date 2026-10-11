@@ -59,7 +59,7 @@ impl ContextCondenser {
             }
         }
 
-        let cutoff_index = if assistant_indices.len() > self.config.keep_recent_turns {
+        let cutoff_index = if assistant_indices.len() >= self.config.keep_recent_turns && self.config.keep_recent_turns > 0 {
             assistant_indices[assistant_indices.len() - self.config.keep_recent_turns]
         } else {
             0
