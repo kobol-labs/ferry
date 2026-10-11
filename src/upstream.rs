@@ -18,15 +18,7 @@ use tracing::{error, info, warn};
 
 pub struct GuardedStream<S> {
     inner: S,
-    metrics: Option<Arc<MetricsTracker>>,
-}
-
-impl<S> Drop for GuardedStream<S> {
-    fn drop(&mut self) {
-        if let Some(m) = self.metrics.take() {
-            m.dec_local();
-        }
-    }
+    _guard: Option<crate::router::LocalSlotGuard>,
 }
 
 impl<S: Stream + Unpin> Stream for GuardedStream<S> {
@@ -72,8 +64,8 @@ impl UpstreamClient {
 
     pub async fn forward_chat(
         &self,
-        body: Value,
-        decision: RouteDecision,
+        mut body: Value,
+        mut decision: RouteDecision,
         req_id: u64,
         chars_saved: usize,
         savings_pct: f64,
@@ -83,7 +75,8 @@ impl UpstreamClient {
 
         match decision.target {
             TargetProvider::Local => {
-                self.metrics.inc_local(decision.est_tokens);
+                let slot_guard = decision.slot_guard.take();
+                self.metrics.record_local_request_stats(decision.est_tokens);
                 info!(
                     req_id = req_id,
                     target = "local",
@@ -94,15 +87,14 @@ impl UpstreamClient {
                 );
 
                 let local_url = format!("{}/chat/completions", self.config.local.api_base.trim_end_matches('/'));
-                let mut target_body = body.clone();
-                normalize_wire_format(&mut target_body, &self.config.local.model);
+                normalize_wire_format(&mut body, &self.config.local.model);
 
                 let req = self
                     .client
                     .post(&local_url)
                     .header(header::AUTHORIZATION, format!("Bearer {}", self.config.local.api_key))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .json(&target_body)
+                    .json(&body)
                     .timeout(std::time::Duration::from_secs(self.config.local.timeout_secs));
 
                 match req.send().await {
@@ -125,7 +117,7 @@ impl UpstreamClient {
                             duration_ms: duration.as_millis(),
                             is_failover: false,
                         };
-                        self.handle_upstream_response(resp, is_stream, true, meta)
+                        self.handle_upstream_response(resp, is_stream, slot_guard, meta)
                     }
                     Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
                         self.metrics.record_local_success();
@@ -146,7 +138,7 @@ impl UpstreamClient {
                             duration_ms: duration.as_millis(),
                             is_failover: false,
                         };
-                        self.handle_upstream_response(resp, is_stream, true, meta)
+                        self.handle_upstream_response(resp, is_stream, slot_guard, meta)
                     }
                     Ok(resp) => {
                         let status = resp.status();
@@ -165,7 +157,7 @@ impl UpstreamClient {
                                 "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
                             );
                         }
-                        self.metrics.dec_local();
+                        drop(slot_guard); // Release local slot immediately before failing over to Cloud
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
                         self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct).await
@@ -184,7 +176,7 @@ impl UpstreamClient {
                                 "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
                             );
                         }
-                        self.metrics.dec_local();
+                        drop(slot_guard); // Release local slot immediately before failing over to Cloud
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
                         self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct).await
@@ -200,7 +192,7 @@ impl UpstreamClient {
 
     async fn dispatch_cloud(
         &self,
-        body: Value,
+        mut body: Value,
         decision: RouteDecision,
         req_id: u64,
         is_failover: bool,
@@ -221,15 +213,14 @@ impl UpstreamClient {
         );
 
         let cloud_url = format!("{}/chat/completions", self.config.cloud.api_base.trim_end_matches('/'));
-        let mut target_body = body;
-        normalize_wire_format(&mut target_body, &self.config.cloud.model);
+        normalize_wire_format(&mut body, &self.config.cloud.model);
 
         let req = self
             .client
             .post(&cloud_url)
             .header(header::AUTHORIZATION, format!("Bearer {}", self.config.cloud.api_key))
             .header(header::CONTENT_TYPE, "application/json")
-            .json(&target_body)
+            .json(&body)
             .timeout(std::time::Duration::from_secs(self.config.cloud.timeout_secs));
 
         match req.send().await {
@@ -252,7 +243,7 @@ impl UpstreamClient {
                     duration_ms: duration.as_millis(),
                     is_failover,
                 };
-                self.handle_upstream_response(resp, is_stream, false, meta)
+                self.handle_upstream_response(resp, is_stream, None, meta)
             }
             Err(err) => {
                 error!(req_id = req_id, error = %err, "Cloud request failed");
@@ -273,7 +264,7 @@ impl UpstreamClient {
         &self,
         resp: reqwest::Response,
         _is_stream: bool,
-        is_local: bool,
+        guard: Option<crate::router::LocalSlotGuard>,
         meta: ResponseMeta,
     ) -> Response {
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
@@ -322,12 +313,6 @@ impl UpstreamClient {
             HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover"),
         );
 
-        let metrics = if is_local {
-            Some(self.metrics.clone())
-        } else {
-            None
-        };
-
         let raw_stream = Box::pin(
             resp.bytes_stream()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
@@ -335,7 +320,7 @@ impl UpstreamClient {
 
         let guarded = GuardedStream {
             inner: raw_stream,
-            metrics,
+            _guard: guard,
         };
 
         let body = Body::from_stream(guarded);

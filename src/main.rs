@@ -130,7 +130,14 @@ async fn cors_options_handler() -> impl IntoResponse {
         [
             ("access-control-allow-origin", "*"),
             ("access-control-allow-methods", "GET, POST, OPTIONS"),
-            ("access-control-allow-headers", "content-type, authorization"),
+            (
+                "access-control-allow-headers",
+                "content-type, authorization, x-ferry-condense, x-ferry-route",
+            ),
+            (
+                "access-control-expose-headers",
+                "x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover",
+            ),
         ],
         "",
     )

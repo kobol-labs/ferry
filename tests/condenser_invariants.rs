@@ -698,6 +698,72 @@ async fn test_queue_contention_slot_release() {
     // Router should wait in queue, notice slot free, and route to Local!
     let d = router.decide(&body, None).await;
     assert_eq!(d.target, TargetProvider::Local);
+    assert!(d.slot_guard.is_some());
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // Dropping decision releases slot immediately
+    drop(d);
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_atomic_slot_concurrency_no_oversubscription() {
+    use ferry::config::Config;
+    use ferry::router::{Router, TargetProvider};
+    use ferry::stats::MetricsTracker;
+    use std::sync::Arc;
+
+    let mut cfg = Config::default();
+    cfg.local.max_slots = 3;
+    cfg.local.queue_timeout_ms = 0; // immediate spillover on contention
+    let config = Arc::new(cfg);
+    let metrics = Arc::new(MetricsTracker::new());
+    let router = Arc::new(Router::new(config, metrics.clone()));
+
+    let mut handles = Vec::new();
+
+    // Spawn 10 concurrent requests simultaneously
+    for _ in 0..10 {
+        let r = router.clone();
+        handles.push(tokio::spawn(async move {
+            let body = json!({
+                "messages": [
+                    { "role": "user", "content": "Concurrent test query" }
+                ]
+            });
+            r.decide(&body, None).await
+        }));
+    }
+
+    let mut local_count = 0;
+    let mut cloud_count = 0;
+    let mut retained_decisions = Vec::new();
+
+    for handle in handles {
+        let decision = handle.await.unwrap();
+        match decision.target {
+            TargetProvider::Local => {
+                local_count += 1;
+                retained_decisions.push(decision);
+            }
+            TargetProvider::Cloud => {
+                cloud_count += 1;
+            }
+        }
+    }
+
+    // Invariant: EXACTLY 3 requests acquired local slots; 7 spilled to cloud
+    assert_eq!(local_count, 3);
+    assert_eq!(cloud_count, 7);
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+    // Releasing one decision frees up exactly one slot
+    retained_decisions.pop();
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    // Releasing all remaining decisions drops active slots back to zero
+    retained_decisions.clear();
+    assert_eq!(metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 

@@ -9,13 +9,39 @@ pub enum TargetProvider {
     Cloud,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct LocalSlotGuard {
+    metrics: Option<Arc<MetricsTracker>>,
+}
+
+impl LocalSlotGuard {
+    pub fn new(metrics: Arc<MetricsTracker>) -> Self {
+        Self {
+            metrics: Some(metrics),
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.metrics = None;
+    }
+}
+
+impl Drop for LocalSlotGuard {
+    fn drop(&mut self) {
+        if let Some(m) = self.metrics.take() {
+            m.dec_local();
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct RouteDecision {
     pub target: TargetProvider,
     pub est_tokens: u64,
     pub is_spillover: bool,
     pub reason: String,
     pub local_only: bool,
+    pub slot_guard: Option<LocalSlotGuard>,
 }
 
 pub struct Router {
@@ -71,6 +97,7 @@ impl Router {
                 is_spillover: false,
                 reason: "client header X-Ferry-Route requested cloud-only".to_string(),
                 local_only: false,
+                slot_guard: None,
             };
         }
 
@@ -83,6 +110,7 @@ impl Router {
                 is_spillover: false,
                 reason: format!("circuit breaker open (Strata offline, {failures} failures)"),
                 local_only,
+                slot_guard: None,
             };
         }
 
@@ -96,6 +124,7 @@ impl Router {
                         is_spillover: false,
                         reason: format!("explicitly requested cloud model ({requested_model})"),
                         local_only: false,
+                        slot_guard: None,
                     };
                 }
             }
@@ -112,38 +141,52 @@ impl Router {
                 is_spillover: false,
                 reason: format!("context tokens ({est_tokens}) > local max ({max_context})"),
                 local_only,
+                slot_guard: None,
             };
         }
 
-        // 5. Check slot availability with contention queue support
-        let mut active_slots = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+        // 5. Atomic local slot acquisition with contention queue support
         let queue_timeout_ms = self.config.local.queue_timeout_ms;
 
-        if active_slots >= max_slots && queue_timeout_ms > 0 {
-            let start = std::time::Instant::now();
-            let wait_limit = std::time::Duration::from_millis(queue_timeout_ms);
-            while active_slots >= max_slots && start.elapsed() < wait_limit {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                active_slots = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
-        if active_slots < max_slots {
-            RouteDecision {
+        if self.metrics.try_acquire_local_slot(max_slots) {
+            let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+            return RouteDecision {
                 target: TargetProvider::Local,
                 est_tokens,
                 is_spillover: false,
-                reason: format!("local slot available ({active_slots}/{max_slots})"),
+                reason: format!("local slot acquired ({active}/{max_slots})"),
                 local_only,
+                slot_guard: Some(LocalSlotGuard::new(self.metrics.clone())),
+            };
+        }
+
+        if queue_timeout_ms > 0 {
+            let start = std::time::Instant::now();
+            let wait_limit = std::time::Duration::from_millis(queue_timeout_ms);
+            while start.elapsed() < wait_limit {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                if self.metrics.try_acquire_local_slot(max_slots) {
+                    let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+                    return RouteDecision {
+                        target: TargetProvider::Local,
+                        est_tokens,
+                        is_spillover: false,
+                        reason: format!("local slot acquired from contention queue ({active}/{max_slots})"),
+                        local_only,
+                        slot_guard: Some(LocalSlotGuard::new(self.metrics.clone())),
+                    };
+                }
             }
-        } else {
-            RouteDecision {
-                target: TargetProvider::Cloud,
-                est_tokens,
-                is_spillover: true,
-                reason: format!("local slots saturated ({active_slots}/{max_slots}) -> cloud spillover"),
-                local_only,
-            }
+        }
+
+        let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+        RouteDecision {
+            target: TargetProvider::Cloud,
+            est_tokens,
+            is_spillover: true,
+            reason: format!("local slots saturated ({active}/{max_slots}) -> cloud spillover"),
+            local_only,
+            slot_guard: None,
         }
     }
 }

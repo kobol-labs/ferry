@@ -119,11 +119,33 @@ impl MetricsTracker {
         Self::default()
     }
 
-    pub fn inc_local(&self, tokens: u64) {
+    pub fn try_acquire_local_slot(&self, max_slots: usize) -> bool {
+        let mut curr = self.active_local_slots.load(Ordering::SeqCst);
+        loop {
+            if curr >= max_slots {
+                return false;
+            }
+            match self.active_local_slots.compare_exchange_weak(
+                curr,
+                curr + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => curr = actual,
+            }
+        }
+    }
+
+    pub fn record_local_request_stats(&self, tokens: u64) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.local_requests.fetch_add(1, Ordering::Relaxed);
         self.total_tokens_est.fetch_add(tokens, Ordering::Relaxed);
         self.local_tokens_est.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub fn inc_local(&self, tokens: u64) {
+        self.record_local_request_stats(tokens);
         self.active_local_slots.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -165,9 +187,9 @@ impl MetricsTracker {
     pub fn record_local_failure(&self, threshold: u32) -> bool {
         let prev = self.consecutive_local_failures.fetch_add(1, Ordering::Relaxed);
         let current = prev + 1;
-        self.strata_online.store(false, Ordering::Relaxed);
 
         if current >= threshold {
+            self.strata_online.store(false, Ordering::Relaxed);
             let was_open = self.circuit_open.swap(true, Ordering::Relaxed);
             if !was_open {
                 self.circuit_trips_total.fetch_add(1, Ordering::Relaxed);
@@ -218,12 +240,26 @@ impl MetricsTracker {
         if chars_saved > 0 {
             self.condensed_requests.fetch_add(1, Ordering::Relaxed);
             self.chars_saved.fetch_add(chars_saved as u64, Ordering::Relaxed);
+        }
+        if reasoning_dropped > 0 {
             self.reasoning_blocks_dropped.fetch_add(reasoning_dropped as u64, Ordering::Relaxed);
+        }
+        if tools_truncated > 0 {
             self.tool_outputs_truncated.fetch_add(tools_truncated as u64, Ordering::Relaxed);
+        }
+        if ansi_stripped > 0 {
             self.ansi_stripped_count.fetch_add(ansi_stripped as u64, Ordering::Relaxed);
+        }
+        if progress_cleaned > 0 {
             self.progress_cleaned_count.fetch_add(progress_cleaned as u64, Ordering::Relaxed);
+        }
+        if lines_deduped > 0 {
             self.lines_deduped_count.fetch_add(lines_deduped as u64, Ordering::Relaxed);
+        }
+        if whitespace_collapsed > 0 {
             self.whitespace_collapsed_count.fetch_add(whitespace_collapsed as u64, Ordering::Relaxed);
+        }
+        if json_minified > 0 {
             self.json_minified_count.fetch_add(json_minified as u64, Ordering::Relaxed);
         }
         self.ledger_checks_passed.fetch_add(ledger_passed as u64, Ordering::Relaxed);

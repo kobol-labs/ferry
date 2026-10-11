@@ -438,7 +438,12 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
         let is_port_binding = clean.starts_with(':') && clean[1..].chars().all(|c| c.is_ascii_digit()) && clean.len() <= 6;
         let is_port_proto = clean.contains("/tcp") || clean.contains("/udp");
         let is_ipv4 = clean.split('.').count() == 4 && clean.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-        let is_host_port = clean.contains(':') && clean.split(':').count() == 2 && clean.split(':').nth(1).unwrap().chars().all(|c| c.is_ascii_digit());
+        let is_host_port = clean.contains(':')
+            && clean.split(':').count() == 2
+            && {
+                let port = clean.split(':').nth(1).unwrap();
+                !port.is_empty() && port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit())
+            };
 
         if is_port_binding || is_port_proto || is_ipv4 || is_host_port {
             anchors.push(clean.to_string());
@@ -453,8 +458,9 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
             || upper == "NEVER"
             || upper == "MUST"
             || upper == "DENY"
-            || upper == "DO NOT"
             || upper == "DON'T"
+            || upper == "DONT"
+            || upper == "DO_NOT"
             || upper == "CANNOT"
             || upper == "FORBIDDEN"
             || upper == "RESTRICTED"
