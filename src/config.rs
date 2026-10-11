@@ -124,18 +124,18 @@ impl Config {
     }
 
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("FERRY_BIND") { self.server.bind = v; }
-        if let Ok(v) = std::env::var("FERRY_LOCAL_API_BASE") { self.local.api_base = v; }
-        if let Ok(v) = std::env::var("FERRY_LOCAL_API_KEY") { self.local.api_key = v; }
-        if let Ok(v) = std::env::var("FERRY_LOCAL_MODEL") { self.local.model = v; }
+        if let Ok(v) = std::env::var("FERRY_BIND") { if !v.trim().is_empty() { self.server.bind = v; } }
+        if let Ok(v) = std::env::var("FERRY_LOCAL_API_BASE") { if !v.trim().is_empty() { self.local.api_base = v; } }
+        if let Ok(v) = std::env::var("FERRY_LOCAL_API_KEY") { if !v.trim().is_empty() { self.local.api_key = v; } }
+        if let Ok(v) = std::env::var("FERRY_LOCAL_MODEL") { if !v.trim().is_empty() { self.local.model = v; } }
         if let Ok(v) = std::env::var("FERRY_LOCAL_MAX_SLOTS") {
             if let Ok(n) = v.parse() { self.local.max_slots = n; }
         }
         if let Ok(v) = std::env::var("FERRY_LOCAL_MAX_CONTEXT") {
             if let Ok(n) = v.parse() { self.local.max_context_tokens = n; }
         }
-        if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { self.cloud.api_base = v; }
-        if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { self.cloud.api_key = v; }
-        if let Ok(v) = std::env::var("FERRY_CLOUD_MODEL") { self.cloud.model = v; }
+        if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { if !v.trim().is_empty() { self.cloud.api_base = v; } }
+        if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { if !v.trim().is_empty() { self.cloud.api_key = v; } }
+        if let Ok(v) = std::env::var("FERRY_CLOUD_MODEL") { if !v.trim().is_empty() { self.cloud.model = v; } }
     }
 }
