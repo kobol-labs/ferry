@@ -23,6 +23,8 @@ pub struct MetricsTracker {
     pub lines_deduped_count: AtomicU64,
     pub whitespace_collapsed_count: AtomicU64,
     pub json_minified_count: AtomicU64,
+    pub ledger_checks_passed: AtomicU64,
+    pub ledger_vetoed_count: AtomicU64,
 
     // Last request gauges (for real-time Grafana observation)
     pub last_prompt_tokens_original: AtomicU64,
@@ -54,6 +56,8 @@ pub struct StatsSnapshot {
     pub lines_deduped_count: u64,
     pub whitespace_collapsed_count: u64,
     pub json_minified_count: u64,
+    pub ledger_checks_passed: u64,
+    pub ledger_vetoed_count: u64,
 
     pub last_prompt_tokens_original: u64,
     pub last_prompt_tokens_condensed: u64,
@@ -104,6 +108,8 @@ impl MetricsTracker {
         lines_deduped: usize,
         whitespace_collapsed: usize,
         json_minified: usize,
+        ledger_passed: usize,
+        ledger_vetoed: usize,
     ) {
         self.last_prompt_tokens_original.store(orig_tokens, Ordering::Relaxed);
         self.last_prompt_tokens_condensed.store(cond_tokens, Ordering::Relaxed);
@@ -128,6 +134,8 @@ impl MetricsTracker {
             self.whitespace_collapsed_count.fetch_add(whitespace_collapsed as u64, Ordering::Relaxed);
             self.json_minified_count.fetch_add(json_minified as u64, Ordering::Relaxed);
         }
+        self.ledger_checks_passed.fetch_add(ledger_passed as u64, Ordering::Relaxed);
+        self.ledger_vetoed_count.fetch_add(ledger_vetoed as u64, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
@@ -164,6 +172,8 @@ impl MetricsTracker {
             lines_deduped_count: self.lines_deduped_count.load(Ordering::Relaxed),
             whitespace_collapsed_count: self.whitespace_collapsed_count.load(Ordering::Relaxed),
             json_minified_count: self.json_minified_count.load(Ordering::Relaxed),
+            ledger_checks_passed: self.ledger_checks_passed.load(Ordering::Relaxed),
+            ledger_vetoed_count: self.ledger_vetoed_count.load(Ordering::Relaxed),
 
             last_prompt_tokens_original: self.last_prompt_tokens_original.load(Ordering::Relaxed),
             last_prompt_tokens_condensed: self.last_prompt_tokens_condensed.load(Ordering::Relaxed),
@@ -208,6 +218,12 @@ impl MetricsTracker {
              ferry_condensation_cleaner_actions_total{{action=\"lines_deduped\"}} {lines_deduped}\n\
              ferry_condensation_cleaner_actions_total{{action=\"whitespace_collapsed\"}} {whitespace_collapsed}\n\
              ferry_condensation_cleaner_actions_total{{action=\"json_minified\"}} {json_minified}\n\
+             # HELP ferry_ledger_checks_passed_total Total compression operations verified by the constraint ledger\n\
+             # TYPE ferry_ledger_checks_passed_total counter\n\
+             ferry_ledger_checks_passed_total {ledger_passed}\n\
+             # HELP ferry_ledger_vetoed_total Total compression operations vetoed by the constraint ledger\n\
+             # TYPE ferry_ledger_vetoed_total counter\n\
+             ferry_ledger_vetoed_total {ledger_vetoed}\n\
              # HELP ferry_last_prompt_tokens_original Estimated tokens before condensation on most recent request\n\
              # TYPE ferry_last_prompt_tokens_original gauge\n\
              ferry_last_prompt_tokens_original {last_orig}\n\
@@ -239,6 +255,8 @@ impl MetricsTracker {
             lines_deduped = s.lines_deduped_count,
             whitespace_collapsed = s.whitespace_collapsed_count,
             json_minified = s.json_minified_count,
+            ledger_passed = s.ledger_checks_passed,
+            ledger_vetoed = s.ledger_vetoed_count,
             last_orig = s.last_prompt_tokens_original,
             last_cond = s.last_prompt_tokens_condensed,
             last_pct = s.last_savings_percent,

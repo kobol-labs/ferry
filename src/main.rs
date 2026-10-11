@@ -116,7 +116,7 @@ async fn chat_completions_handler(
 
     // Context condensation: strip past reasoning & truncate stale tool dumps
     let cond_stats = state.condenser.condense(&mut body);
-    if cond_stats.chars_saved > 0 {
+    if cond_stats.orig_chars > 0 {
         let orig_tokens = (cond_stats.orig_chars / 4) as u64;
         let cond_tokens = (cond_stats.cond_chars / 4) as u64;
         state.metrics.record_condensation(
@@ -130,6 +130,8 @@ async fn chat_completions_handler(
             cond_stats.lines_deduped_count,
             cond_stats.whitespace_collapsed_count,
             cond_stats.json_minified_count,
+            cond_stats.ledger_checks_passed,
+            cond_stats.ledger_vetoed_count,
         );
     }
 

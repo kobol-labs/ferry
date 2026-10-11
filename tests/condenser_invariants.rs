@@ -267,3 +267,107 @@ fn test_cleaner_counters_and_metrics() {
     assert!(!cleaned.contains("100%"));
     assert_eq!(cleaned_json, r#"{"count":42,"foo":"bar"}"#);
 }
+
+#[test]
+fn test_code_fence_protection_in_tool_output() {
+    let config = CondenserConfig {
+        enabled: true,
+        protect_code_blocks: true,
+        deduplicate_lines: true,
+        collapse_whitespace: true,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    let raw_tool_body = "Progress log line 1\nProgress log line 1\nProgress log line 1\n```rust\nfn calculate() {\n    let a = 1;\n    let a = 1;\n    let a = 1;\n}\n```\nDone.";
+    let cleaned = condenser.clean_tool_text(raw_tool_body);
+
+    // Repetitive logs outside code block are collapsed
+    assert!(cleaned.contains("[... repeated 2 times ...]"));
+    // Code block contents are completely preserved without deduplication
+    assert!(cleaned.contains("```rust\nfn calculate() {\n    let a = 1;\n    let a = 1;\n    let a = 1;\n}\n```"));
+}
+
+#[test]
+fn test_constraint_ledger_verifies_anchors() {
+    let config = CondenserConfig {
+        enabled: true,
+        enable_constraint_ledger: true,
+        protect_code_blocks: true,
+        deduplicate_lines: true,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+    let mut stats = ferry::condenser::CondensationStats::default();
+
+    let raw = "Auditing /var/log/detainer.log at https://github.com:443\nDuplicate notice\nDuplicate notice\nDuplicate notice\nDO NOT delete /etc/shadow";
+    let cleaned = condenser.clean_tool_text_with_stats(raw, &mut stats);
+
+    // Ledger check passed because path, URL, port, and negation are preserved
+    assert_eq!(stats.ledger_checks_passed, 1);
+    assert_eq!(stats.ledger_vetoed_count, 0);
+    assert!(cleaned.contains("/var/log/detainer.log"));
+    assert!(cleaned.contains("https://github.com:443"));
+    assert!(cleaned.contains("DO NOT delete /etc/shadow"));
+}
+
+#[test]
+fn test_constraint_ledger_veto_restores_verbatim() {
+    let config = CondenserConfig {
+        enabled: true,
+        enable_constraint_ledger: true,
+        protect_code_blocks: true,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    // Test verify_ledger directly
+    let original = "Audit /var/run/secrets/token and do NOT bypass https://internal.corp:8443";
+    let anchors = condenser.extract_critical_anchors(original);
+    assert!(anchors.iter().any(|a| a == "/var/run/secrets/token"));
+    assert!(anchors.iter().any(|a| a == "https://internal.corp:8443"));
+    assert!(anchors.iter().any(|a| a.eq_ignore_ascii_case("not")));
+
+    // If candidate text lost the anchor "/var/run/secrets/token", verify_ledger MUST return false
+    let bad_condensed = "Audit token and do NOT bypass https://internal.corp:8443";
+    assert!(!condenser.verify_ledger(&anchors, bad_condensed));
+
+    // If candidate text preserves all anchors, verify_ledger returns true
+    let good_condensed = "Audit /var/run/secrets/token and do not bypass https://internal.corp:8443";
+    assert!(condenser.verify_ledger(&anchors, good_condensed));
+}
+
+#[test]
+fn test_prefix_cache_alignment_preserves_initial_turn_bytes() {
+    let config = CondenserConfig {
+        enabled: true,
+        protect_static_prefix: true,
+        drop_historical_reasoning: true,
+        truncate_tool_outputs: true,
+        keep_recent_turns: 1,
+        max_tool_chars: 50,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    let system_prompt = "You are a vulnerability research agent with strict operating parameters.";
+    let initial_user_prompt = "Please audit detainer repo commit 42e3f1.";
+
+    let mut body = json!({
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": initial_user_prompt },
+            { "role": "assistant", "content": "Running git log.", "reasoning": "checking commit" },
+            { "role": "tool", "content": "Commit details:\n".to_string() + &"detail line\n".repeat(50) }
+        ]
+    });
+
+    let _stats = condenser.condense(&mut body);
+    let msgs = body["messages"].as_array().unwrap();
+
+    // Verify system message is 100% byte-for-byte identical
+    assert_eq!(msgs[0]["content"].as_str().unwrap(), system_prompt);
+    // Verify first user prompt is 100% byte-for-byte identical
+    assert_eq!(msgs[1]["content"].as_str().unwrap(), initial_user_prompt);
+}
+

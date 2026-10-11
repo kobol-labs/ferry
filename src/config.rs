@@ -130,6 +130,12 @@ pub struct CondenserConfig {
     pub deduplicate_lines: bool,
     #[serde(default = "default_minify_json_outputs")]
     pub minify_json_outputs: bool,
+    #[serde(default = "default_protect_code_blocks")]
+    pub protect_code_blocks: bool,
+    #[serde(default = "default_enable_constraint_ledger")]
+    pub enable_constraint_ledger: bool,
+    #[serde(default = "default_protect_static_prefix")]
+    pub protect_static_prefix: bool,
 }
 
 fn default_condensation_enabled() -> bool { true }
@@ -145,6 +151,9 @@ fn default_strip_progress_bars() -> bool { true }
 fn default_collapse_whitespace() -> bool { true }
 fn default_deduplicate_lines() -> bool { true }
 fn default_minify_json_outputs() -> bool { true }
+fn default_protect_code_blocks() -> bool { true }
+fn default_enable_constraint_ledger() -> bool { true }
+fn default_protect_static_prefix() -> bool { true }
 
 impl Default for CondenserConfig {
     fn default() -> Self {
@@ -162,6 +171,9 @@ impl Default for CondenserConfig {
             collapse_whitespace: default_collapse_whitespace(),
             deduplicate_lines: default_deduplicate_lines(),
             minify_json_outputs: default_minify_json_outputs(),
+            protect_code_blocks: default_protect_code_blocks(),
+            enable_constraint_ledger: default_enable_constraint_ledger(),
+            protect_static_prefix: default_protect_static_prefix(),
         }
     }
 }
@@ -230,6 +242,15 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_MINIFY_JSON") {
             if let Ok(b) = v.parse() { self.condensation.minify_json_outputs = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_PROTECT_CODE_BLOCKS") {
+            if let Ok(b) = v.parse() { self.condensation.protect_code_blocks = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_ENABLE_CONSTRAINT_LEDGER") {
+            if let Ok(b) = v.parse() { self.condensation.enable_constraint_ledger = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_PROTECT_STATIC_PREFIX") {
+            if let Ok(b) = v.parse() { self.condensation.protect_static_prefix = b; }
         }
     }
 }
