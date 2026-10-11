@@ -1,7 +1,7 @@
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetricsTracker {
     pub total_requests: AtomicU64,
     pub local_requests: AtomicU64,
@@ -31,6 +31,50 @@ pub struct MetricsTracker {
     pub last_prompt_tokens_condensed: AtomicU64,
     pub last_chars_saved: AtomicU64,
     pub last_savings_percent: AtomicU64, // scaled by 100, e.g. 2550 = 25.50%
+
+    // Circuit breaker & upstream hardware health
+    pub strata_online: AtomicBool,
+    pub circuit_open: AtomicBool,
+    pub consecutive_local_failures: AtomicU32,
+    pub circuit_trips_total: AtomicU64,
+}
+
+impl Default for MetricsTracker {
+    fn default() -> Self {
+        Self {
+            total_requests: AtomicU64::new(0),
+            local_requests: AtomicU64::new(0),
+            cloud_requests: AtomicU64::new(0),
+            spillover_requests: AtomicU64::new(0),
+            failover_requests: AtomicU64::new(0),
+            active_local_slots: AtomicUsize::new(0),
+            total_tokens_est: AtomicU64::new(0),
+            local_tokens_est: AtomicU64::new(0),
+            cloud_tokens_est: AtomicU64::new(0),
+
+            condensed_requests: AtomicU64::new(0),
+            chars_saved: AtomicU64::new(0),
+            reasoning_blocks_dropped: AtomicU64::new(0),
+            tool_outputs_truncated: AtomicU64::new(0),
+            ansi_stripped_count: AtomicU64::new(0),
+            progress_cleaned_count: AtomicU64::new(0),
+            lines_deduped_count: AtomicU64::new(0),
+            whitespace_collapsed_count: AtomicU64::new(0),
+            json_minified_count: AtomicU64::new(0),
+            ledger_checks_passed: AtomicU64::new(0),
+            ledger_vetoed_count: AtomicU64::new(0),
+
+            last_prompt_tokens_original: AtomicU64::new(0),
+            last_prompt_tokens_condensed: AtomicU64::new(0),
+            last_chars_saved: AtomicU64::new(0),
+            last_savings_percent: AtomicU64::new(0),
+
+            strata_online: AtomicBool::new(true),
+            circuit_open: AtomicBool::new(false),
+            consecutive_local_failures: AtomicU32::new(0),
+            circuit_trips_total: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +107,11 @@ pub struct StatsSnapshot {
     pub last_prompt_tokens_condensed: u64,
     pub last_chars_saved: u64,
     pub last_savings_percent: f64,
+
+    pub strata_online: bool,
+    pub circuit_open: bool,
+    pub consecutive_local_failures: u32,
+    pub circuit_trips_total: u64,
 }
 
 impl MetricsTracker {
@@ -105,6 +154,38 @@ impl MetricsTracker {
 
     pub fn inc_failover(&self) {
         self.failover_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_local_success(&self) {
+        self.consecutive_local_failures.store(0, Ordering::Relaxed);
+        self.circuit_open.store(false, Ordering::Relaxed);
+        self.strata_online.store(true, Ordering::Relaxed);
+    }
+
+    pub fn record_local_failure(&self, threshold: u32) -> bool {
+        let prev = self.consecutive_local_failures.fetch_add(1, Ordering::Relaxed);
+        let current = prev + 1;
+        self.strata_online.store(false, Ordering::Relaxed);
+
+        if current >= threshold {
+            let was_open = self.circuit_open.swap(true, Ordering::Relaxed);
+            if !was_open {
+                self.circuit_trips_total.fetch_add(1, Ordering::Relaxed);
+                return true; // Tripped just now
+            }
+        }
+        false
+    }
+
+    pub fn set_strata_status(&self, online: bool) {
+        self.strata_online.store(online, Ordering::Relaxed);
+        if !online {
+            self.circuit_open.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_circuit_open(&self) -> bool {
+        self.circuit_open.load(Ordering::Relaxed)
     }
 
     pub fn record_condensation(
@@ -190,6 +271,11 @@ impl MetricsTracker {
             last_prompt_tokens_condensed: self.last_prompt_tokens_condensed.load(Ordering::Relaxed),
             last_chars_saved: self.last_chars_saved.load(Ordering::Relaxed),
             last_savings_percent: pct_scaled as f64 / 100.0,
+
+            strata_online: self.strata_online.load(Ordering::Relaxed),
+            circuit_open: self.circuit_open.load(Ordering::Relaxed),
+            consecutive_local_failures: self.consecutive_local_failures.load(Ordering::Relaxed),
+            circuit_trips_total: self.circuit_trips_total.load(Ordering::Relaxed),
         }
     }
 
@@ -206,6 +292,15 @@ impl MetricsTracker {
              # HELP ferry_active_slots Current active local hardware slots\n\
              # TYPE ferry_active_slots gauge\n\
              ferry_active_slots {slots}\n\
+             # HELP ferry_strata_online Health status of the local hardware provider (1 = online, 0 = offline)\n\
+             # TYPE ferry_strata_online gauge\n\
+             ferry_strata_online {strata_online}\n\
+             # HELP ferry_circuit_open Whether the circuit breaker is currently open (1 = open, 0 = closed)\n\
+             # TYPE ferry_circuit_open gauge\n\
+             ferry_circuit_open {circuit_open}\n\
+             # HELP ferry_circuit_trips_total Total times the circuit breaker tripped\n\
+             # TYPE ferry_circuit_trips_total counter\n\
+             ferry_circuit_trips_total {circuit_trips}\n\
              # HELP ferry_tokens_estimated Total estimated tokens processed\n\
              # TYPE ferry_tokens_estimated counter\n\
              ferry_tokens_estimated {tokens}\n\
@@ -253,6 +348,9 @@ impl MetricsTracker {
             spill = s.spillover_requests,
             fail = s.failover_requests,
             slots = s.active_local_slots,
+            strata_online = if s.strata_online { 1 } else { 0 },
+            circuit_open = if s.circuit_open { 1 } else { 0 },
+            circuit_trips = s.circuit_trips_total,
             tokens = s.total_tokens_est,
             ltokens = s.local_tokens_est,
             ctokens = s.cloud_tokens_est,

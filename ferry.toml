@@ -9,6 +9,9 @@ model = "qwen3.8-flash-next-iq2_xs"
 max_slots = 3
 max_context_tokens = 65000
 timeout_secs = 90
+connect_timeout_secs = 3
+circuit_breaker_threshold = 3
+probe_interval_secs = 5
 
 [cloud]
 name = "minimax"

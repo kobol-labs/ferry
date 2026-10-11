@@ -580,4 +580,56 @@ fn test_explicit_cloud_model_selection_router() {
     assert!(decision.reason.contains("explicitly requested"));
 }
 
+#[test]
+fn test_circuit_breaker_trip_and_recovery() {
+    use ferry::config::Config;
+    use ferry::router::{Router, TargetProvider};
+    use ferry::stats::MetricsTracker;
+    use std::sync::Arc;
+
+    let config = Arc::new(Config::default());
+    let metrics = Arc::new(MetricsTracker::new());
+    let router = Router::new(config, metrics.clone());
+
+    let body = json!({
+        "messages": [
+            { "role": "user", "content": "Query" }
+        ]
+    });
+
+    // 1. Initial healthy state: routes to local
+    let d1 = router.decide(&body);
+    assert_eq!(d1.target, TargetProvider::Local);
+    assert!(!metrics.is_circuit_open());
+    assert!(metrics.strata_online.load(std::sync::atomic::Ordering::Relaxed));
+
+    // 2. Simulate 2 consecutive failures (threshold is 3)
+    assert!(!metrics.record_local_failure(3));
+    assert!(!metrics.record_local_failure(3));
+    assert!(!metrics.is_circuit_open());
+
+    // 3. 3rd consecutive failure: trips the circuit breaker!
+    let tripped = metrics.record_local_failure(3);
+    assert!(tripped);
+    assert!(metrics.is_circuit_open());
+    assert!(!metrics.strata_online.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(metrics.circuit_trips_total.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // 4. Now router MUST immediately route to Cloud with 0ms delay!
+    let d2 = router.decide(&body);
+    assert_eq!(d2.target, TargetProvider::Cloud);
+    assert!(d2.reason.contains("circuit breaker open"));
+
+    // 5. Simulate Strata recovery (probe succeeds or turn succeeds)
+    metrics.record_local_success();
+    assert!(!metrics.is_circuit_open());
+    assert!(metrics.strata_online.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(metrics.consecutive_local_failures.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    // 6. Router immediately resumes local GPU routing!
+    let d3 = router.decide(&body);
+    assert_eq!(d3.target, TargetProvider::Local);
+}
+
+
 

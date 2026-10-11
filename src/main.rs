@@ -51,6 +51,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_id_counter: AtomicU64::new(1),
     });
 
+    // Spawn background health probe for local Strata hardware
+    let probe_state = state.clone();
+    tokio::spawn(async move {
+        let probe_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(probe_state.config.local.connect_timeout_secs))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        let probe_url = format!("{}/models", probe_state.config.local.api_base.trim_end_matches('/'));
+        let interval_secs = probe_state.config.local.probe_interval_secs.max(1);
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+
+            let res = probe_client
+                .get(&probe_url)
+                .header("Authorization", format!("Bearer {}", probe_state.config.local.api_key))
+                .send()
+                .await;
+
+            match res {
+                Ok(resp) if resp.status().is_success() => {
+                    let was_open = probe_state.metrics.is_circuit_open();
+                    probe_state.metrics.record_local_success();
+                    if was_open {
+                        info!("Circuit breaker RESET: Strata is back online and healthy. Resuming local GPU routing.");
+                    }
+                }
+                Ok(resp) => {
+                    tracing::debug!(status = resp.status().as_u16(), "Strata probe returned non-200");
+                    let tripped = probe_state.metrics.record_local_failure(probe_state.config.local.circuit_breaker_threshold);
+                    if tripped {
+                        tracing::warn!("Circuit breaker TRIPPED by background probe (non-200 response). Strata marked offline.");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Strata probe connection failed");
+                    let tripped = probe_state.metrics.record_local_failure(probe_state.config.local.circuit_breaker_threshold);
+                    if tripped {
+                        tracing::warn!("Circuit breaker TRIPPED by background probe (connection failure). Strata marked offline.");
+                    }
+                }
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
@@ -93,9 +140,13 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     (
         [("access-control-allow-origin", "*")],
         Json(json!({
-            "status": "ok",
+            "status": if snap.circuit_open { "degraded" } else { "ok" },
             "service": "ferry",
             "version": env!("CARGO_PKG_VERSION"),
+            "strata_online": snap.strata_online,
+            "circuit_breaker_open": snap.circuit_open,
+            "consecutive_local_failures": snap.consecutive_local_failures,
+            "circuit_trips_total": snap.circuit_trips_total,
             "active_local_slots": snap.active_local_slots,
             "max_local_slots": state.config.local.max_slots,
             "condensation_enabled": state.config.condensation.enabled,

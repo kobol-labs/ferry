@@ -72,6 +72,17 @@ impl Router {
             }
         }
 
+        // Check if circuit breaker is open (Strata is offline / failing)
+        if self.metrics.is_circuit_open() {
+            let failures = self.metrics.consecutive_local_failures.load(std::sync::atomic::Ordering::Relaxed);
+            return RouteDecision {
+                target: TargetProvider::Cloud,
+                est_tokens,
+                is_spillover: false,
+                reason: format!("circuit breaker open (Strata offline, {failures} failures) -> instant cloud fallback"),
+            };
+        }
+
         let max_context = self.config.local.max_context_tokens as u64;
         let max_slots = self.config.local.max_slots;
         let active_slots = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);

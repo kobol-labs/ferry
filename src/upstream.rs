@@ -48,6 +48,7 @@ impl UpstreamClient {
         let client = Client::builder()
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .tcp_nodelay(true)
+            .connect_timeout(std::time::Duration::from_secs(config.local.connect_timeout_secs))
             .build()
             .expect("Failed to build HTTP client");
 
@@ -93,6 +94,7 @@ impl UpstreamClient {
 
                 match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        self.metrics.record_local_success();
                         let duration = start.elapsed();
                         info!(
                             req_id = req_id,
@@ -104,6 +106,7 @@ impl UpstreamClient {
                         self.handle_upstream_response(resp, is_stream, true)
                     }
                     Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
+                        self.metrics.record_local_success();
                         let status = resp.status();
                         let duration = start.elapsed();
                         warn!(
@@ -123,6 +126,14 @@ impl UpstreamClient {
                             error = %error_text,
                             "Local provider returned server error. Failing over to cloud..."
                         );
+                        let tripped = self.metrics.record_local_failure(self.config.local.circuit_breaker_threshold);
+                        if tripped {
+                            warn!(
+                                req_id = req_id,
+                                threshold = self.config.local.circuit_breaker_threshold,
+                                "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
+                            );
+                        }
                         self.metrics.dec_local();
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
@@ -134,6 +145,14 @@ impl UpstreamClient {
                             error = %err,
                             "Local provider connection failed. Failing over to cloud..."
                         );
+                        let tripped = self.metrics.record_local_failure(self.config.local.circuit_breaker_threshold);
+                        if tripped {
+                            warn!(
+                                req_id = req_id,
+                                threshold = self.config.local.circuit_breaker_threshold,
+                                "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
+                            );
+                        }
                         self.metrics.dec_local();
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);

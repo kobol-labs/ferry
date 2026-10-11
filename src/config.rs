@@ -47,6 +47,12 @@ pub struct LocalConfig {
     pub max_context_tokens: usize,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: u32,
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u64,
 }
 
 fn default_local_name() -> String { "strata".to_string() }
@@ -56,6 +62,9 @@ fn default_local_model() -> String { "qwen3.8-flash-next-iq2_xs".to_string() }
 fn default_max_slots() -> usize { 3 }
 fn default_max_context_tokens() -> usize { 65000 }
 fn default_timeout_secs() -> u64 { 90 }
+fn default_connect_timeout_secs() -> u64 { 3 }
+fn default_circuit_breaker_threshold() -> u32 { 3 }
+fn default_probe_interval_secs() -> u64 { 5 }
 
 impl Default for LocalConfig {
     fn default() -> Self {
@@ -67,6 +76,9 @@ impl Default for LocalConfig {
             max_slots: default_max_slots(),
             max_context_tokens: default_max_context_tokens(),
             timeout_secs: default_timeout_secs(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            circuit_breaker_threshold: default_circuit_breaker_threshold(),
+            probe_interval_secs: default_probe_interval_secs(),
         }
     }
 }
@@ -215,6 +227,15 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_LOCAL_TIMEOUT_SECS") {
             if let Ok(n) = v.parse() { self.local.timeout_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_LOCAL_CONNECT_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() { self.local.connect_timeout_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_CIRCUIT_BREAKER_THRESHOLD") {
+            if let Ok(n) = v.parse() { self.local.circuit_breaker_threshold = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_PROBE_INTERVAL_SECS") {
+            if let Ok(n) = v.parse() { self.local.probe_interval_secs = n; }
         }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { if !v.trim().is_empty() { self.cloud.api_base = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { if !v.trim().is_empty() { self.cloud.api_key = v; } }
