@@ -363,7 +363,12 @@ fn test_constraint_ledger_veto_in_condense() {
     };
     let condenser = ContextCondenser::new(config);
 
-    let raw = "Header\nMiddle line with CRITICAL /var/run/secrets/token\nFooter line";
+    let mut lines = Vec::new();
+    for i in 1..=30 { lines.push(format!("Header line {}", i)); }
+    lines.push("CRITICAL /var/run/secrets/token".to_string());
+    for i in 1..=25 { lines.push(format!("Footer line {}", i)); }
+    let raw = lines.join("\n");
+
     let mut body = json!({
         "messages": [
             { "role": "system", "content": "You are a scanner." },
