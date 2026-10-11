@@ -1,0 +1,21 @@
+[package]
+name = "ferry"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kobol Labs <team@kobol.ai>"]
+description = "Ultra-fast hybrid LLM router and metrics proxy for on-prem GPU hardware with cloud overflow"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.43", features = ["full"] }
+axum = { version = "0.8", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+futures-util = "0.3"
+bytes = "1.10"
+pin-project-lite = "0.2"
+chrono = { version = "0.4", features = ["serde"] }

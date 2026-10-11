@@ -1,0 +1,18 @@
+[server]
+bind = "0.0.0.0:4000"
+
+[local]
+name = "strata"
+api_base = "http://192.168.9.99:8080/v1"
+api_key = "sk-strata-stevegaming"
+model = "qwen3.8-flash-next-iq2_xs"
+max_slots = 3
+max_context_tokens = 65000
+timeout_secs = 90
+
+[cloud]
+name = "minimax"
+api_base = "https://api.minimax.io/v1"
+api_key = ""
+model = "MiniMax-M3"
+timeout_secs = 300
