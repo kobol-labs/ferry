@@ -44,6 +44,14 @@ impl Router {
                 if let Some(output) = msg.get("output").and_then(|o| o.as_str()) {
                     char_count += output.len();
                 }
+                // Handle tool_calls arguments from assistant messages
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                    for call in tool_calls {
+                        if let Some(args) = call.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
+                            char_count += args.len();
+                        }
+                    }
+                }
             }
         }
         (char_count as f64 / 3.0).ceil() as u64

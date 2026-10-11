@@ -55,8 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/v1/models", get(models_handler))
-        .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/models", get(models_handler).options(cors_options_handler))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions_handler).options(cors_options_handler),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
 
@@ -72,6 +75,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn cors_options_handler() -> impl IntoResponse {
+    (
+        [
+            ("access-control-allow-origin", "*"),
+            ("access-control-allow-methods", "GET, POST, OPTIONS"),
+            ("access-control-allow-headers", "content-type, authorization"),
+        ],
+        "",
+    )
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

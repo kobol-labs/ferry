@@ -79,7 +79,11 @@ impl MetricsTracker {
     }
 
     pub fn dec_local(&self) {
-        self.active_local_slots.fetch_sub(1, Ordering::Relaxed);
+        self.active_local_slots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                Some(val.saturating_sub(1))
+            })
+            .ok();
     }
 
     pub fn inc_cloud(&self, tokens: u64, is_spillover: bool) {

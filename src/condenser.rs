@@ -305,20 +305,28 @@ impl ContextCondenser {
     }
 }
 
-/// Segments a tool output into plain text chunks and protected markdown code blocks
+/// Segments a tool output into plain text chunks and protected markdown code blocks.
+/// Supports multi-backtick nested fences (e.g. 4+ backticks enclosing 3 backticks).
 pub fn segment_markdown_code_blocks(input: &str) -> Vec<ContentSegment> {
     let mut segments = Vec::new();
     let mut current_chunk = Vec::new();
     let mut in_code_block = false;
+    let mut fence_len = 0;
 
     for line in input.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
+            let backtick_count = trimmed.chars().take_while(|&c| c == '`').count();
             if in_code_block {
-                current_chunk.push(line);
-                segments.push(ContentSegment::Code(current_chunk.join("\n")));
-                current_chunk.clear();
-                in_code_block = false;
+                if backtick_count >= fence_len {
+                    current_chunk.push(line);
+                    segments.push(ContentSegment::Code(current_chunk.join("\n")));
+                    current_chunk.clear();
+                    in_code_block = false;
+                    fence_len = 0;
+                } else {
+                    current_chunk.push(line);
+                }
             } else {
                 if !current_chunk.is_empty() {
                     segments.push(ContentSegment::Text(current_chunk.join("\n")));
@@ -326,6 +334,7 @@ pub fn segment_markdown_code_blocks(input: &str) -> Vec<ContentSegment> {
                 }
                 current_chunk.push(line);
                 in_code_block = true;
+                fence_len = backtick_count;
             }
         } else {
             current_chunk.push(line);
@@ -396,7 +405,21 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
         }
 
         // 6. Security keywords and imperatives
-        if upper == "CRITICAL" || upper == "CVSS" || upper == "HIGH" || upper == "NOT" || upper == "NEVER" || upper == "MUST" || upper == "DENY" || upper == "DO NOT" {
+        if upper == "CRITICAL"
+            || upper == "CVSS"
+            || upper == "HIGH"
+            || upper == "NOT"
+            || upper == "NEVER"
+            || upper == "MUST"
+            || upper == "DENY"
+            || upper == "DO NOT"
+            || upper == "DON'T"
+            || upper == "CANNOT"
+            || upper == "FORBIDDEN"
+            || upper == "RESTRICTED"
+            || upper == "PROHIBITED"
+            || upper == "BYPASS"
+        {
             anchors.push(clean.to_string());
             continue;
         }
