@@ -83,6 +83,25 @@ impl UpstreamClient {
                 let mut target_body = body.clone();
                 if let Some(obj) = target_body.as_object_mut() {
                     obj.insert("model".to_string(), Value::String(self.config.local.model.clone()));
+
+                    // Normalize OpenAI Responses format (type: function_call_output) to standard OpenAI (role: tool)
+                    if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                        for msg in messages {
+                            let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
+                            if msg_type == "function_call_output" && role.is_empty() {
+                                if let Some(m_obj) = msg.as_object_mut() {
+                                    m_obj.insert("role".to_string(), Value::String("tool".to_string()));
+                                    if let Some(call_id) = m_obj.get("call_id").cloned() {
+                                        m_obj.insert("tool_call_id".to_string(), call_id);
+                                    }
+                                    if let Some(out_val) = m_obj.remove("output") {
+                                        m_obj.insert("content".to_string(), out_val);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let req = self

@@ -174,19 +174,6 @@ impl ContextCondenser {
                             obj.insert(target_key.to_string(), Value::String(processed));
                         }
                     }
-
-                    // Dual-key schema normalization: populate standard role: tool and content while preserving output
-                    if msg_type == "function_call_output" && role.is_empty() {
-                        if let Some(obj) = msg.as_object_mut() {
-                            obj.insert("role".to_string(), Value::String("tool".to_string()));
-                            if let Some(call_id) = obj.get("call_id").cloned() {
-                                obj.insert("tool_call_id".to_string(), call_id);
-                            }
-                            if let Some(out_val) = obj.get("output").cloned() {
-                                obj.insert("content".to_string(), out_val);
-                            }
-                        }
-                    }
                 }
             }
         }
