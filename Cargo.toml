@@ -1,10 +1,18 @@
 [package]
 name = "ferry"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Kobol Labs <team@kobol.ai>"]
 description = "Ultra-fast hybrid LLM router and metrics proxy for on-prem GPU hardware with cloud overflow"
 license = "MIT"
+
+[lib]
+name = "ferry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferry"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }

@@ -13,11 +13,22 @@ pub struct MetricsTracker {
     pub local_tokens_est: AtomicU64,
     pub cloud_tokens_est: AtomicU64,
 
-    // Condensation statistics
+    // Condensation statistics (Lifetime counters)
     pub condensed_requests: AtomicU64,
     pub chars_saved: AtomicU64,
     pub reasoning_blocks_dropped: AtomicU64,
     pub tool_outputs_truncated: AtomicU64,
+    pub ansi_stripped_count: AtomicU64,
+    pub progress_cleaned_count: AtomicU64,
+    pub lines_deduped_count: AtomicU64,
+    pub whitespace_collapsed_count: AtomicU64,
+    pub json_minified_count: AtomicU64,
+
+    // Last request gauges (for real-time Grafana observation)
+    pub last_prompt_tokens_original: AtomicU64,
+    pub last_prompt_tokens_condensed: AtomicU64,
+    pub last_chars_saved: AtomicU64,
+    pub last_savings_percent: AtomicU64, // scaled by 100, e.g. 2550 = 25.50%
 }
 
 #[derive(Debug, Serialize)]
@@ -35,8 +46,19 @@ pub struct StatsSnapshot {
 
     pub condensed_requests: u64,
     pub chars_saved: u64,
+    pub tokens_saved_est: u64,
     pub reasoning_blocks_dropped: u64,
     pub tool_outputs_truncated: u64,
+    pub ansi_stripped_count: u64,
+    pub progress_cleaned_count: u64,
+    pub lines_deduped_count: u64,
+    pub whitespace_collapsed_count: u64,
+    pub json_minified_count: u64,
+
+    pub last_prompt_tokens_original: u64,
+    pub last_prompt_tokens_condensed: u64,
+    pub last_chars_saved: u64,
+    pub last_savings_percent: f64,
 }
 
 impl MetricsTracker {
@@ -70,12 +92,41 @@ impl MetricsTracker {
         self.failover_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_condensation(&self, reasoning_dropped: usize, tools_truncated: usize, chars_saved: usize) {
+    pub fn record_condensation(
+        &self,
+        orig_tokens: u64,
+        cond_tokens: u64,
+        reasoning_dropped: usize,
+        tools_truncated: usize,
+        chars_saved: usize,
+        ansi_stripped: usize,
+        progress_cleaned: usize,
+        lines_deduped: usize,
+        whitespace_collapsed: usize,
+        json_minified: usize,
+    ) {
+        self.last_prompt_tokens_original.store(orig_tokens, Ordering::Relaxed);
+        self.last_prompt_tokens_condensed.store(cond_tokens, Ordering::Relaxed);
+        self.last_chars_saved.store(chars_saved as u64, Ordering::Relaxed);
+
+        let pct = if orig_tokens > 0 && orig_tokens >= cond_tokens {
+            let diff = orig_tokens - cond_tokens;
+            (diff as f64 / orig_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+        self.last_savings_percent.store((pct * 100.0).round() as u64, Ordering::Relaxed);
+
         if chars_saved > 0 {
             self.condensed_requests.fetch_add(1, Ordering::Relaxed);
             self.chars_saved.fetch_add(chars_saved as u64, Ordering::Relaxed);
             self.reasoning_blocks_dropped.fetch_add(reasoning_dropped as u64, Ordering::Relaxed);
             self.tool_outputs_truncated.fetch_add(tools_truncated as u64, Ordering::Relaxed);
+            self.ansi_stripped_count.fetch_add(ansi_stripped as u64, Ordering::Relaxed);
+            self.progress_cleaned_count.fetch_add(progress_cleaned as u64, Ordering::Relaxed);
+            self.lines_deduped_count.fetch_add(lines_deduped as u64, Ordering::Relaxed);
+            self.whitespace_collapsed_count.fetch_add(whitespace_collapsed as u64, Ordering::Relaxed);
+            self.json_minified_count.fetch_add(json_minified as u64, Ordering::Relaxed);
         }
     }
 
@@ -88,6 +139,9 @@ impl MetricsTracker {
             0.0
         };
 
+        let chars_saved = self.chars_saved.load(Ordering::Relaxed);
+        let pct_scaled = self.last_savings_percent.load(Ordering::Relaxed);
+
         StatsSnapshot {
             total_requests: total,
             local_requests: local,
@@ -99,10 +153,22 @@ impl MetricsTracker {
             local_tokens_est: self.local_tokens_est.load(Ordering::Relaxed),
             cloud_tokens_est: self.cloud_tokens_est.load(Ordering::Relaxed),
             local_ratio_percent: (ratio * 100.0).round() / 100.0,
+
             condensed_requests: self.condensed_requests.load(Ordering::Relaxed),
-            chars_saved: self.chars_saved.load(Ordering::Relaxed),
+            chars_saved,
+            tokens_saved_est: chars_saved / 4,
             reasoning_blocks_dropped: self.reasoning_blocks_dropped.load(Ordering::Relaxed),
             tool_outputs_truncated: self.tool_outputs_truncated.load(Ordering::Relaxed),
+            ansi_stripped_count: self.ansi_stripped_count.load(Ordering::Relaxed),
+            progress_cleaned_count: self.progress_cleaned_count.load(Ordering::Relaxed),
+            lines_deduped_count: self.lines_deduped_count.load(Ordering::Relaxed),
+            whitespace_collapsed_count: self.whitespace_collapsed_count.load(Ordering::Relaxed),
+            json_minified_count: self.json_minified_count.load(Ordering::Relaxed),
+
+            last_prompt_tokens_original: self.last_prompt_tokens_original.load(Ordering::Relaxed),
+            last_prompt_tokens_condensed: self.last_prompt_tokens_condensed.load(Ordering::Relaxed),
+            last_chars_saved: self.last_chars_saved.load(Ordering::Relaxed),
+            last_savings_percent: pct_scaled as f64 / 100.0,
         }
     }
 
@@ -130,12 +196,30 @@ impl MetricsTracker {
              # HELP ferry_chars_saved_total Total characters pruned from prompts\n\
              # TYPE ferry_chars_saved_total counter\n\
              ferry_chars_saved_total {chars_saved}\n\
-             # HELP ferry_reasoning_blocks_dropped_total Total historical reasoning blocks stripped\n\
-             # TYPE ferry_reasoning_blocks_dropped_total counter\n\
-             ferry_reasoning_blocks_dropped_total {reasoning_dropped}\n\
-             # HELP ferry_tool_outputs_truncated_total Total historical tool outputs truncated\n\
-             # TYPE ferry_tool_outputs_truncated_total counter\n\
-             ferry_tool_outputs_truncated_total {tools_truncated}\n",
+             # HELP ferry_tokens_saved_estimated_total Total tokens estimated saved\n\
+             # TYPE ferry_tokens_saved_estimated_total counter\n\
+             ferry_tokens_saved_estimated_total {tokens_saved}\n\
+             # HELP ferry_condensation_cleaner_actions_total Total actions performed per cleaner filter\n\
+             # TYPE ferry_condensation_cleaner_actions_total counter\n\
+             ferry_condensation_cleaner_actions_total{{action=\"reasoning_dropped\"}} {reasoning_dropped}\n\
+             ferry_condensation_cleaner_actions_total{{action=\"tool_truncated\"}} {tools_truncated}\n\
+             ferry_condensation_cleaner_actions_total{{action=\"ansi_stripped\"}} {ansi_stripped}\n\
+             ferry_condensation_cleaner_actions_total{{action=\"progress_cleaned\"}} {progress_cleaned}\n\
+             ferry_condensation_cleaner_actions_total{{action=\"lines_deduped\"}} {lines_deduped}\n\
+             ferry_condensation_cleaner_actions_total{{action=\"whitespace_collapsed\"}} {whitespace_collapsed}\n\
+             ferry_condensation_cleaner_actions_total{{action=\"json_minified\"}} {json_minified}\n\
+             # HELP ferry_last_prompt_tokens_original Estimated tokens before condensation on most recent request\n\
+             # TYPE ferry_last_prompt_tokens_original gauge\n\
+             ferry_last_prompt_tokens_original {last_orig}\n\
+             # HELP ferry_last_prompt_tokens_condensed Estimated tokens after condensation on most recent request\n\
+             # TYPE ferry_last_prompt_tokens_condensed gauge\n\
+             ferry_last_prompt_tokens_condensed {last_cond}\n\
+             # HELP ferry_last_condensation_savings_percent Percentage of prompt tokens pruned on most recent request\n\
+             # TYPE ferry_last_condensation_savings_percent gauge\n\
+             ferry_last_condensation_savings_percent {last_pct:.2}\n\
+             # HELP ferry_last_condensation_chars_saved Characters pruned on most recent request\n\
+             # TYPE ferry_last_condensation_chars_saved gauge\n\
+             ferry_last_condensation_chars_saved {last_chars}\n",
             total = s.total_requests,
             local = s.local_requests,
             cloud = s.cloud_requests,
@@ -147,8 +231,18 @@ impl MetricsTracker {
             ctokens = s.cloud_tokens_est,
             condensed_reqs = s.condensed_requests,
             chars_saved = s.chars_saved,
+            tokens_saved = s.tokens_saved_est,
             reasoning_dropped = s.reasoning_blocks_dropped,
             tools_truncated = s.tool_outputs_truncated,
+            ansi_stripped = s.ansi_stripped_count,
+            progress_cleaned = s.progress_cleaned_count,
+            lines_deduped = s.lines_deduped_count,
+            whitespace_collapsed = s.whitespace_collapsed_count,
+            json_minified = s.json_minified_count,
+            last_orig = s.last_prompt_tokens_original,
+            last_cond = s.last_prompt_tokens_condensed,
+            last_pct = s.last_savings_percent,
+            last_chars = s.last_chars_saved,
         )
     }
 }

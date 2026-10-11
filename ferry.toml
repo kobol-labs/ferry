@@ -26,13 +26,13 @@ drop_historical_reasoning = true
 truncate_tool_outputs = true
 # Number of most recent turns to keep 100% byte-for-byte untouched (immediate context)
 keep_recent_turns = 1
-# Character threshold before an older tool output is truncated (default: 800 chars)
-max_tool_chars = 800
-# Sanity cap on any single tool output even in recent turns (default: 12000 chars)
-recent_max_tool_chars = 12000
+# Character threshold before an older tool output is truncated (default: 2000 chars)
+max_tool_chars = 2000
+# Runaway safety cap on recent turn tool outputs to avoid blinding auditor on code files (default: 60000 chars)
+recent_max_tool_chars = 60000
 # Lines to preserve from the head and tail of truncated tool outputs
-head_lines = 5
-tail_lines = 3
+head_lines = 15
+tail_lines = 10
 # RTK-inspired inline stream cleaners:
 strip_ansi_escapes = true       # Strip ANSI terminal colors and cursor codes
 strip_progress_bars = true      # Remove carriage-return overwrites and progress bars

@@ -136,10 +136,10 @@ fn default_condensation_enabled() -> bool { true }
 fn default_drop_historical_reasoning() -> bool { true }
 fn default_truncate_tool_outputs() -> bool { true }
 fn default_keep_recent_turns() -> usize { 1 }
-fn default_max_tool_chars() -> usize { 800 }
-fn default_recent_max_tool_chars() -> usize { 12000 }
-fn default_head_lines() -> usize { 5 }
-fn default_tail_lines() -> usize { 3 }
+fn default_max_tool_chars() -> usize { 2000 }
+fn default_recent_max_tool_chars() -> usize { 60000 }
+fn default_head_lines() -> usize { 15 }
+fn default_tail_lines() -> usize { 10 }
 fn default_strip_ansi_escapes() -> bool { true }
 fn default_strip_progress_bars() -> bool { true }
 fn default_collapse_whitespace() -> bool { true }

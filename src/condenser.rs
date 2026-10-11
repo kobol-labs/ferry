@@ -8,9 +8,16 @@ pub struct ContextCondenser {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CondensationStats {
+    pub orig_chars: usize,
+    pub cond_chars: usize,
     pub reasoning_blocks_dropped: usize,
     pub tool_outputs_truncated: usize,
     pub chars_saved: usize,
+    pub ansi_stripped_count: usize,
+    pub progress_cleaned_count: usize,
+    pub lines_deduped_count: usize,
+    pub whitespace_collapsed_count: usize,
+    pub json_minified_count: usize,
 }
 
 impl ContextCondenser {
@@ -30,6 +37,8 @@ impl ContextCondenser {
         if messages.is_empty() {
             return CondensationStats::default();
         }
+
+        let orig_chars = serde_json::to_string(&messages).map(|s| s.len()).unwrap_or(0);
 
         // 1. Identify assistant turn boundaries.
         // We preserve the last `keep_recent_turns` assistant messages from historical truncation.
@@ -52,29 +61,25 @@ impl ContextCondenser {
 
         // 2. Iterate through all messages
         for idx in 0..messages.len() {
-            // Never touch system prompts or root user prompt at index 0
-            if idx == 0 {
-                continue;
-            }
-
-            let is_historical = idx < cutoff_index;
             let msg = &mut messages[idx];
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default().to_string();
             let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
 
+            // CRITICAL INVARIANT: Never mutate system rules or user prompts across ANY turn
+            if role == "system" || role == "user" {
+                continue;
+            }
+
+            let is_historical = idx < cutoff_index;
+
             // A) Handle standalone reasoning message items
             if is_historical && self.config.drop_historical_reasoning && msg_type == "reasoning" {
                 if let Some(obj) = msg.as_object_mut() {
-                    let prev_len = serde_json::to_string(obj).map(|s| s.len()).unwrap_or(0);
                     if let Some(c) = obj.get_mut("content") {
                         *c = Value::String(String::new());
                     }
                     if let Some(s) = obj.get_mut("summary") {
                         *s = Value::Array(Vec::new());
-                    }
-                    let new_len = serde_json::to_string(obj).map(|s| s.len()).unwrap_or(0);
-                    if prev_len > new_len {
-                        stats.chars_saved += prev_len - new_len;
                     }
                     stats.reasoning_blocks_dropped += 1;
                 }
@@ -82,21 +87,17 @@ impl ContextCondenser {
             }
 
             // B) Handle assistant messages with reasoning fields or <think> tags
+            // CRITICAL INVARIANT: tool_calls array is NEVER mutated
             if is_historical && self.config.drop_historical_reasoning && (role == "assistant" || msg_type == "message") {
                 if let Some(obj) = msg.as_object_mut() {
-                    if let Some(v) = obj.remove("reasoning") {
-                        let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
-                        stats.chars_saved += len;
+                    if obj.remove("reasoning").is_some() {
                         stats.reasoning_blocks_dropped += 1;
                     }
-                    if let Some(v) = obj.remove("reasoning_content") {
-                        let len = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
-                        stats.chars_saved += len;
+                    if obj.remove("reasoning_content").is_some() {
                         stats.reasoning_blocks_dropped += 1;
                     }
                     if let Some(content) = obj.get("content").and_then(|c| c.as_str()) {
                         if let Some(stripped) = strip_think_tags(content) {
-                            stats.chars_saved += content.len().saturating_sub(stripped.len());
                             stats.reasoning_blocks_dropped += 1;
                             obj.insert("content".to_string(), Value::String(stripped));
                         }
@@ -116,12 +117,12 @@ impl ContextCondenser {
                 };
 
                 if !target_key.is_empty() && !initial_text.is_empty() {
-                    let mut processed = self.clean_tool_text(&initial_text);
+                    let mut processed = self.clean_tool_text_with_stats(&initial_text, &mut stats);
 
                     // Truncation logic
                     if self.config.truncate_tool_outputs {
                         if is_historical {
-                            // Aggressive truncation for older turns
+                            // Historical turns: aggressive truncation to max_tool_chars
                             if processed.len() > self.config.max_tool_chars {
                                 processed = truncate_tool_content(
                                     &processed,
@@ -131,23 +132,29 @@ impl ContextCondenser {
                                 stats.tool_outputs_truncated += 1;
                             }
                         } else {
-                            // Sanity cap for recent turns (prevents rogue 50k dumps)
-                            if processed.len() > self.config.recent_max_tool_chars {
-                                processed = truncate_tool_content(&processed, 20, 10);
+                            // Recent active turn: generous runaway safety cap (default 60k chars)
+                            // Prevents blinding the auditor on code files being analyzed
+                            if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
+                                processed = truncate_tool_content(&processed, 30, 20);
                                 stats.tool_outputs_truncated += 1;
                             }
                         }
                     }
 
-                    let saved = initial_text.len().saturating_sub(processed.len());
-                    if saved > 0 {
-                        stats.chars_saved += saved;
+                    if processed != initial_text {
                         if let Some(obj) = msg.as_object_mut() {
                             obj.insert(target_key.to_string(), Value::String(processed));
                         }
                     }
                 }
             }
+        }
+
+        let cond_chars = serde_json::to_string(&messages).map(|s| s.len()).unwrap_or(0);
+        stats.orig_chars = orig_chars;
+        stats.cond_chars = cond_chars;
+        if orig_chars > cond_chars {
+            stats.chars_saved = orig_chars - cond_chars;
         }
 
         if stats.chars_saved > 0 {
@@ -165,26 +172,47 @@ impl ContextCondenser {
     /// Applies RTK-inspired inline text cleaners (ANSI strip, progress bar removal,
     /// line deduplication, whitespace collapsing, JSON minification).
     pub fn clean_tool_text(&self, input: &str) -> String {
+        let mut dummy = CondensationStats::default();
+        self.clean_tool_text_with_stats(input, &mut dummy)
+    }
+
+    pub fn clean_tool_text_with_stats(&self, input: &str, stats: &mut CondensationStats) -> String {
         let mut text = input.to_string();
 
         // 1. Strip ANSI escape sequences
         if self.config.strip_ansi_escapes && text.contains('\x1b') {
-            text = strip_ansi_codes(&text);
+            let (cleaned, stripped) = strip_ansi_codes(&text);
+            if stripped {
+                text = cleaned;
+                stats.ansi_stripped_count += 1;
+            }
         }
 
         // 2. Strip carriage-return progress overwrites and progress bars
         if self.config.strip_progress_bars && (text.contains('\r') || text.contains('%') || text.contains('█')) {
-            text = strip_progress_artifacts(&text);
+            let (cleaned, stripped) = strip_progress_artifacts(&text);
+            if stripped {
+                text = cleaned;
+                stats.progress_cleaned_count += 1;
+            }
         }
 
-        // 3. Deduplicate consecutive identical lines (RTK signature feature)
+        // 3. Deduplicate consecutive identical lines (RTK signature feature, safe for code)
         if self.config.deduplicate_lines && text.contains('\n') {
-            text = deduplicate_lines(&text);
+            let (cleaned, count) = deduplicate_lines(&text);
+            if count > 0 {
+                text = cleaned;
+                stats.lines_deduped_count += count;
+            }
         }
 
         // 4. Collapse runs of 3+ newlines and strip trailing whitespace
         if self.config.collapse_whitespace {
-            text = collapse_excess_whitespace(&text);
+            let (cleaned, collapsed) = collapse_excess_whitespace(&text);
+            if collapsed {
+                text = cleaned;
+                stats.whitespace_collapsed_count += 1;
+            }
         }
 
         // 5. Minify pretty-printed JSON outputs
@@ -195,9 +223,10 @@ impl ContextCondenser {
             {
                 if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
                     if let Ok(minified) = serde_json::to_string(&val) {
-                        // Only replace if it saves significant space (> 15% reduction)
-                        if minified.len() + 20 < trimmed.len() {
+                        // Replace if minification saves space
+                        if minified.len() < trimmed.len() {
                             text = minified;
+                            stats.json_minified_count += 1;
                         }
                     }
                 }
@@ -248,20 +277,21 @@ pub fn truncate_tool_content(text: &str, head_lines: usize, tail_lines: usize) -
     let dropped_chars = text.len().saturating_sub(head_part.len() + tail_part.len());
 
     format!(
-        "{}\n\n[... Ferry Proxy: truncated {} lines ({} chars) of earlier tool output ...]\n\n{}",
-        head_part, dropped_lines, dropped_chars, tail_part
+        "{head_part}\n\n[... Ferry Proxy: truncated {dropped_lines} lines ({dropped_chars} characters) of earlier tool output ...]\n\n{tail_part}"
     )
 }
 
 /// Strips ANSI terminal escape codes (e.g. \x1b[32m or \x1b[0m) without external regex crate
-pub fn strip_ansi_codes(input: &str) -> String {
+pub fn strip_ansi_codes(input: &str) -> (String, bool) {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
+    let mut modified = false;
 
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             if chars.peek() == Some(&'[') {
                 chars.next(); // consume '['
+                modified = true;
                 // Consume characters until terminator [a-zA-Z] or end of string
                 while let Some(&next) = chars.peek() {
                     chars.next();
@@ -275,55 +305,77 @@ pub fn strip_ansi_codes(input: &str) -> String {
         out.push(c);
     }
 
-    out
+    (out, modified)
 }
 
 /// Resolves `\r` carriage returns (keeps final line overwrite) and removes progress bars
-pub fn strip_progress_artifacts(input: &str) -> String {
+pub fn strip_progress_artifacts(input: &str) -> (String, bool) {
     let mut clean_lines = Vec::new();
+    let mut modified = false;
 
     for line in input.lines() {
-        // If line contains carriage return, take the last segment
-        let effective_line = if line.contains('\r') {
-            line.split('\r').filter(|s| !s.trim().is_empty()).last().unwrap_or("")
+        let (effective_line, had_cr) = if line.contains('\r') {
+            (
+                line.split('\r').filter(|s| !s.trim().is_empty()).last().unwrap_or(""),
+                true,
+            )
         } else {
-            line
+            (line, false)
         };
 
-        // Filter out pure progress bar lines like `[=====>   ] 45%` or `100% |██████████|`
+        if had_cr {
+            modified = true;
+        }
+
         let trimmed = effective_line.trim();
-        // Detect progress bars: contains [==>...] or |███...| with %, or ends with progress percentage
         let is_progress = (trimmed.contains('[') && trimmed.contains(']') && trimmed.contains('%') && (trimmed.contains('=') || trimmed.contains('>')))
             || (trimmed.contains('|') && (trimmed.contains('█') || trimmed.contains('#')) && trimmed.contains('%'))
             || (trimmed.starts_with("Downloading ") && trimmed.ends_with('%'))
             || (trimmed.starts_with("Fetch: ") && trimmed.ends_with('%'));
 
-        if !is_progress {
+        if is_progress {
+            modified = true;
+        } else {
             clean_lines.push(effective_line);
         }
     }
 
-    clean_lines.join("\n")
+    (clean_lines.join("\n"), modified)
 }
 
 /// Collapses runs of consecutive identical lines into a single line with `(repeated N times)`
-pub fn deduplicate_lines(input: &str) -> String {
+/// Safety invariants:
+/// 1. Only deduplicate if repeat_count >= 3 (never for just 2 repetitions).
+/// 2. Line must have trimmed length >= 12 and contain alphanumeric characters.
+///    This strictly avoids mangling nested code closures (e.g. `}`, `);`, `---`, `***`).
+pub fn deduplicate_lines(input: &str) -> (String, usize) {
     let lines: Vec<&str> = input.lines().collect();
-    if lines.len() <= 1 {
-        return input.to_string();
+    if lines.len() <= 2 {
+        return (input.to_string(), 0);
     }
 
     let mut result = Vec::new();
     let mut current_line = lines[0];
     let mut repeat_count = 1;
+    let mut dedup_count = 0;
+
+    let can_dedup = |line: &str| -> bool {
+        let trimmed = line.trim();
+        trimmed.len() >= 12 && trimmed.chars().any(|c| c.is_alphanumeric())
+    };
 
     for &line in &lines[1..] {
         if line == current_line && !line.trim().is_empty() {
             repeat_count += 1;
         } else {
             result.push(current_line.to_string());
-            if repeat_count > 1 {
+            if repeat_count >= 3 && can_dedup(current_line) {
                 result.push(format!("    [... repeated {} times ...]", repeat_count - 1));
+                dedup_count += 1;
+            } else if repeat_count > 1 {
+                for _ in 1..repeat_count {
+                    result.push(current_line.to_string());
+                }
             }
             current_line = line;
             repeat_count = 1;
@@ -331,24 +383,36 @@ pub fn deduplicate_lines(input: &str) -> String {
     }
 
     result.push(current_line.to_string());
-    if repeat_count > 1 {
+    if repeat_count >= 3 && can_dedup(current_line) {
         result.push(format!("    [... repeated {} times ...]", repeat_count - 1));
+        dedup_count += 1;
+    } else if repeat_count > 1 {
+        for _ in 1..repeat_count {
+            result.push(current_line.to_string());
+        }
     }
 
-    result.join("\n")
+    (result.join("\n"), dedup_count)
 }
 
 /// Collapses 3+ consecutive newlines into 2, and trims trailing whitespace per line
-pub fn collapse_excess_whitespace(input: &str) -> String {
+pub fn collapse_excess_whitespace(input: &str) -> (String, bool) {
     let mut out = String::with_capacity(input.len());
     let mut consecutive_newlines = 0;
+    let mut modified = false;
 
     for line in input.lines() {
         let trimmed_line = line.trim_end();
+        if trimmed_line.len() != line.len() {
+            modified = true;
+        }
+
         if trimmed_line.is_empty() {
             consecutive_newlines += 1;
             if consecutive_newlines <= 2 {
                 out.push('\n');
+            } else {
+                modified = true;
             }
         } else {
             consecutive_newlines = 0;
@@ -359,7 +423,7 @@ pub fn collapse_excess_whitespace(input: &str) -> String {
         }
     }
 
-    out
+    (out, modified)
 }
 
 #[cfg(test)]
@@ -370,13 +434,16 @@ mod tests {
     #[test]
     fn test_strip_ansi_codes() {
         let colored = "\x1b[32mSuccess:\x1b[0m All tests passed\x1b[1;31m!\x1b[0m";
-        assert_eq!(strip_ansi_codes(colored), "Success: All tests passed!");
+        let (cleaned, stripped) = strip_ansi_codes(colored);
+        assert!(stripped);
+        assert_eq!(cleaned, "Success: All tests passed!");
     }
 
     #[test]
     fn test_strip_progress_artifacts() {
         let text = "Step 1: starting\nDownload: [=====>    ] 50%\nDownload: [==========] 100%\nStep 2: complete";
-        let cleaned = strip_progress_artifacts(text);
+        let (cleaned, stripped) = strip_progress_artifacts(text);
+        assert!(stripped);
         assert!(!cleaned.contains("50%"));
         assert!(!cleaned.contains("100%"));
         assert!(cleaned.contains("Step 1: starting"));
@@ -384,10 +451,18 @@ mod tests {
     }
 
     #[test]
-    fn test_deduplicate_consecutive_lines() {
-        let text = "Connecting to host...\nPolling status: wait\nPolling status: wait\nPolling status: wait\nConnected OK!";
-        let deduped = deduplicate_lines(text);
-        assert!(deduped.contains("Polling status: wait"));
+    fn test_deduplicate_consecutive_lines_safe_for_code() {
+        // Nested closing brackets must NOT be deduplicated
+        let code = "func foo() {\n    if true {\n        return\n    }\n}\n";
+        let (deduped_code, count) = deduplicate_lines(code);
+        assert_eq!(count, 0);
+        assert_eq!(deduped_code, code.trim_end());
+
+        // Repeated long logs MUST be deduplicated
+        let text = "Connecting to host...\nPolling status: waiting for connection\nPolling status: waiting for connection\nPolling status: waiting for connection\nConnected OK!";
+        let (deduped, count) = deduplicate_lines(text);
+        assert_eq!(count, 1);
+        assert!(deduped.contains("Polling status: waiting for connection"));
         assert!(deduped.contains("[... repeated 2 times ...]"));
         assert!(deduped.contains("Connected OK!"));
     }
@@ -395,7 +470,8 @@ mod tests {
     #[test]
     fn test_collapse_excess_whitespace() {
         let text = "Header\n\n\n\n\nMiddle\n\n\nFooter   ";
-        let collapsed = collapse_excess_whitespace(text);
+        let (collapsed, modified) = collapse_excess_whitespace(text);
+        assert!(modified);
         assert!(!collapsed.contains("\n\n\n"));
         assert!(collapsed.contains("Header\n\nMiddle\n\nFooter"));
     }

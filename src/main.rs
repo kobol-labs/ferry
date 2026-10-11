@@ -1,8 +1,3 @@
-mod condenser;
-mod config;
-mod router;
-mod stats;
-mod upstream;
 
 use axum::{
     extract::State,
@@ -10,15 +5,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use condenser::ContextCondenser;
-use config::Config;
-use router::Router as HybridRouter;
+use ferry::condenser::ContextCondenser;
+use ferry::config::Config;
+use ferry::router::Router as HybridRouter;
+use ferry::stats::MetricsTracker;
+use ferry::upstream::UpstreamClient;
 use serde_json::{json, Value};
-use stats::MetricsTracker;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::info;
-use upstream::UpstreamClient;
 
 struct AppState {
     config: Arc<Config>,
@@ -122,10 +117,19 @@ async fn chat_completions_handler(
     // Context condensation: strip past reasoning & truncate stale tool dumps
     let cond_stats = state.condenser.condense(&mut body);
     if cond_stats.chars_saved > 0 {
+        let orig_tokens = (cond_stats.orig_chars / 4) as u64;
+        let cond_tokens = (cond_stats.cond_chars / 4) as u64;
         state.metrics.record_condensation(
+            orig_tokens,
+            cond_tokens,
             cond_stats.reasoning_blocks_dropped,
             cond_stats.tool_outputs_truncated,
             cond_stats.chars_saved,
+            cond_stats.ansi_stripped_count,
+            cond_stats.progress_cleaned_count,
+            cond_stats.lines_deduped_count,
+            cond_stats.whitespace_collapsed_count,
+            cond_stats.json_minified_count,
         );
     }
 
