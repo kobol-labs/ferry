@@ -310,11 +310,35 @@ impl Router {
             let start = std::time::Instant::now();
             let wait_limit = std::time::Duration::from_millis(effective_wait_ms);
             let poll_interval = if fast_mode { 10 } else { 25 };
+            let mut logged_queue_entry = false;
+            let mut last_queue_heartbeat = start;
             while start.elapsed() < wait_limit {
+                if !logged_queue_entry {
+                    let is_priority = local_only || local_prefer || session_id.contains("root");
+                    let prio_label = if is_priority { "orchestrator" } else { "standard" };
+                    tracing::info!(
+                        session = %session_id,
+                        est_tokens,
+                        timeout_ms = effective_wait_ms,
+                        priority = prio_label,
+                        "Local slots saturated; request entered contention queue waiting for available slot"
+                    );
+                    logged_queue_entry = true;
+                } else if last_queue_heartbeat.elapsed() >= std::time::Duration::from_secs(10) {
+                    tracing::info!(
+                        session = %session_id,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        timeout_ms = effective_wait_ms,
+                        "Request waiting in contention queue"
+                    );
+                    last_queue_heartbeat = std::time::Instant::now();
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval)).await;
                 if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_with_prefix(session_id, prefix_hash) {
                     let is_hit = aff_type.is_hit();
                     if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
+                        let wait_ms = start.elapsed().as_millis() as u64;
+                        self.metrics.record_queue_wait(wait_ms);
                         self.metrics.record_affinity(is_hit);
                         let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
                         let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
@@ -327,7 +351,7 @@ impl Router {
                             target: TargetProvider::Local,
                             est_tokens,
                             is_spillover: false,
-                            reason: format!("local slot {slot_id} acquired from contention queue ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
+                            reason: format!("local slot {slot_id} acquired from contention queue after {wait_ms}ms ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
                             local_only,
                             slot_guard: Some(LocalSlotGuard::new(
                                 self.metrics.clone(),
@@ -344,6 +368,10 @@ impl Router {
                         self.affinity_tracker.release_slot(slot_id);
                     }
                 }
+            }
+            if logged_queue_entry {
+                let wait_ms = start.elapsed().as_millis() as u64;
+                self.metrics.record_queue_wait(wait_ms);
             }
         }
 

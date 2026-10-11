@@ -51,6 +51,11 @@ pub struct MetricsTracker {
     pub affinity_misses: AtomicU64,
     pub rolling_compact_count: AtomicU64,
     pub rolling_compact_chars_saved: AtomicU64,
+
+    // Contention Queue metrics
+    pub queued_requests: AtomicU64,
+    pub queue_wait_ms_total: AtomicU64,
+    pub last_queue_wait_ms: AtomicU64,
 }
 
 impl Default for MetricsTracker {
@@ -100,6 +105,10 @@ impl Default for MetricsTracker {
             affinity_misses: AtomicU64::new(0),
             rolling_compact_count: AtomicU64::new(0),
             rolling_compact_chars_saved: AtomicU64::new(0),
+
+            queued_requests: AtomicU64::new(0),
+            queue_wait_ms_total: AtomicU64::new(0),
+            last_queue_wait_ms: AtomicU64::new(0),
         }
     }
 }
@@ -152,6 +161,11 @@ pub struct StatsSnapshot {
     pub affinity_misses: u64,
     pub rolling_compact_count: u64,
     pub rolling_compact_chars_saved: u64,
+
+    pub queued_requests_total: u64,
+    pub queue_wait_ms_total: u64,
+    pub last_queue_wait_ms: u64,
+    pub avg_queue_wait_ms: f64,
 }
 
 impl MetricsTracker {
@@ -364,6 +378,15 @@ impl MetricsTracker {
             0.0
         };
 
+        let queued = self.queued_requests.load(Ordering::Relaxed);
+        let queue_wait_total = self.queue_wait_ms_total.load(Ordering::Relaxed);
+        let last_queue_wait = self.last_queue_wait_ms.load(Ordering::Relaxed);
+        let avg_queue_wait = if queued > 0 {
+            (queue_wait_total as f64 / queued as f64 * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+
         let chars_saved = self.chars_saved.load(Ordering::Relaxed);
         let pct_scaled = self.last_savings_percent.load(Ordering::Relaxed);
 
@@ -414,6 +437,11 @@ impl MetricsTracker {
             affinity_misses: self.affinity_misses.load(Ordering::Relaxed),
             rolling_compact_count: self.rolling_compact_count.load(Ordering::Relaxed),
             rolling_compact_chars_saved: self.rolling_compact_chars_saved.load(Ordering::Relaxed),
+
+            queued_requests_total: queued,
+            queue_wait_ms_total: queue_wait_total,
+            last_queue_wait_ms: last_queue_wait,
+            avg_queue_wait_ms: avg_queue_wait,
         }
     }
 
@@ -494,7 +522,16 @@ impl MetricsTracker {
              ferry_last_condensation_savings_percent {last_pct:.2}\n\
              # HELP ferry_last_condensation_chars_saved Characters pruned on most recent request\n\
              # TYPE ferry_last_condensation_chars_saved gauge\n\
-             ferry_last_condensation_chars_saved {last_chars}\n             # HELP ferry_affinity_hits_total Total requests routed to their bound session slot (affinity hit)\n             # TYPE ferry_affinity_hits_total counter\n             ferry_affinity_hits_total {aff_hits}\n             # HELP ferry_affinity_misses_total Total requests that were allocated a new or alternative slot\n             # TYPE ferry_affinity_misses_total counter\n             ferry_affinity_misses_total {aff_misses}\n             # HELP ferry_rolling_compact_total Total times rolling context compaction triggered\n             # TYPE ferry_rolling_compact_total counter\n             ferry_rolling_compact_total {rolling_compacts}\n             # HELP ferry_rolling_compact_chars_saved_total Total characters pruned via rolling compaction\n             # TYPE ferry_rolling_compact_chars_saved_total counter\n             ferry_rolling_compact_chars_saved_total {rolling_chars}\n",
+             ferry_last_condensation_chars_saved {last_chars}\n             # HELP ferry_affinity_hits_total Total requests routed to their bound session slot (affinity hit)\n             # TYPE ferry_affinity_hits_total counter\n             ferry_affinity_hits_total {aff_hits}\n             # HELP ferry_affinity_misses_total Total requests that were allocated a new or alternative slot\n             # TYPE ferry_affinity_misses_total counter\n             ferry_affinity_misses_total {aff_misses}\n             # HELP ferry_rolling_compact_total Total times rolling context compaction triggered\n             # TYPE ferry_rolling_compact_total counter\n             ferry_rolling_compact_total {rolling_compacts}\n             # HELP ferry_rolling_compact_chars_saved_total Total characters pruned via rolling compaction\n             # TYPE ferry_rolling_compact_chars_saved_total counter\n             ferry_rolling_compact_chars_saved_total {rolling_chars}\n\
+             # HELP ferry_queued_requests_total Total requests that waited in local contention queue\n\
+             # TYPE ferry_queued_requests_total counter\n\
+             ferry_queued_requests_total {queued}\n\
+             # HELP ferry_queue_wait_ms_total Total milliseconds spent waiting in contention queue\n\
+             # TYPE ferry_queue_wait_ms_total counter\n\
+             ferry_queue_wait_ms_total {queue_wait}\n\
+             # HELP ferry_last_queue_wait_ms Latency of most recent contention queue wait in ms\n\
+             # TYPE ferry_last_queue_wait_ms gauge\n\
+             ferry_last_queue_wait_ms {last_queue}\n",
             total = s.total_requests,
             local = s.local_requests,
             cloud = s.cloud_requests,
@@ -534,6 +571,9 @@ impl MetricsTracker {
             aff_misses = s.affinity_misses,
             rolling_compacts = s.rolling_compact_count,
             rolling_chars = s.rolling_compact_chars_saved,
+            queued = s.queued_requests_total,
+            queue_wait = s.queue_wait_ms_total,
+            last_queue = s.last_queue_wait_ms,
         )
     }
 
@@ -545,9 +585,33 @@ impl MetricsTracker {
         }
     }
 
-    pub fn record_rolling_compaction(&self, chars_saved: usize) {
-        self.rolling_compact_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_rolling_compaction(&self, chars_saved: usize) {        self.rolling_compact_count.fetch_add(1, Ordering::Relaxed);
         self.rolling_compact_chars_saved.fetch_add(chars_saved as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_queue_wait(&self, wait_ms: u64) {
+        self.queued_requests.fetch_add(1, Ordering::Relaxed);
+        self.queue_wait_ms_total.fetch_add(wait_ms, Ordering::Relaxed);
+        self.last_queue_wait_ms.store(wait_ms, Ordering::Relaxed);
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_queue_metrics_tracking() {
+        let tracker = MetricsTracker::new();
+        assert_eq!(tracker.queued_requests.load(Ordering::Relaxed), 0);
+        tracker.record_queue_wait(150);
+        tracker.record_queue_wait(350);
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.queued_requests_total, 2);
+        assert_eq!(snap.queue_wait_ms_total, 500);
+        assert_eq!(snap.last_queue_wait_ms, 350);
+        assert_eq!(snap.avg_queue_wait_ms, 250.0);
+    }
+}
