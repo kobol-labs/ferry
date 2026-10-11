@@ -62,7 +62,7 @@ impl ContextCondenser {
         let cutoff_index = if assistant_indices.len() > self.config.keep_recent_turns {
             assistant_indices[assistant_indices.len() - self.config.keep_recent_turns]
         } else {
-            messages.len()
+            0
         };
 
         let mut stats = CondensationStats::default();
