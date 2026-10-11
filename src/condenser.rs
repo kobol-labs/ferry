@@ -116,62 +116,35 @@ impl ContextCondenser {
             }
 
             // C) Handle tool / function call outputs (both historical and recent)
+            // C) Handle tool / function call outputs (both historical and recent)
             let is_tool = role == "tool" || role == "function" || msg_type == "function_call_output";
             if is_tool {
-                let (target_key, initial_text) = if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
-                    ("content", c.to_string())
-                } else if let Some(o) = msg.get("output").and_then(|o| o.as_str()) {
-                    ("output", o.to_string())
-                } else {
-                    ("", String::new())
-                };
-
-                if !target_key.is_empty() && !initial_text.is_empty() {
-                    let mut processed = self.clean_tool_text_with_stats(&initial_text, &mut stats);
-
-                    // Truncation logic
-                    if self.config.truncate_tool_outputs {
-                        if is_historical {
-                            // Historical turns: aggressive truncation to max_tool_chars
-                            if processed.len() > self.config.max_tool_chars {
-                                processed = truncate_tool_content(
-                                    &processed,
-                                    self.config.head_lines,
-                                    self.config.tail_lines,
-                                );
-                                stats.tool_outputs_truncated += 1;
-                            }
-                        } else {
-                            // Recent active turn: generous runaway safety cap (default 60k chars)
-                            // Prevents blinding the auditor on code files being analyzed
-                            if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
-                                processed = truncate_tool_content(&processed, 30, 20);
-                                stats.tool_outputs_truncated += 1;
-                            }
-                        }
-                    }
-
-                    // PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
-                    if self.config.enable_constraint_ledger {
-                        if !is_historical {
-                            // In the recent active turn, 100% of critical anchors must survive
-                            let anchors = extract_critical_anchors(&initial_text);
-                            if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
-                                warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
-                                stats.ledger_vetoed_count += 1;
-                                processed = initial_text.clone();
-                            } else {
-                                stats.ledger_checks_passed += 1;
-                            }
-                        } else {
-                            // In historical turns, basic verification passes
-                            stats.ledger_checks_passed += 1;
-                        }
-                    }
-
+                if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+                    let initial_text = c.to_string();
+                    let processed = self.condense_tool_string(&initial_text, is_historical, &mut stats);
                     if processed != initial_text {
                         if let Some(obj) = msg.as_object_mut() {
-                            obj.insert(target_key.to_string(), Value::String(processed));
+                            obj.insert("content".to_string(), Value::String(processed));
+                        }
+                    }
+                } else if let Some(o) = msg.get("output").and_then(|o| o.as_str()) {
+                    let initial_text = o.to_string();
+                    let processed = self.condense_tool_string(&initial_text, is_historical, &mut stats);
+                    if processed != initial_text {
+                        if let Some(obj) = msg.as_object_mut() {
+                            obj.insert("output".to_string(), Value::String(processed));
+                        }
+                    }
+                } else if let Some(content_arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    for part in content_arr {
+                        if let Some(text_val) = part.get("text").and_then(|t| t.as_str()) {
+                            let initial_text = text_val.to_string();
+                            let processed = self.condense_tool_string(&initial_text, is_historical, &mut stats);
+                            if processed != initial_text {
+                                if let Some(part_obj) = part.as_object_mut() {
+                                    part_obj.insert("text".to_string(), Value::String(processed));
+                                }
+                            }
                         }
                     }
                 }
@@ -197,6 +170,62 @@ impl ContextCondenser {
         }
 
         stats
+    }
+
+    /// Condenses a single tool output string according to historical vs recent policies and constraint ledger.
+    pub fn condense_tool_string(
+        &self,
+        initial_text: &str,
+        is_historical: bool,
+        stats: &mut CondensationStats,
+    ) -> String {
+        if initial_text.is_empty() {
+            return String::new();
+        }
+
+        let mut processed = self.clean_tool_text_with_stats(initial_text, stats);
+
+        // Truncation logic
+        if self.config.truncate_tool_outputs {
+            if is_historical {
+                // Historical turns: aggressive truncation to max_tool_chars
+                if processed.len() > self.config.max_tool_chars {
+                    processed = truncate_tool_content(
+                        &processed,
+                        self.config.head_lines,
+                        self.config.tail_lines,
+                    );
+                    stats.tool_outputs_truncated += 1;
+                }
+            } else {
+                // Recent active turn: generous runaway safety cap (default 60k chars)
+                // Prevents blinding the auditor on code files being analyzed
+                if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
+                    processed = truncate_tool_content(&processed, 30, 20);
+                    stats.tool_outputs_truncated += 1;
+                }
+            }
+        }
+
+        // PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
+        if self.config.enable_constraint_ledger {
+            if !is_historical {
+                // In the recent active turn, 100% of critical anchors must survive
+                let anchors = extract_critical_anchors(initial_text);
+                if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
+                    warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
+                    stats.ledger_vetoed_count += 1;
+                    processed = initial_text.to_string();
+                } else {
+                    stats.ledger_checks_passed += 1;
+                }
+            } else {
+                // In historical turns, basic verification passes
+                stats.ledger_checks_passed += 1;
+            }
+        }
+
+        processed
     }
 
     /// Applies RTK-inspired inline text cleaners with code-block protection
@@ -382,7 +411,19 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
 
         // 3. File paths with directories
         if (clean.starts_with('/') && clean.contains('/'))
-            || (clean.contains('/') && (clean.ends_with(".go") || clean.ends_with(".rs") || clean.ends_with(".py") || clean.ends_with(".js") || clean.ends_with(".ts") || clean.ends_with(".json") || clean.ends_with(".toml") || clean.ends_with(".yaml") || clean.ends_with(".yml") || clean.ends_with(".sql") || clean.ends_with(".sh"))) {
+            || ((clean.contains('/') || clean.contains('\\'))
+                && (clean.ends_with(".go")
+                    || clean.ends_with(".rs")
+                    || clean.ends_with(".py")
+                    || clean.ends_with(".js")
+                    || clean.ends_with(".ts")
+                    || clean.ends_with(".json")
+                    || clean.ends_with(".toml")
+                    || clean.ends_with(".yaml")
+                    || clean.ends_with(".yml")
+                    || clean.ends_with(".sql")
+                    || clean.ends_with(".sh")))
+        {
             anchors.push(clean.to_string());
             continue;
         }

@@ -59,6 +59,19 @@ impl Router {
 
     pub fn decide(&self, body: &Value) -> RouteDecision {
         let est_tokens = Self::estimate_tokens(body);
+
+        // Check if the client explicitly requested the cloud model
+        if let Some(requested_model) = body.get("model").and_then(|m| m.as_str()) {
+            if requested_model == self.config.cloud.model || requested_model == "cloud" {
+                return RouteDecision {
+                    target: TargetProvider::Cloud,
+                    est_tokens,
+                    is_spillover: false,
+                    reason: format!("explicitly requested cloud model ({requested_model})"),
+                };
+            }
+        }
+
         let max_context = self.config.local.max_context_tokens as u64;
         let max_slots = self.config.local.max_slots;
         let active_slots = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);

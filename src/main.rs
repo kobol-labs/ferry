@@ -90,37 +90,49 @@ async fn cors_options_handler() -> impl IntoResponse {
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let snap = state.metrics.snapshot();
-    Json(json!({
-        "status": "ok",
-        "service": "ferry",
-        "version": env!("CARGO_PKG_VERSION"),
-        "active_local_slots": snap.active_local_slots,
-        "max_local_slots": state.config.local.max_slots,
-        "condensation_enabled": state.config.condensation.enabled,
-    }))
+    (
+        [("access-control-allow-origin", "*")],
+        Json(json!({
+            "status": "ok",
+            "service": "ferry",
+            "version": env!("CARGO_PKG_VERSION"),
+            "active_local_slots": snap.active_local_slots,
+            "max_local_slots": state.config.local.max_slots,
+            "condensation_enabled": state.config.condensation.enabled,
+        })),
+    )
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.metrics.snapshot())
+    (
+        [("access-control-allow-origin", "*")],
+        Json(state.metrics.snapshot()),
+    )
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
-        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        [
+            ("content-type", "text/plain; version=0.0.4; charset=utf-8"),
+            ("access-control-allow-origin", "*"),
+        ],
         state.metrics.prometheus_metrics(),
     )
 }
 
 async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({
-        "object": "list",
-        "data": [
-            { "id": "ferry", "object": "model", "owned_by": "kobol-labs" },
-            { "id": "hybrid-pentest", "object": "model", "owned_by": "kobol-labs" },
-            { "id": &state.config.local.model, "object": "model", "owned_by": "local" },
-            { "id": &state.config.cloud.model, "object": "model", "owned_by": "cloud" },
-        ]
-    }))
+    (
+        [("access-control-allow-origin", "*")],
+        Json(json!({
+            "object": "list",
+            "data": [
+                { "id": "ferry", "object": "model", "owned_by": "kobol-labs" },
+                { "id": "hybrid-pentest", "object": "model", "owned_by": "kobol-labs" },
+                { "id": &state.config.local.model, "object": "model", "owned_by": "local" },
+                { "id": &state.config.cloud.model, "object": "model", "owned_by": "cloud" },
+            ]
+        })),
+    )
 }
 
 async fn chat_completions_handler(

@@ -213,17 +213,23 @@ impl Config {
         if let Ok(v) = std::env::var("FERRY_LOCAL_MAX_CONTEXT") {
             if let Ok(n) = v.parse() { self.local.max_context_tokens = n; }
         }
+        if let Ok(v) = std::env::var("FERRY_LOCAL_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() { self.local.timeout_secs = n; }
+        }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { if !v.trim().is_empty() { self.cloud.api_base = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { if !v.trim().is_empty() { self.cloud.api_key = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_MODEL") { if !v.trim().is_empty() { self.cloud.model = v; } }
+        if let Ok(v) = std::env::var("FERRY_CLOUD_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() { self.cloud.timeout_secs = n; }
+        }
         if let Ok(v) = std::env::var("FERRY_CONDENSATION_ENABLED") {
-            if let Ok(b) = v.parse() { self.condensation.enabled = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.enabled = b; }
         }
         if let Ok(v) = std::env::var("FERRY_DROP_HISTORICAL_REASONING") {
-            if let Ok(b) = v.parse() { self.condensation.drop_historical_reasoning = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.drop_historical_reasoning = b; }
         }
         if let Ok(v) = std::env::var("FERRY_TRUNCATE_TOOL_OUTPUTS") {
-            if let Ok(b) = v.parse() { self.condensation.truncate_tool_outputs = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.truncate_tool_outputs = b; }
         }
         if let Ok(v) = std::env::var("FERRY_KEEP_RECENT_TURNS") {
             if let Ok(n) = v.parse() { self.condensation.keep_recent_turns = n; }
@@ -234,23 +240,43 @@ impl Config {
         if let Ok(v) = std::env::var("FERRY_RECENT_MAX_TOOL_CHARS") {
             if let Ok(n) = v.parse() { self.condensation.recent_max_tool_chars = n; }
         }
+        if let Ok(v) = std::env::var("FERRY_HEAD_LINES") {
+            if let Ok(n) = v.parse() { self.condensation.head_lines = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_TAIL_LINES") {
+            if let Ok(n) = v.parse() { self.condensation.tail_lines = n; }
+        }
         if let Ok(v) = std::env::var("FERRY_STRIP_ANSI") {
-            if let Ok(b) = v.parse() { self.condensation.strip_ansi_escapes = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.strip_ansi_escapes = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_STRIP_PROGRESS_BARS") {
+            if let Some(b) = parse_bool(&v) { self.condensation.strip_progress_bars = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_COLLAPSE_WHITESPACE") {
+            if let Some(b) = parse_bool(&v) { self.condensation.collapse_whitespace = b; }
         }
         if let Ok(v) = std::env::var("FERRY_DEDUPLICATE_LINES") {
-            if let Ok(b) = v.parse() { self.condensation.deduplicate_lines = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.deduplicate_lines = b; }
         }
         if let Ok(v) = std::env::var("FERRY_MINIFY_JSON") {
-            if let Ok(b) = v.parse() { self.condensation.minify_json_outputs = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.minify_json_outputs = b; }
         }
         if let Ok(v) = std::env::var("FERRY_PROTECT_CODE_BLOCKS") {
-            if let Ok(b) = v.parse() { self.condensation.protect_code_blocks = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.protect_code_blocks = b; }
         }
         if let Ok(v) = std::env::var("FERRY_ENABLE_CONSTRAINT_LEDGER") {
-            if let Ok(b) = v.parse() { self.condensation.enable_constraint_ledger = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.enable_constraint_ledger = b; }
         }
         if let Ok(v) = std::env::var("FERRY_PROTECT_STATIC_PREFIX") {
-            if let Ok(b) = v.parse() { self.condensation.protect_static_prefix = b; }
+            if let Some(b) = parse_bool(&v) { self.condensation.protect_static_prefix = b; }
         }
+    }
+}
+
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
     }
 }

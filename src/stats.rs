@@ -79,11 +79,18 @@ impl MetricsTracker {
     }
 
     pub fn dec_local(&self) {
-        self.active_local_slots
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                Some(val.saturating_sub(1))
-            })
-            .ok();
+        let mut curr = self.active_local_slots.load(Ordering::Relaxed);
+        while curr > 0 {
+            match self.active_local_slots.compare_exchange_weak(
+                curr,
+                curr - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => curr = actual,
+            }
+        }
     }
 
     pub fn inc_cloud(&self, tokens: u64, is_spillover: bool) {

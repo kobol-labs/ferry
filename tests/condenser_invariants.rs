@@ -507,4 +507,77 @@ fn test_security_anchors_cve_ip_port_and_configs() {
     assert!(anchors.iter().any(|a| a == "Cargo.toml"));
 }
 
+#[test]
+fn test_tool_output_array_content_condensed() {
+    let config = CondenserConfig {
+        enabled: true,
+        truncate_tool_outputs: true,
+        keep_recent_turns: 1,
+        max_tool_chars: 50,
+        recent_max_tool_chars: 5000,
+        head_lines: 2,
+        tail_lines: 2,
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    let historical_dump = (1..=30).map(|i| format!("Array output line {}", i)).collect::<Vec<_>>().join("\n");
+
+    let mut body = json!({
+        "messages": [
+            { "role": "system", "content": "System" },
+            { "role": "user", "content": "Start" },
+            {
+                "role": "tool",
+                "content": [
+                    { "type": "text", "text": historical_dump }
+                ]
+            },
+            { "role": "assistant", "content": "Done" }
+        ]
+    });
+
+    let stats = condenser.condense(&mut body);
+    assert_eq!(stats.tool_outputs_truncated, 1);
+
+    let msgs = body["messages"].as_array().unwrap();
+    let text = msgs[2]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Ferry Proxy: truncated"));
+}
+
+#[test]
+fn test_windows_path_anchors_preserved() {
+    let config = CondenserConfig::default();
+    let condenser = ContextCondenser::new(config);
+
+    let text = r"Check C:\Users\app\main.py and src\pkg\docker.go for vulnerabilities.";
+    let anchors = condenser.extract_critical_anchors(text);
+
+    assert!(anchors.iter().any(|a| a.contains("main.py")));
+    assert!(anchors.iter().any(|a| a.contains("docker.go")));
+}
+
+#[test]
+fn test_explicit_cloud_model_selection_router() {
+    use ferry::config::Config;
+    use ferry::router::{Router, TargetProvider};
+    use ferry::stats::MetricsTracker;
+    use std::sync::Arc;
+
+    let config = Arc::new(Config::default());
+    let metrics = Arc::new(MetricsTracker::new());
+    let router = Router::new(config, metrics);
+
+    let body = json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            { "role": "user", "content": "Hello" }
+        ]
+    });
+
+    let decision = router.decide(&body);
+    assert_eq!(decision.target, TargetProvider::Cloud);
+    assert!(decision.reason.contains("explicitly requested"));
+}
+
 

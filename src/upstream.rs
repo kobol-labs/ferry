@@ -81,28 +81,7 @@ impl UpstreamClient {
 
                 let local_url = format!("{}/chat/completions", self.config.local.api_base.trim_end_matches('/'));
                 let mut target_body = body.clone();
-                if let Some(obj) = target_body.as_object_mut() {
-                    obj.insert("model".to_string(), Value::String(self.config.local.model.clone()));
-
-                    // Normalize OpenAI Responses format (type: function_call_output) to standard OpenAI (role: tool)
-                    if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
-                        for msg in messages {
-                            let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-                            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-                            if msg_type == "function_call_output" && role.is_empty() {
-                                if let Some(m_obj) = msg.as_object_mut() {
-                                    m_obj.insert("role".to_string(), Value::String("tool".to_string()));
-                                    if let Some(call_id) = m_obj.get("call_id").cloned() {
-                                        m_obj.insert("tool_call_id".to_string(), call_id);
-                                    }
-                                    if let Some(out_val) = m_obj.remove("output") {
-                                        m_obj.insert("content".to_string(), out_val);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                normalize_wire_format(&mut target_body, &self.config.local.model);
 
                 let req = self
                     .client
@@ -146,6 +125,7 @@ impl UpstreamClient {
                         );
                         self.metrics.dec_local();
                         self.metrics.inc_failover();
+                        self.metrics.inc_cloud(decision.est_tokens, false);
                         self.dispatch_cloud(body, decision, req_id, true).await
                     }
                     Err(err) => {
@@ -156,6 +136,7 @@ impl UpstreamClient {
                         );
                         self.metrics.dec_local();
                         self.metrics.inc_failover();
+                        self.metrics.inc_cloud(decision.est_tokens, false);
                         self.dispatch_cloud(body, decision, req_id, true).await
                     }
                 }
@@ -189,9 +170,7 @@ impl UpstreamClient {
 
         let cloud_url = format!("{}/chat/completions", self.config.cloud.api_base.trim_end_matches('/'));
         let mut target_body = body;
-        if let Some(obj) = target_body.as_object_mut() {
-            obj.insert("model".to_string(), Value::String(self.config.cloud.model.clone()));
-        }
+        normalize_wire_format(&mut target_body, &self.config.cloud.model);
 
         let req = self
             .client
@@ -218,6 +197,10 @@ impl UpstreamClient {
                 error!(req_id = req_id, error = %err, "Cloud request failed");
                 (
                     StatusCode::BAD_GATEWAY,
+                    [
+                        ("access-control-allow-origin", "*"),
+                        ("content-type", "application/json"),
+                    ],
                     serde_json::json!({ "error": format!("Cloud upstream failed: {}", err) }).to_string(),
                 )
                     .into_response()
@@ -236,7 +219,7 @@ impl UpstreamClient {
 
         for (k, v) in resp.headers().iter() {
             let key = k.as_str().to_lowercase();
-            if key == "content-type" || key == "cache-control" || key == "access-control-allow-origin" {
+            if key == "content-type" || key == "cache-control" {
                 if let (Ok(hname), Ok(hval)) = (
                     HeaderName::from_bytes(k.as_ref()),
                     HeaderValue::from_bytes(v.as_ref()),
@@ -245,6 +228,11 @@ impl UpstreamClient {
                 }
             }
         }
+
+        // Always ensure universal CORS headers so browser-based clients (OpenWebUI, dashboards) are never blocked
+        headers.insert(HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*"));
+        headers.insert(HeaderName::from_static("access-control-allow-methods"), HeaderValue::from_static("GET, POST, OPTIONS"));
+        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization"));
 
         let metrics = if is_local {
             Some(self.metrics.clone())
@@ -264,5 +252,31 @@ impl UpstreamClient {
 
         let body = Body::from_stream(guarded);
         (status, headers, body).into_response()
+    }
+}
+
+/// Normalizes OpenAI Responses format (`type: function_call_output`) to standard OpenAI wire format (`role: tool`)
+/// and sets the appropriate target model identifier.
+pub fn normalize_wire_format(body: &mut Value, target_model: &str) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(target_model.to_string()));
+
+        if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            for msg in messages {
+                let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
+                if msg_type == "function_call_output" && role.is_empty() {
+                    if let Some(m_obj) = msg.as_object_mut() {
+                        m_obj.insert("role".to_string(), Value::String("tool".to_string()));
+                        if let Some(call_id) = m_obj.get("call_id").cloned() {
+                            m_obj.insert("tool_call_id".to_string(), call_id);
+                        }
+                        if let Some(out_val) = m_obj.remove("output") {
+                            m_obj.insert("content".to_string(), out_val);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
