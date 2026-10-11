@@ -328,7 +328,7 @@ impl MetricsTracker {
 
             condensed_requests: self.condensed_requests.load(Ordering::Relaxed),
             chars_saved,
-            tokens_saved_est: chars_saved / 4,
+            tokens_saved_est: crate::condenser::estimate_tokens_from_chars(chars_saved as usize),
             reasoning_blocks_dropped: self.reasoning_blocks_dropped.load(Ordering::Relaxed),
             tool_outputs_truncated: self.tool_outputs_truncated.load(Ordering::Relaxed),
             ansi_stripped_count: self.ansi_stripped_count.load(Ordering::Relaxed),

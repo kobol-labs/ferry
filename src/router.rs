@@ -56,8 +56,7 @@ impl Router {
 
     pub fn estimate_tokens(body: &Value) -> u64 {
         if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            let char_count = crate::condenser::count_message_chars(messages);
-            (char_count as f64 / 3.0).ceil() as u64
+            crate::condenser::estimate_message_tokens(messages)
         } else {
             0
         }

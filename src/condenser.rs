@@ -133,7 +133,7 @@ impl ContextCondenser {
             // CRITICAL INVARIANT: Prefix-cache alignment guard.
             // Never mutate system rules, developer messages, or user prompts across ANY turn.
             // Preserves KV cache prefixes to ensure 90%+ cache hit rate on local GPU and cloud.
-            if self.config.protect_static_prefix && (role == "system" || role == "user" || role == "developer") {
+            if role == "system" || role == "user" || role == "developer" {
                 continue;
             }
 
@@ -172,7 +172,6 @@ impl ContextCondenser {
                 }
             }
 
-            // C) Handle tool / function call outputs (both historical and recent)
             // C) Handle tool / function call outputs (both historical and recent)
             let is_tool = role == "tool" || role == "function" || msg_type == "function_call_output";
             if is_tool {
@@ -245,13 +244,12 @@ impl ContextCondenser {
         // Truncation logic
         if self.config.truncate_tool_outputs {
             if is_historical {
-                // Historical turns: aggressive truncation to max_tool_chars
+                // Historical turns: aggressive truncation to max_tool_chars with signal awareness
                 if processed.len() > self.config.max_tool_chars {
                     processed = truncate_tool_content_smart(
                         &processed,
                         self.config.head_lines,
                         self.config.tail_lines,
-                        self.config.signal_aware_truncation,
                         &mut stats.signals_extracted_count,
                     );
                     stats.tool_outputs_truncated += 1;
@@ -260,11 +258,12 @@ impl ContextCondenser {
                 // Recent active turn: generous runaway safety cap (default 60k chars)
                 // Prevents blinding the auditor on code files being analyzed
                 if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
+                    let recent_head = self.config.head_lines.max(30);
+                    let recent_tail = self.config.tail_lines.max(20);
                     processed = truncate_tool_content_smart(
                         &processed,
-                        30,
-                        20,
-                        self.config.signal_aware_truncation,
+                        recent_head,
+                        recent_tail,
                         &mut stats.signals_extracted_count,
                     );
                     stats.tool_outputs_truncated += 1;
@@ -272,35 +271,34 @@ impl ContextCondenser {
             }
         }
 
-        // PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
-        if self.config.enable_constraint_ledger {
-            if !is_historical {
-                // In the recent active turn, 100% of critical anchors must survive
-                let anchors = extract_critical_anchors(initial_text);
-                if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
-                    warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
-                    stats.ledger_vetoed_count += 1;
-                    processed = initial_text.to_string();
-                } else {
-                    stats.ledger_checks_passed += 1;
-                }
+        // Permanent invariant: PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
+        if !is_historical {
+            // In the recent active turn, 100% of critical anchors must survive
+            let anchors = extract_critical_anchors(initial_text);
+            if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
+                warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
+                stats.ledger_vetoed_count += 1;
+                processed = initial_text.to_string();
             } else {
-                // In historical turns, basic verification passes
                 stats.ledger_checks_passed += 1;
             }
+        } else {
+            // In historical turns, basic verification passes
+            stats.ledger_checks_passed += 1;
         }
 
         processed
     }
 
-    /// Applies RTK-inspired inline text cleaners with code-block protection
+    /// Applies inline text cleaners with 100% verbatim markdown code-block protection
     pub fn clean_tool_text(&self, input: &str) -> String {
         let mut dummy = CondensationStats::default();
         self.clean_tool_text_with_stats(input, &mut dummy)
     }
 
     pub fn clean_tool_text_with_stats(&self, input: &str, stats: &mut CondensationStats) -> String {
-        if self.config.protect_code_blocks && input.contains("```") {
+        // Built-in invariant: Always protect markdown code blocks from destructive cleaners
+        if input.contains("```") {
             let segments = segment_markdown_code_blocks(input);
             let mut cleaned_parts = Vec::new();
             for seg in segments {
@@ -342,25 +340,32 @@ impl ContextCondenser {
     fn clean_single_chunk(&self, input: &str, stats: &mut CondensationStats) -> String {
         let mut text = input.to_string();
 
-        // 1. Strip ANSI escape sequences
-        if self.config.strip_ansi_escapes && text.contains('\x1b') {
-            let (cleaned, stripped) = strip_ansi_codes(&text);
-            if stripped {
+        // 1. Strip terminal noise (ANSI escapes, carriage-return progress overwrites, excess blank lines)
+        if self.config.strip_terminal_noise {
+            if text.contains('\x1b') {
+                let (cleaned, stripped) = strip_ansi_codes(&text);
+                if stripped {
+                    text = cleaned;
+                    stats.ansi_stripped_count += 1;
+                }
+            }
+
+            if text.contains('\r') || text.contains('%') || text.contains('█') {
+                let (cleaned, stripped) = strip_progress_artifacts(&text);
+                if stripped {
+                    text = cleaned;
+                    stats.progress_cleaned_count += 1;
+                }
+            }
+
+            let (cleaned, collapsed) = collapse_excess_whitespace(&text);
+            if collapsed {
                 text = cleaned;
-                stats.ansi_stripped_count += 1;
+                stats.whitespace_collapsed_count += 1;
             }
         }
 
-        // 2. Strip carriage-return progress overwrites and progress bars
-        if self.config.strip_progress_bars && (text.contains('\r') || text.contains('%') || text.contains('█')) {
-            let (cleaned, stripped) = strip_progress_artifacts(&text);
-            if stripped {
-                text = cleaned;
-                stats.progress_cleaned_count += 1;
-            }
-        }
-
-        // 3. Deduplicate consecutive identical lines (RTK signature feature, safe for code)
+        // 2. Deduplicate consecutive identical lines (RTK signature feature, safe for code)
         if self.config.deduplicate_lines && text.contains('\n') {
             let (cleaned, count) = deduplicate_lines(&text);
             if count > 0 {
@@ -369,16 +374,7 @@ impl ContextCondenser {
             }
         }
 
-        // 4. Collapse runs of 3+ newlines and strip trailing whitespace
-        if self.config.collapse_whitespace {
-            let (cleaned, collapsed) = collapse_excess_whitespace(&text);
-            if collapsed {
-                text = cleaned;
-                stats.whitespace_collapsed_count += 1;
-            }
-        }
-
-        // 5. Minify pretty-printed JSON outputs
+        // 3. Minify pretty-printed JSON outputs
         if self.config.minify_json_outputs {
             let trimmed = text.trim();
             if (trimmed.starts_with('{') && trimmed.ends_with('}'))
@@ -650,7 +646,7 @@ pub fn find_diagnostic_signal_index(lines: &[&str], start_idx: usize, end_idx: u
 /// Guarantees 100% panic-freedom on multi-byte UTF-8 inputs.
 pub fn truncate_tool_content(text: &str, head_lines: usize, tail_lines: usize) -> String {
     let mut dummy = 0;
-    truncate_tool_content_smart(text, head_lines, tail_lines, false, &mut dummy)
+    truncate_tool_content_smart(text, head_lines, tail_lines, &mut dummy)
 }
 
 /// Signal-aware smart truncation that preserves error diagnostic regions in the middle of long outputs.
@@ -658,7 +654,6 @@ pub fn truncate_tool_content_smart(
     text: &str,
     head_lines: usize,
     tail_lines: usize,
-    signal_aware: bool,
     signals_extracted: &mut usize,
 ) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -683,36 +678,34 @@ pub fn truncate_tool_content_smart(
     }
 
     // Check if middle lines contain diagnostic failure signals
-    if signal_aware {
-        let mid_start = head_lines;
-        let mid_end = lines.len().saturating_sub(tail_lines);
-        if let Some(signal_line_idx) = find_diagnostic_signal_index(&lines, mid_start, mid_end) {
-            *signals_extracted += 1;
-            let win_start = signal_line_idx.saturating_sub(4).max(head_lines);
-            let win_end = (signal_line_idx + 8).min(mid_end);
+    let mid_start = head_lines;
+    let mid_end = lines.len().saturating_sub(tail_lines);
+    if let Some(signal_line_idx) = find_diagnostic_signal_index(&lines, mid_start, mid_end) {
+        *signals_extracted += 1;
+        let win_start = signal_line_idx.saturating_sub(4).max(head_lines);
+        let win_end = (signal_line_idx + 8).min(mid_end);
 
-            let head_part = lines[..head_lines].join("\n");
-            let signal_part = lines[win_start..win_end].join("\n");
-            let tail_part = lines[lines.len() - tail_lines..].join("\n");
+        let head_part = lines[..head_lines].join("\n");
+        let signal_part = lines[win_start..win_end].join("\n");
+        let tail_part = lines[lines.len() - tail_lines..].join("\n");
 
-            let dropped_before = win_start.saturating_sub(head_lines);
-            let dropped_after = mid_end.saturating_sub(win_end);
+        let dropped_before = win_start.saturating_sub(head_lines);
+        let dropped_after = mid_end.saturating_sub(win_end);
 
-            let mut out = head_part;
-            if dropped_before > 0 {
-                out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_before} lines of passing logs ...]\n\n"));
-            } else {
-                out.push('\n');
-            }
-            out.push_str(&signal_part);
-            if dropped_after > 0 {
-                out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_after} lines ...]\n\n"));
-            } else {
-                out.push('\n');
-            }
-            out.push_str(&tail_part);
-            return out;
+        let mut out = head_part;
+        if dropped_before > 0 {
+            out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_before} lines of passing logs ...]\n\n"));
+        } else {
+            out.push('\n');
         }
+        out.push_str(&signal_part);
+        if dropped_after > 0 {
+            out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_after} lines ...]\n\n"));
+        } else {
+            out.push('\n');
+        }
+        out.push_str(&tail_part);
+        return out;
     }
 
     let head_part = lines[..head_lines].join("\n");
@@ -904,6 +897,20 @@ pub fn count_message_chars(messages: &[Value]) -> usize {
     total
 }
 
+/// Unified token estimation ratio: 3.5 characters per token for mixed code, tool JSON, and natural text.
+pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
+    if chars == 0 {
+        return 0;
+    }
+    (chars as f64 / 3.5).ceil() as u64
+}
+
+/// Estimates token count for an array of messages using unified 3.5 chars/token ratio.
+pub fn estimate_message_tokens(messages: &[Value]) -> u64 {
+    let chars = count_message_chars(messages);
+    estimate_tokens_from_chars(chars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,7 +972,6 @@ mod tests {
     #[test]
     fn test_protected_code_blocks_segmentation() {
         let config = CondenserConfig {
-            protect_code_blocks: true,
             deduplicate_lines: true,
             ..Default::default()
         };

@@ -218,8 +218,8 @@ async fn chat_completions_handler(
     };
 
     if cond_stats.orig_chars > 0 {
-        let orig_tokens = (cond_stats.orig_chars / 4) as u64;
-        let cond_tokens = (cond_stats.cond_chars / 4) as u64;
+        let orig_tokens = ferry::condenser::estimate_tokens_from_chars(cond_stats.orig_chars);
+        let cond_tokens = ferry::condenser::estimate_tokens_from_chars(cond_stats.cond_chars);
         state.metrics.record_condensation(
             orig_tokens,
             cond_tokens,

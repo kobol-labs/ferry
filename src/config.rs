@@ -33,8 +33,6 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
-    #[serde(default = "default_local_name")]
-    pub name: String,
     #[serde(default = "default_local_base")]
     pub api_base: String,
     #[serde(default = "default_local_key")]
@@ -57,7 +55,6 @@ pub struct LocalConfig {
     pub queue_timeout_ms: u64,
 }
 
-fn default_local_name() -> String { "strata".to_string() }
 fn default_local_base() -> String { "http://192.168.9.99:8080/v1".to_string() }
 fn default_local_key() -> String { "sk-strata-stevegaming".to_string() }
 fn default_local_model() -> String { "qwen3.8-flash-next-iq2_xs".to_string() }
@@ -72,7 +69,6 @@ fn default_queue_timeout_ms() -> u64 { 0 }
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
-            name: default_local_name(),
             api_base: default_local_base(),
             api_key: default_local_key(),
             model: default_local_model(),
@@ -89,8 +85,6 @@ impl Default for LocalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
-    #[serde(default = "default_cloud_name")]
-    pub name: String,
     #[serde(default = "default_cloud_base")]
     pub api_base: String,
     #[serde(default)]
@@ -101,7 +95,6 @@ pub struct CloudConfig {
     pub timeout_secs: u64,
 }
 
-fn default_cloud_name() -> String { "minimax".to_string() }
 fn default_cloud_base() -> String { "https://api.minimax.io/v1".to_string() }
 fn default_cloud_model() -> String { "MiniMax-M3".to_string() }
 fn default_cloud_timeout_secs() -> u64 { 300 }
@@ -109,7 +102,6 @@ fn default_cloud_timeout_secs() -> u64 { 300 }
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
-            name: default_cloud_name(),
             api_base: default_cloud_base(),
             api_key: String::new(),
             model: default_cloud_model(),
@@ -120,11 +112,11 @@ impl Default for CloudConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CondenserConfig {
-    #[serde(default = "default_condensation_enabled")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_drop_historical_reasoning")]
+    #[serde(default = "default_true")]
     pub drop_historical_reasoning: bool,
-    #[serde(default = "default_truncate_tool_outputs")]
+    #[serde(default = "default_true")]
     pub truncate_tool_outputs: bool,
     #[serde(default = "default_keep_recent_turns")]
     pub keep_recent_turns: usize,
@@ -136,68 +128,38 @@ pub struct CondenserConfig {
     pub head_lines: usize,
     #[serde(default = "default_tail_lines")]
     pub tail_lines: usize,
-    #[serde(default = "default_strip_ansi_escapes")]
-    pub strip_ansi_escapes: bool,
-    #[serde(default = "default_strip_progress_bars")]
-    pub strip_progress_bars: bool,
-    #[serde(default = "default_collapse_whitespace")]
-    pub collapse_whitespace: bool,
-    #[serde(default = "default_deduplicate_lines")]
+    #[serde(default = "default_true")]
+    pub strip_terminal_noise: bool,
+    #[serde(default = "default_true")]
     pub deduplicate_lines: bool,
-    #[serde(default = "default_minify_json_outputs")]
+    #[serde(default = "default_true")]
     pub minify_json_outputs: bool,
-    #[serde(default = "default_protect_code_blocks")]
-    pub protect_code_blocks: bool,
-    #[serde(default = "default_enable_constraint_ledger")]
-    pub enable_constraint_ledger: bool,
-    #[serde(default = "default_protect_static_prefix")]
-    pub protect_static_prefix: bool,
-    #[serde(default = "default_signal_aware_truncation")]
-    pub signal_aware_truncation: bool,
-    #[serde(default = "default_fold_repeated_tool_failures")]
+    #[serde(default = "default_true")]
     pub fold_repeated_tool_failures: bool,
 }
 
-fn default_condensation_enabled() -> bool { true }
-fn default_drop_historical_reasoning() -> bool { true }
-fn default_truncate_tool_outputs() -> bool { true }
-fn default_signal_aware_truncation() -> bool { true }
-fn default_fold_repeated_tool_failures() -> bool { true }
+fn default_true() -> bool { true }
 fn default_keep_recent_turns() -> usize { 1 }
 fn default_max_tool_chars() -> usize { 2000 }
 fn default_recent_max_tool_chars() -> usize { 60000 }
 fn default_head_lines() -> usize { 15 }
 fn default_tail_lines() -> usize { 10 }
-fn default_strip_ansi_escapes() -> bool { true }
-fn default_strip_progress_bars() -> bool { true }
-fn default_collapse_whitespace() -> bool { true }
-fn default_deduplicate_lines() -> bool { true }
-fn default_minify_json_outputs() -> bool { true }
-fn default_protect_code_blocks() -> bool { true }
-fn default_enable_constraint_ledger() -> bool { true }
-fn default_protect_static_prefix() -> bool { true }
 
 impl Default for CondenserConfig {
     fn default() -> Self {
         Self {
-            enabled: default_condensation_enabled(),
-            drop_historical_reasoning: default_drop_historical_reasoning(),
-            truncate_tool_outputs: default_truncate_tool_outputs(),
+            enabled: default_true(),
+            drop_historical_reasoning: default_true(),
+            truncate_tool_outputs: default_true(),
             keep_recent_turns: default_keep_recent_turns(),
             max_tool_chars: default_max_tool_chars(),
             recent_max_tool_chars: default_recent_max_tool_chars(),
             head_lines: default_head_lines(),
             tail_lines: default_tail_lines(),
-            strip_ansi_escapes: default_strip_ansi_escapes(),
-            strip_progress_bars: default_strip_progress_bars(),
-            collapse_whitespace: default_collapse_whitespace(),
-            deduplicate_lines: default_deduplicate_lines(),
-            minify_json_outputs: default_minify_json_outputs(),
-            protect_code_blocks: default_protect_code_blocks(),
-            enable_constraint_ledger: default_enable_constraint_ledger(),
-            protect_static_prefix: default_protect_static_prefix(),
-            signal_aware_truncation: default_signal_aware_truncation(),
-            fold_repeated_tool_failures: default_fold_repeated_tool_failures(),
+            strip_terminal_noise: default_true(),
+            deduplicate_lines: default_true(),
+            minify_json_outputs: default_true(),
+            fold_repeated_tool_failures: default_true(),
         }
     }
 }
@@ -282,32 +244,14 @@ impl Config {
         if let Ok(v) = std::env::var("FERRY_TAIL_LINES") {
             if let Ok(n) = v.parse() { self.condensation.tail_lines = n; }
         }
-        if let Ok(v) = std::env::var("FERRY_STRIP_ANSI") {
-            if let Some(b) = parse_bool(&v) { self.condensation.strip_ansi_escapes = b; }
-        }
-        if let Ok(v) = std::env::var("FERRY_STRIP_PROGRESS_BARS") {
-            if let Some(b) = parse_bool(&v) { self.condensation.strip_progress_bars = b; }
-        }
-        if let Ok(v) = std::env::var("FERRY_COLLAPSE_WHITESPACE") {
-            if let Some(b) = parse_bool(&v) { self.condensation.collapse_whitespace = b; }
+        if let Ok(v) = std::env::var("FERRY_STRIP_TERMINAL_NOISE").or_else(|_| std::env::var("FERRY_STRIP_ANSI")) {
+            if let Some(b) = parse_bool(&v) { self.condensation.strip_terminal_noise = b; }
         }
         if let Ok(v) = std::env::var("FERRY_DEDUPLICATE_LINES") {
             if let Some(b) = parse_bool(&v) { self.condensation.deduplicate_lines = b; }
         }
         if let Ok(v) = std::env::var("FERRY_MINIFY_JSON") {
             if let Some(b) = parse_bool(&v) { self.condensation.minify_json_outputs = b; }
-        }
-        if let Ok(v) = std::env::var("FERRY_PROTECT_CODE_BLOCKS") {
-            if let Some(b) = parse_bool(&v) { self.condensation.protect_code_blocks = b; }
-        }
-        if let Ok(v) = std::env::var("FERRY_ENABLE_CONSTRAINT_LEDGER") {
-            if let Some(b) = parse_bool(&v) { self.condensation.enable_constraint_ledger = b; }
-        }
-        if let Ok(v) = std::env::var("FERRY_PROTECT_STATIC_PREFIX") {
-            if let Some(b) = parse_bool(&v) { self.condensation.protect_static_prefix = b; }
-        }
-        if let Ok(v) = std::env::var("FERRY_SIGNAL_AWARE_TRUNCATION") {
-            if let Some(b) = parse_bool(&v) { self.condensation.signal_aware_truncation = b; }
         }
         if let Ok(v) = std::env::var("FERRY_FOLD_REPEATED_TOOL_FAILURES") {
             if let Some(b) = parse_bool(&v) { self.condensation.fold_repeated_tool_failures = b; }

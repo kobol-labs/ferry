@@ -13,9 +13,7 @@ fn test_system_prompt_never_mutated() {
         recent_max_tool_chars: 500,
         head_lines: 2,
         tail_lines: 2,
-        strip_ansi_escapes: true,
-        strip_progress_bars: true,
-        collapse_whitespace: true,
+        strip_terminal_noise: true,
         deduplicate_lines: true,
         minify_json_outputs: true,
         ..Default::default()
@@ -242,10 +240,8 @@ fn test_dual_key_openai_agents_format() {
 fn test_cleaner_counters_and_metrics() {
     let config = CondenserConfig {
         enabled: true,
-        strip_ansi_escapes: true,
-        strip_progress_bars: true,
+        strip_terminal_noise: true,
         deduplicate_lines: true,
-        collapse_whitespace: true,
         minify_json_outputs: true,
         ..Default::default()
     };
@@ -273,9 +269,8 @@ fn test_cleaner_counters_and_metrics() {
 fn test_code_fence_protection_in_tool_output() {
     let config = CondenserConfig {
         enabled: true,
-        protect_code_blocks: true,
+        strip_terminal_noise: true,
         deduplicate_lines: true,
-        collapse_whitespace: true,
         ..Default::default()
     };
     let condenser = ContextCondenser::new(config);
@@ -293,8 +288,6 @@ fn test_code_fence_protection_in_tool_output() {
 fn test_constraint_ledger_verifies_anchors() {
     let config = CondenserConfig {
         enabled: true,
-        enable_constraint_ledger: true,
-        protect_code_blocks: true,
         deduplicate_lines: true,
         ..Default::default()
     };
@@ -327,8 +320,6 @@ fn test_constraint_ledger_verifies_anchors() {
 fn test_constraint_ledger_veto_restores_verbatim() {
     let config = CondenserConfig {
         enabled: true,
-        enable_constraint_ledger: true,
-        protect_code_blocks: true,
         ..Default::default()
     };
     let condenser = ContextCondenser::new(config);
@@ -354,7 +345,6 @@ fn test_constraint_ledger_veto_restores_verbatim() {
 fn test_constraint_ledger_veto_in_condense() {
     let config = CondenserConfig {
         enabled: true,
-        enable_constraint_ledger: true,
         truncate_tool_outputs: true,
         recent_max_tool_chars: 50, // Truncation triggers on recent active turn
         head_lines: 1,
@@ -390,7 +380,6 @@ fn test_constraint_ledger_veto_in_condense() {
 fn test_prefix_cache_alignment_preserves_initial_turn_bytes() {
     let config = CondenserConfig {
         enabled: true,
-        protect_static_prefix: true,
         drop_historical_reasoning: true,
         truncate_tool_outputs: true,
         keep_recent_turns: 1,
@@ -470,7 +459,6 @@ fn test_strip_unclosed_think_tag() {
 fn test_developer_role_prefix_protected() {
     let config = CondenserConfig {
         enabled: true,
-        protect_static_prefix: true,
         drop_historical_reasoning: true,
         truncate_tool_outputs: true,
         ..Default::default()
@@ -828,8 +816,8 @@ fn test_signal_aware_truncation_preserves_middle_error() {
     let full_text = lines.join("\n");
 
     let mut signals_extracted = 0;
-    // With signal_aware = true, head 5 lines, tail 5 lines
-    let truncated = truncate_tool_content_smart(&full_text, 5, 5, true, &mut signals_extracted);
+    // With signal-aware smart truncation, head 5 lines, tail 5 lines
+    let truncated = truncate_tool_content_smart(&full_text, 5, 5, &mut signals_extracted);
 
     assert_eq!(signals_extracted, 1);
     assert!(truncated.contains("fatal error: connection to postgres failed"));
@@ -837,11 +825,17 @@ fn test_signal_aware_truncation_preserves_middle_error() {
     assert!(truncated.contains("info: log event 100"));
     assert!(truncated.contains("Ferry Proxy: truncated"));
 
-    // Compare with signal_aware = false: line 50 should be completely dropped
+    // When no signals exist in the middle, truncation runs standard head/tail omission
+    let clean_text: String = (1..=100)
+        .map(|i| format!("info: standard log event {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut no_signals = 0;
-    let blind_truncated = truncate_tool_content_smart(&full_text, 5, 5, false, &mut no_signals);
+    let clean_truncated = truncate_tool_content_smart(&clean_text, 5, 5, &mut no_signals);
     assert_eq!(no_signals, 0);
-    assert!(!blind_truncated.contains("fatal error: connection to postgres failed"));
+    assert!(clean_truncated.contains("info: standard log event 1"));
+    assert!(clean_truncated.contains("info: standard log event 100"));
+    assert!(!clean_truncated.contains("info: standard log event 50"));
 }
 
 #[test]

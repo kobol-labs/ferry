@@ -2,7 +2,6 @@
 bind = "0.0.0.0:4000"
 
 [local]
-name = "strata"
 api_base = "http://192.168.9.99:8080/v1"
 api_key = "sk-strata-stevegaming"
 model = "qwen3.8-flash-next-iq2_xs"
@@ -15,7 +14,6 @@ probe_interval_secs = 5
 queue_timeout_ms = 500
 
 [cloud]
-name = "minimax"
 api_base = "https://api.minimax.io/v1"
 api_key = ""
 model = "MiniMax-M3"
@@ -37,12 +35,14 @@ recent_max_tool_chars = 60000
 # Lines to preserve from the head and tail of truncated tool outputs
 head_lines = 15
 tail_lines = 10
-# RTK-inspired inline stream cleaners:
-strip_ansi_escapes = true       # Strip ANSI terminal colors and cursor codes
-strip_progress_bars = true      # Remove carriage-return overwrites and progress bars
-collapse_whitespace = true      # Collapse 3+ newlines to \n\n and trim trailing whitespace
-deduplicate_lines = true        # Collapse consecutive identical lines with repeat count
-minify_json_outputs = true      # Minify pretty-printed JSON tool outputs (saves ~30%)
-protect_code_blocks = true      # Exempt markdown code blocks from destructive cleaners
-enable_constraint_ledger = true # Proof-of-safety constraint ledger (auto-veto on anchor loss)
-protect_static_prefix = true    # Maintain 100% prefix cache immutability for 90%+ GPU hit rate
+# Streamlined cleaners & folding:
+strip_terminal_noise = true          # Strip ANSI escapes, progress bar overwrites, and collapse excess blank lines
+deduplicate_lines = true             # Collapse consecutive identical lines with repeat count
+minify_json_outputs = true           # Minify pretty-printed JSON tool outputs (saves ~30%)
+fold_repeated_tool_failures = true   # Fold runaway repetitive tool errors across historical turns
+
+# Engine Invariants (always enforced, zero configuration needed):
+# - Static Prefix Protection: 100% byte-for-byte immutable system/developer/user prompts for 90%+ KV cache hit rate
+# - Markdown Code Block Protection: code blocks are 100% exempt from destructive cleaners
+# - Signal-Aware Truncation: diagnostic errors/exceptions in middle of long logs are automatically detected and preserved
+# - Constraint Ledger Verification: safety anchors (IPs, paths, CVEs, security imperatives) are verified with automatic rollback
