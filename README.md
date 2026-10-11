@@ -17,6 +17,7 @@ When running autonomous multi-agent swarms (e.g., Strix, Cursor swarms, AutoGen)
 * **Context Watermarking**: Prompts exceeding your local GPU's prefill threshold automatically route to cloud clusters.
 * **Automatic Failover**: If a local stream terminates or times out, Ferry seamlessly retries the turn against the cloud fallback.
 * **Observability**: Exposes real-time Prometheus `/metrics` and `/stats` to track local hardware savings vs cloud spend.
+* **Network Isolation**: Can run with **zero exposed host ports**, communicating strictly across internal Docker bridge networks with client swarms.
 
 ---
 
@@ -93,7 +94,7 @@ Ferry supports full zero-config deployment by overriding any setting via environ
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `FERRY_BIND` | `0.0.0.0:4000` | Address and port to bind |
+| `FERRY_BIND` | `0.0.0.0:4000` | Address and port to bind inside container |
 | `FERRY_LOCAL_API_BASE` | `http://192.168.9.99:8080/v1` | Local inference engine base URL |
 | `FERRY_LOCAL_API_KEY` | `sk-strata-stevegaming` | Local engine API key |
 | `FERRY_LOCAL_MODEL` | `qwen3.8-flash-next-iq2_xs` | Local model name |
@@ -105,15 +106,43 @@ Ferry supports full zero-config deployment by overriding any setting via environ
 
 ---
 
-## Running Ferry
+## Deployment Modes
 
-### Standalone Binary
-```bash
-cargo build --release
-./target/release/ferry
+### Mode 1: Dedicated Internal Network (Recommended for Security Swarms)
+
+To ensure Ferry **only** accepts traffic from client agents (e.g., Strix) and exposes **no open ports on the host**, deploy via Docker Compose:
+
+```yaml
+services:
+  ferry:
+    image: ghcr.io/kobol-labs/ferry:latest
+    container_name: ferry
+    restart: unless-stopped
+    volumes:
+      - ./config/ferry.toml:/app/ferry.toml:ro
+    expose:
+      - "4000"  # Accessible inside strix-net only; NOT bound to host
+    networks:
+      - strix-net
+
+  strix:
+    image: ghcr.io/kobol-labs/strix:latest
+    depends_on:
+      - ferry
+    environment:
+      - OPENAI_BASE_URL=http://ferry:4000/v1
+    networks:
+      - strix-net
+
+networks:
+  strix-net:
+    name: strix-net
 ```
 
-### Docker
+### Mode 2: Published Host Port (Standalone Docker)
+
+If clients on your host machine or LAN need to route through Ferry:
+
 ```bash
 docker run -d \
   --name ferry \
@@ -124,6 +153,13 @@ docker run -d \
   ghcr.io/kobol-labs/ferry:latest
 ```
 
+### Mode 3: Native Binary
+
+```bash
+cargo build --release
+./target/release/ferry
+```
+
 ---
 
 ## Observability & Metrics
@@ -131,9 +167,18 @@ docker run -d \
 Ferry exposes built-in telemetry endpoints for real-time monitoring:
 
 ### 1. JSON Statistics (`GET /stats`)
+
+From host (when running in Docker Compose with no host ports):
+```bash
+docker compose exec ferry wget -qO- http://127.0.0.1:4000/stats | jq
+```
+
+From localhost (when running standalone on port 4000):
 ```bash
 curl -s http://127.0.0.1:4000/stats | jq
 ```
+
+Example output:
 ```json
 {
   "total_requests": 332,
@@ -150,9 +195,11 @@ curl -s http://127.0.0.1:4000/stats | jq
 ```
 
 ### 2. Prometheus Scrape Target (`GET /metrics`)
+
 ```bash
-curl -s http://127.0.0.1:4000/metrics
+docker compose exec ferry wget -qO- http://127.0.0.1:4000/metrics
 ```
+
 ```text
 # HELP ferry_requests_total Total number of LLM requests
 # TYPE ferry_requests_total counter
