@@ -63,40 +63,37 @@ where
             return Poll::Ready(None);
         }
 
-        // 1. Poll the upstream data stream first
         match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
+            Poll::Ready(Some(Ok(bytes))) => {
                 this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
-                return Poll::Ready(Some(Ok(chunk)));
+                Poll::Ready(Some(Ok(bytes)))
             }
-            Poll::Ready(Some(Err(err))) => {
+            Poll::Ready(Some(Err(e))) => {
+                warn!(error = %e, "Upstream stream closed or errored mid-transfer; cleanly terminating SSE stream with [DONE]");
+                *this.ended = true;
                 if *this.is_sse {
-                    warn!(error = %err, "Upstream stream closed or errored mid-transfer; cleanly terminating SSE stream with [DONE]");
-                    *this.ended = true;
-                    return Poll::Ready(Some(Ok(bytes::Bytes::from("\n\ndata: [DONE]\n\n"))));
+                    Poll::Ready(Some(Ok(bytes::Bytes::from("data: [DONE]\n\n"))))
                 } else {
-                    *this.ended = true;
-                    return Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))));
+                    Poll::Ready(None)
                 }
             }
             Poll::Ready(None) => {
                 *this.ended = true;
-                return Poll::Ready(None);
+                Poll::Ready(None)
             }
-            Poll::Pending => {}
-        }
-
-        // 2. If inner stream is pending and this is an SSE connection, poll the keepalive timer
-        if *this.is_sse {
-            match Future::poll(this.sleep.as_mut(), cx) {
-                Poll::Ready(()) => {
-                    this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
-                    Poll::Ready(Some(Ok(bytes::Bytes::from(": keepalive\n\n"))))
+            Poll::Pending => {
+                if *this.is_sse {
+                    match Future::poll(this.sleep.as_mut(), cx) {
+                        Poll::Ready(()) => {
+                            this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
+                            Poll::Ready(Some(Ok(bytes::Bytes::from(": keepalive\n\n"))))
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
+                } else {
+                    Poll::Pending
                 }
-                Poll::Pending => Poll::Pending,
             }
-        } else {
-            Poll::Pending
         }
     }
 }
@@ -110,6 +107,9 @@ pub struct ResponseMeta {
     pub savings_pct: f64,
     pub duration_ms: u128,
     pub is_failover: bool,
+    pub slot_id: Option<usize>,
+    pub is_affinity_hit: bool,
+    pub session_id: String,
 }
 
 pub struct UpstreamClient {
@@ -158,12 +158,20 @@ impl UpstreamClient {
                     target = "local",
                     model = %self.config.local.model,
                     tokens = decision.est_tokens,
+                    slot = decision.slot_id.unwrap_or(0),
+                    affinity_hit = decision.is_affinity_hit,
+                    session = %decision.session_id,
                     reason = %decision.reason,
                     "Routing to Local Provider"
                 );
 
                 let local_url = format!("{}/chat/completions", self.config.local.api_base.trim_end_matches('/'));
                 normalize_wire_format(&mut body, &self.config.local.model);
+
+                // Inject slot affinity into local llama-server / Strata payload
+                if let Some(slot) = decision.slot_id {
+                    body["id_slot"] = serde_json::json!(slot);
+                }
 
                 let req = self
                     .client
@@ -193,6 +201,9 @@ impl UpstreamClient {
                             savings_pct,
                             duration_ms: duration.as_millis(),
                             is_failover: false,
+                            slot_id: decision.slot_id,
+                            is_affinity_hit: decision.is_affinity_hit,
+                            session_id: decision.session_id.clone(),
                         };
                         self.handle_upstream_response(resp, is_stream, slot_guard, meta, cache_key).await
                     }
@@ -215,6 +226,9 @@ impl UpstreamClient {
                             savings_pct,
                             duration_ms: duration.as_millis(),
                             is_failover: false,
+                            slot_id: decision.slot_id,
+                            is_affinity_hit: decision.is_affinity_hit,
+                            session_id: decision.session_id.clone(),
                         };
                         self.handle_upstream_response(resp, is_stream, slot_guard, meta, None).await
                     }
@@ -291,6 +305,11 @@ impl UpstreamClient {
             "Routing to Cloud Provider"
         );
 
+        // Strip local-specific id_slot parameter before sending to Cloud
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("id_slot");
+        }
+
         let cloud_url = format!("{}/chat/completions", self.config.cloud.api_base.trim_end_matches('/'));
         normalize_wire_format(&mut body, &self.config.cloud.model);
 
@@ -322,6 +341,9 @@ impl UpstreamClient {
                     savings_pct,
                     duration_ms: duration.as_millis(),
                     is_failover,
+                    slot_id: None,
+                    is_affinity_hit: false,
+                    session_id: decision.session_id,
                 };
                 self.handle_upstream_response(resp, is_stream, None, meta, cache_key).await
             }
@@ -366,7 +388,7 @@ impl UpstreamClient {
         // Always ensure universal CORS headers so browser-based clients (OpenWebUI, dashboards) are never blocked
         headers.insert(HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*"));
         headers.insert(HeaderName::from_static("access-control-allow-methods"), HeaderValue::from_static("GET, POST, OPTIONS"));
-        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms"));
+        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms, x-ferry-session-id, x-session-id, x-agent-id"));
 
         // Observability headers
         headers.insert(HeaderName::from_static("x-ferry-provider"), HeaderValue::from_static(meta.provider));
@@ -389,9 +411,26 @@ impl UpstreamClient {
             HeaderName::from_static("x-ferry-failover"),
             HeaderValue::from_static(if meta.is_failover { "true" } else { "false" }),
         );
+
+        // Session & Slot Affinity headers
+        if let Some(slot) = meta.slot_id {
+            if let Ok(val) = HeaderValue::from_str(&slot.to_string()) {
+                headers.insert(HeaderName::from_static("x-ferry-slot"), val);
+            }
+            headers.insert(
+                HeaderName::from_static("x-ferry-affinity"),
+                HeaderValue::from_static(if meta.is_affinity_hit { "HIT" } else { "NEW" }),
+            );
+        }
+        if !meta.session_id.is_empty() {
+            if let Ok(val) = HeaderValue::from_str(&meta.session_id) {
+                headers.insert(HeaderName::from_static("x-ferry-session-id"), val);
+            }
+        }
+
         headers.insert(
             HeaderName::from_static("access-control-expose-headers"),
-            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache"),
+            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache, x-ferry-slot, x-ferry-affinity, x-ferry-session-id"),
         );
 
         let is_sse = _is_stream
@@ -412,33 +451,21 @@ impl UpstreamClient {
             return (status, headers, body_bytes).into_response();
         }
 
-        let keepalive_duration = std::time::Duration::from_secs(3);
-        let guarded = GuardedStream::new(resp.bytes_stream(), guard, is_sse, keepalive_duration);
+        // Streaming SSE path with background keepalive heartbeat
+        let byte_stream = resp.bytes_stream();
+        let guarded_stream = GuardedStream::new(
+            byte_stream,
+            guard,
+            is_sse,
+            std::time::Duration::from_secs(15),
+        );
 
-        let body = Body::from_stream(guarded);
-        (status, headers, body).into_response()
+        (status, headers, Body::from_stream(guarded_stream)).into_response()
     }
 }
 
-/// Normalizes OpenAI Responses format (`type: function_call_output`) to standard OpenAI wire format (`role: tool`)
-/// and sets the appropriate target model identifier.
 pub fn normalize_wire_format(body: &mut Value, target_model: &str) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("model".to_string(), Value::String(target_model.to_string()));
-
-        if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
-            for msg in messages {
-                let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-                if msg_type == "function_call_output" && role.is_empty() {
-                    if let Some(m_obj) = msg.as_object_mut() {
-                        m_obj.insert("role".to_string(), Value::String("tool".to_string()));
-                        if let Some(call_id) = m_obj.get("call_id").cloned() {
-                            m_obj.insert("tool_call_id".to_string(), call_id);
-                        }
-                    }
-                }
-            }
-        }
     }
 }

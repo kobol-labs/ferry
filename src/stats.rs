@@ -45,6 +45,12 @@ pub struct MetricsTracker {
     pub circuit_open: AtomicBool,
     pub consecutive_local_failures: AtomicU32,
     pub circuit_trips_total: AtomicU64,
+
+    // Affinity & Rolling Compaction metrics
+    pub affinity_hits: AtomicU64,
+    pub affinity_misses: AtomicU64,
+    pub rolling_compact_count: AtomicU64,
+    pub rolling_compact_chars_saved: AtomicU64,
 }
 
 impl Default for MetricsTracker {
@@ -89,6 +95,11 @@ impl Default for MetricsTracker {
             circuit_open: AtomicBool::new(false),
             consecutive_local_failures: AtomicU32::new(0),
             circuit_trips_total: AtomicU64::new(0),
+
+            affinity_hits: AtomicU64::new(0),
+            affinity_misses: AtomicU64::new(0),
+            rolling_compact_count: AtomicU64::new(0),
+            rolling_compact_chars_saved: AtomicU64::new(0),
         }
     }
 }
@@ -136,6 +147,11 @@ pub struct StatsSnapshot {
     pub circuit_open: bool,
     pub consecutive_local_failures: u32,
     pub circuit_trips_total: u64,
+
+    pub affinity_hits: u64,
+    pub affinity_misses: u64,
+    pub rolling_compact_count: u64,
+    pub rolling_compact_chars_saved: u64,
 }
 
 impl MetricsTracker {
@@ -393,6 +409,11 @@ impl MetricsTracker {
             circuit_open: self.circuit_open.load(Ordering::Relaxed),
             consecutive_local_failures: self.consecutive_local_failures.load(Ordering::Relaxed),
             circuit_trips_total: self.circuit_trips_total.load(Ordering::Relaxed),
+
+            affinity_hits: self.affinity_hits.load(Ordering::Relaxed),
+            affinity_misses: self.affinity_misses.load(Ordering::Relaxed),
+            rolling_compact_count: self.rolling_compact_count.load(Ordering::Relaxed),
+            rolling_compact_chars_saved: self.rolling_compact_chars_saved.load(Ordering::Relaxed),
         }
     }
 
@@ -473,7 +494,7 @@ impl MetricsTracker {
              ferry_last_condensation_savings_percent {last_pct:.2}\n\
              # HELP ferry_last_condensation_chars_saved Characters pruned on most recent request\n\
              # TYPE ferry_last_condensation_chars_saved gauge\n\
-             ferry_last_condensation_chars_saved {last_chars}\n",
+             ferry_last_condensation_chars_saved {last_chars}\n             # HELP ferry_affinity_hits_total Total requests routed to their bound session slot (affinity hit)\n             # TYPE ferry_affinity_hits_total counter\n             ferry_affinity_hits_total {aff_hits}\n             # HELP ferry_affinity_misses_total Total requests that were allocated a new or alternative slot\n             # TYPE ferry_affinity_misses_total counter\n             ferry_affinity_misses_total {aff_misses}\n             # HELP ferry_rolling_compact_total Total times rolling context compaction triggered\n             # TYPE ferry_rolling_compact_total counter\n             ferry_rolling_compact_total {rolling_compacts}\n             # HELP ferry_rolling_compact_chars_saved_total Total characters pruned via rolling compaction\n             # TYPE ferry_rolling_compact_chars_saved_total counter\n             ferry_rolling_compact_chars_saved_total {rolling_chars}\n",
             total = s.total_requests,
             local = s.local_requests,
             cloud = s.cloud_requests,
@@ -509,6 +530,24 @@ impl MetricsTracker {
             last_cond = s.last_prompt_tokens_condensed,
             last_pct = s.last_savings_percent,
             last_chars = s.last_chars_saved,
+            aff_hits = s.affinity_hits,
+            aff_misses = s.affinity_misses,
+            rolling_compacts = s.rolling_compact_count,
+            rolling_chars = s.rolling_compact_chars_saved,
         )
     }
+
+    pub fn record_affinity(&self, is_hit: bool) {
+        if is_hit {
+            self.affinity_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.affinity_misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_rolling_compaction(&self, chars_saved: usize) {
+        self.rolling_compact_count.fetch_add(1, Ordering::Relaxed);
+        self.rolling_compact_chars_saved.fetch_add(chars_saved as u64, Ordering::Relaxed);
+    }
 }
+

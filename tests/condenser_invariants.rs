@@ -551,7 +551,7 @@ fn test_windows_path_anchors_preserved() {
 #[tokio::test]
 async fn test_explicit_cloud_model_selection_router() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -574,7 +574,7 @@ async fn test_explicit_cloud_model_selection_router() {
 #[tokio::test]
 async fn test_circuit_breaker_trip_and_recovery() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -625,7 +625,7 @@ async fn test_circuit_breaker_trip_and_recovery() {
 #[tokio::test]
 async fn test_route_override_client_headers() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -659,7 +659,7 @@ async fn test_route_override_client_headers() {
 #[tokio::test]
 async fn test_queue_contention_slot_release() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -700,7 +700,7 @@ async fn test_queue_contention_slot_release() {
 #[tokio::test]
 async fn test_atomic_slot_concurrency_no_oversubscription() {
     use ferry::config::Config;
-    use ferry::router::{Router, TargetProvider};
+    use ferry::router::Router;
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -981,7 +981,9 @@ async fn test_guarded_stream_sse_graceful_done_on_upstream_error() {
     let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = guarded.collect().await;
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].as_ref().unwrap(), &bytes::Bytes::from("data: {\"chunk\": 1}\n\n"));
-    assert_eq!(chunks[1].as_ref().unwrap(), &bytes::Bytes::from("\n\ndata: [DONE]\n\n"));
+    assert_eq!(chunks[1].as_ref().unwrap(), &bytes::Bytes::from("data: [DONE]
+
+"));
 }
 
 #[tokio::test]

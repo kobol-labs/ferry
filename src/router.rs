@@ -1,3 +1,4 @@
+use crate::affinity::SessionAffinityTracker;
 use crate::config::Config;
 use crate::stats::MetricsTracker;
 use serde_json::Value;
@@ -12,24 +13,40 @@ pub enum TargetProvider {
 #[derive(Debug)]
 pub struct LocalSlotGuard {
     metrics: Option<Arc<MetricsTracker>>,
+    affinity_tracker: Option<Arc<SessionAffinityTracker>>,
+    slot_id: Option<usize>,
     tokens: u64,
 }
 
 impl LocalSlotGuard {
-    pub fn new(metrics: Arc<MetricsTracker>, tokens: u64) -> Self {
+    pub fn new(
+        metrics: Arc<MetricsTracker>,
+        affinity_tracker: Option<Arc<SessionAffinityTracker>>,
+        slot_id: Option<usize>,
+        tokens: u64,
+    ) -> Self {
         Self {
             metrics: Some(metrics),
+            affinity_tracker,
+            slot_id,
             tokens,
         }
     }
 
     pub fn disarm(&mut self) {
         self.metrics = None;
+        self.affinity_tracker = None;
+        self.slot_id = None;
     }
 }
 
 impl Drop for LocalSlotGuard {
     fn drop(&mut self) {
+        if let Some(slot) = self.slot_id.take() {
+            if let Some(tracker) = self.affinity_tracker.take() {
+                tracker.release_slot(slot);
+            }
+        }
         if let Some(m) = self.metrics.take() {
             m.release_local_capacity(self.tokens);
         }
@@ -44,16 +61,36 @@ pub struct RouteDecision {
     pub reason: String,
     pub local_only: bool,
     pub slot_guard: Option<LocalSlotGuard>,
+    pub slot_id: Option<usize>,
+    pub is_affinity_hit: bool,
+    pub session_id: String,
 }
 
 pub struct Router {
     config: Arc<Config>,
     metrics: Arc<MetricsTracker>,
+    affinity_tracker: Arc<SessionAffinityTracker>,
 }
 
 impl Router {
     pub fn new(config: Arc<Config>, metrics: Arc<MetricsTracker>) -> Self {
-        Self { config, metrics }
+        let affinity_tracker = Arc::new(SessionAffinityTracker::new(
+            config.affinity.enabled,
+            config.local.max_slots,
+        ));
+        Self::with_affinity(config, metrics, affinity_tracker)
+    }
+
+    pub fn with_affinity(
+        config: Arc<Config>,
+        metrics: Arc<MetricsTracker>,
+        affinity_tracker: Arc<SessionAffinityTracker>,
+    ) -> Self {
+        Self {
+            config,
+            metrics,
+            affinity_tracker,
+        }
     }
 
     pub fn estimate_tokens(body: &Value) -> u64 {
@@ -74,6 +111,16 @@ impl Router {
         route_override: Option<&str>,
         explicit_timeout_ms: Option<u64>,
     ) -> RouteDecision {
+        self.decide_for_session(body, route_override, explicit_timeout_ms, "session-default").await
+    }
+
+    pub async fn decide_for_session(
+        &self,
+        body: &Value,
+        route_override: Option<&str>,
+        explicit_timeout_ms: Option<u64>,
+        session_id: &str,
+    ) -> RouteDecision {
         let est_tokens = Self::estimate_tokens(body);
         let local_only = matches!(route_override, Some("local-only") | Some("local"));
         let local_prefer = matches!(route_override, Some("local-prefer") | Some("prefer-local"));
@@ -89,6 +136,9 @@ impl Router {
                 reason: "client header X-Ferry-Route requested cloud-only".to_string(),
                 local_only: false,
                 slot_guard: None,
+                slot_id: None,
+                is_affinity_hit: false,
+                session_id: session_id.to_string(),
             };
         }
 
@@ -102,6 +152,9 @@ impl Router {
                 reason: format!("circuit breaker open (Strata offline, {failures} failures)"),
                 local_only,
                 slot_guard: None,
+                slot_id: None,
+                is_affinity_hit: false,
+                session_id: session_id.to_string(),
             };
         }
 
@@ -116,6 +169,9 @@ impl Router {
                         reason: format!("explicitly requested cloud model ({requested_model})"),
                         local_only: false,
                         slot_guard: None,
+                        slot_id: None,
+                        is_affinity_hit: false,
+                        session_id: session_id.to_string(),
                     };
                 }
             }
@@ -134,26 +190,42 @@ impl Router {
                 reason: format!("context tokens ({est_tokens}) > local max ({max_context})"),
                 local_only,
                 slot_guard: None,
+                slot_id: None,
+                is_affinity_hit: false,
+                session_id: session_id.to_string(),
             };
         }
 
-        // 5. Atomic local slot & token capacity acquisition with contention queue support
-        let queue_timeout_ms = self.config.local.queue_timeout_ms;
-
-        if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
-            let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
-            let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
-            return RouteDecision {
-                target: TargetProvider::Local,
-                est_tokens,
-                is_spillover: false,
-                reason: format!("local capacity acquired ({active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
-                local_only,
-                slot_guard: Some(LocalSlotGuard::new(self.metrics.clone(), est_tokens)),
-            };
+        // 5. Atomic local slot & token capacity acquisition with session affinity
+        if let Some((slot_id, is_hit)) = self.affinity_tracker.try_acquire_slot(session_id) {
+            if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
+                self.metrics.record_affinity(is_hit);
+                let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+                let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
+                let aff_desc = if is_hit { "affinity hit" } else { "affinity assigned" };
+                return RouteDecision {
+                    target: TargetProvider::Local,
+                    est_tokens,
+                    is_spillover: false,
+                    reason: format!("local slot {slot_id} acquired ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
+                    local_only,
+                    slot_guard: Some(LocalSlotGuard::new(
+                        self.metrics.clone(),
+                        Some(self.affinity_tracker.clone()),
+                        Some(slot_id),
+                        est_tokens,
+                    )),
+                    slot_id: Some(slot_id),
+                    is_affinity_hit: is_hit,
+                    session_id: session_id.to_string(),
+                };
+            } else {
+                self.affinity_tracker.release_slot(slot_id);
+            }
         }
 
         // Adaptive Queueing: Determine wait limit based on client hints and token size
+        let queue_timeout_ms = self.config.local.queue_timeout_ms;
         let effective_wait_ms = if let Some(ms) = explicit_timeout_ms {
             ms
         } else if fast_mode {
@@ -173,17 +245,31 @@ impl Router {
             let wait_limit = std::time::Duration::from_millis(effective_wait_ms);
             while start.elapsed() < wait_limit {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
-                    let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
-                    let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
-                    return RouteDecision {
-                        target: TargetProvider::Local,
-                        est_tokens,
-                        is_spillover: false,
-                        reason: format!("local capacity acquired from contention queue ({active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
-                        local_only,
-                        slot_guard: Some(LocalSlotGuard::new(self.metrics.clone(), est_tokens)),
-                    };
+                if let Some((slot_id, is_hit)) = self.affinity_tracker.try_acquire_slot(session_id) {
+                    if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
+                        self.metrics.record_affinity(is_hit);
+                        let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+                        let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
+                        let aff_desc = if is_hit { "affinity hit" } else { "affinity assigned" };
+                        return RouteDecision {
+                            target: TargetProvider::Local,
+                            est_tokens,
+                            is_spillover: false,
+                            reason: format!("local slot {slot_id} acquired from contention queue ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
+                            local_only,
+                            slot_guard: Some(LocalSlotGuard::new(
+                                self.metrics.clone(),
+                                Some(self.affinity_tracker.clone()),
+                                Some(slot_id),
+                                est_tokens,
+                            )),
+                            slot_id: Some(slot_id),
+                            is_affinity_hit: is_hit,
+                            session_id: session_id.to_string(),
+                        };
+                    } else {
+                        self.affinity_tracker.release_slot(slot_id);
+                    }
                 }
             }
         }
@@ -197,6 +283,9 @@ impl Router {
             reason: format!("local capacity saturated ({active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens) -> cloud spillover"),
             local_only,
             slot_guard: None,
+            slot_id: None,
+            is_affinity_hit: false,
+            session_id: session_id.to_string(),
         }
     }
 }

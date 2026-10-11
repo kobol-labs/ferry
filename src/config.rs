@@ -13,6 +13,8 @@ pub struct Config {
     pub condensation: CondenserConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub affinity: AffinityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,22 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffinityConfig {
+    #[serde(default = "default_affinity_enabled")]
+    pub enabled: bool,
+}
+
+fn default_affinity_enabled() -> bool { true }
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_affinity_enabled(),
         }
     }
 }
@@ -174,6 +192,12 @@ pub struct CondenserConfig {
     pub minify_json_outputs: bool,
     #[serde(default = "default_fold_repeated_tool_failures")]
     pub fold_repeated_tool_failures: bool,
+    #[serde(default = "default_rolling_compaction")]
+    pub rolling_compaction: bool,
+    #[serde(default = "default_compact_threshold_tokens")]
+    pub compact_threshold_tokens: u64,
+    #[serde(default = "default_compact_keep_recent_turns")]
+    pub compact_keep_recent_turns: usize,
 }
 
 fn default_condensation_enabled() -> bool { true }
@@ -188,6 +212,9 @@ fn default_strip_terminal_noise() -> bool { true }
 fn default_deduplicate_lines() -> bool { true }
 fn default_minify_json() -> bool { true }
 fn default_fold_repeated_tool_failures() -> bool { true }
+fn default_rolling_compaction() -> bool { true }
+fn default_compact_threshold_tokens() -> u64 { 64000 }
+fn default_compact_keep_recent_turns() -> usize { 4 }
 
 impl Default for CondenserConfig {
     fn default() -> Self {
@@ -204,6 +231,9 @@ impl Default for CondenserConfig {
             deduplicate_lines: default_deduplicate_lines(),
             minify_json_outputs: default_minify_json(),
             fold_repeated_tool_failures: default_fold_repeated_tool_failures(),
+            rolling_compaction: default_rolling_compaction(),
+            compact_threshold_tokens: default_compact_threshold_tokens(),
+            compact_keep_recent_turns: default_compact_keep_recent_turns(),
         }
     }
 }
@@ -239,6 +269,7 @@ impl Config {
             cloud: CloudConfig::default(),
             condensation: CondenserConfig::default(),
             cache: CacheConfig::default(),
+            affinity: AffinityConfig::default(),
         }
     }
 
@@ -319,6 +350,15 @@ impl Config {
         if let Ok(v) = std::env::var("FERRY_FOLD_REPEATED_TOOL_FAILURES") {
             if let Some(b) = parse_bool(&v) { self.condensation.fold_repeated_tool_failures = b; }
         }
+        if let Ok(v) = std::env::var("FERRY_ROLLING_COMPACTION") {
+            if let Some(b) = parse_bool(&v) { self.condensation.rolling_compaction = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_COMPACT_THRESHOLD_TOKENS") {
+            if let Ok(n) = v.parse() { self.condensation.compact_threshold_tokens = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_COMPACT_KEEP_RECENT_TURNS") {
+            if let Ok(n) = v.parse() { self.condensation.compact_keep_recent_turns = n; }
+        }
         if let Ok(v) = std::env::var("FERRY_CACHE_ENABLED") {
             if let Some(b) = parse_bool(&v) { self.cache.enabled = b; }
         }
@@ -327,6 +367,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_CACHE_TTL_SECS") {
             if let Ok(n) = v.parse() { self.cache.ttl_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_AFFINITY_ENABLED") {
+            if let Some(b) = parse_bool(&v) { self.affinity.enabled = b; }
         }
     }
 }

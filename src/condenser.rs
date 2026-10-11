@@ -24,6 +24,14 @@ pub struct CondensationStats {
     pub loops_collapsed_count: usize,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RollingCompactionStats {
+    pub turns_compacted: usize,
+    pub chars_saved: usize,
+    pub original_chars: usize,
+    pub compacted_chars: usize,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContentSegment {
     Text(String),
@@ -387,6 +395,124 @@ impl ContextCondenser {
         } else {
             None
         }
+    }
+
+    /// Rolling Context Compaction:
+    /// When total context tokens exceed `compact_threshold_tokens`, compacts older historical turns
+    /// into a structured checkpoint block, leaving the system prompt and the recent turns intact.
+    /// Invariant: Respects tool call boundaries so that assistant tool_calls are never separated
+    /// from their matching tool response messages.
+    pub fn rolling_compact(&self, body: &mut Value) -> Option<RollingCompactionStats> {
+        if !self.config.rolling_compaction {
+            return None;
+        }
+
+        let messages = body.get_mut("messages")?.as_array_mut()?;
+        let orig_chars = count_message_chars(messages);
+        let est_tokens = estimate_tokens_from_chars(orig_chars);
+
+        if est_tokens <= self.config.compact_threshold_tokens {
+            return None;
+        }
+
+        let total_msgs = messages.len();
+        let keep_recent = self.config.compact_keep_recent_turns * 2;
+        if total_msgs <= keep_recent + 2 {
+            return None;
+        }
+
+        // Preserve system message if present at index 0
+        let has_system = messages.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system");
+        let start_idx = if has_system { 1 } else { 0 };
+
+        let mut split_idx = total_msgs.saturating_sub(keep_recent);
+        if split_idx <= start_idx {
+            return None;
+        }
+
+        // Safety: ensure we do not split an assistant tool_call from its tool responses
+        while split_idx > start_idx {
+            let role = messages[split_idx].get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "tool" {
+                split_idx -= 1;
+            } else {
+                break;
+            }
+        }
+
+        if split_idx > start_idx {
+            let prev_role = messages[split_idx - 1].get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if prev_role == "assistant" && messages[split_idx - 1].get("tool_calls").is_some() {
+                split_idx -= 1;
+            }
+        }
+
+        if split_idx <= start_idx + 1 {
+            return None;
+        }
+
+        let mut summary_lines = Vec::new();
+        let num_compacted = split_idx - start_idx;
+
+        for msg in &messages[start_idx..split_idx] {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            match role {
+                "user" => {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        let snippet: String = content.chars().take(250).collect();
+                        summary_lines.push(format!("• [User Request]: {}", snippet.trim()));
+                    }
+                }
+                "assistant" => {
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                        for tc in tool_calls {
+                            let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("tool");
+                            summary_lines.push(format!("• [Executed Tool]: {}", name));
+                        }
+                    } else if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        let snippet: String = content.chars().take(250).collect();
+                        summary_lines.push(format!("• [Assistant Finding]: {}", snippet.trim()));
+                    }
+                }
+                "tool" => {
+                    let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        let first_line = content.lines().next().unwrap_or("").trim();
+                        let snippet: String = first_line.chars().take(150).collect();
+                        summary_lines.push(format!("  └─ [{name} result]: {}", snippet));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let summary_text = format!(
+            "[Historical Context Checkpoint: {} earlier turns compacted]\n{}\n[End of Historical Checkpoint]",
+            num_compacted,
+            summary_lines.join("\n")
+        );
+
+        let original_range_chars = count_message_chars(&messages[start_idx..split_idx]);
+        if summary_text.len() >= original_range_chars {
+            return None;
+        }
+
+        let checkpoint_msg = serde_json::json!({
+            "role": "user",
+            "content": summary_text
+        });
+
+        messages.splice(start_idx..split_idx, std::iter::once(checkpoint_msg));
+
+        let new_chars = count_message_chars(messages);
+        let chars_saved = orig_chars.saturating_sub(new_chars);
+
+        Some(RollingCompactionStats {
+            turns_compacted: num_compacted,
+            chars_saved,
+            original_chars: orig_chars,
+            compacted_chars: new_chars,
+        })
     }
 
     fn clean_single_chunk(&self, input: &str, stats: &mut CondensationStats) -> String {
@@ -1069,5 +1195,55 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         let output = msgs[2]["output"].as_str().unwrap();
         assert!(output.contains("Ferry Proxy: truncated"));
+    }
+
+    #[test]
+    fn test_rolling_context_compaction_preserves_system_and_recent() {
+        let config = CondenserConfig {
+            rolling_compaction: true,
+            compact_threshold_tokens: 50, // low threshold for testing
+            compact_keep_recent_turns: 1, // keep last 2 messages
+            ..Default::default()
+        };
+        let condenser = ContextCondenser::new(config);
+
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "You are a pentester." },
+                { "role": "user", "content": "Explore target 1 in deep detail" },
+                { "role": "assistant", "content": "Investigating target 1 with network security tools" },
+                { "role": "tool", "name": "nmap", "content": "PORT 80 open, Apache 2.4 web server details and directory listing\n".repeat(30) },
+                { "role": "user", "content": "Explore target 2 in deep detail" },
+                { "role": "assistant", "content": "Investigating target 2 with web client tools" },
+                { "role": "tool", "name": "curl", "content": "HTTP 200 OK headers and body content with detailed debug responses\n".repeat(30) },
+                { "role": "user", "content": "Recent active user request" },
+                { "role": "assistant", "content": "Recent active assistant reply" }
+            ]
+        });
+
+        let stats = condenser.rolling_compact(&mut body);
+        assert!(stats.is_some(), "Expected rolling compaction to trigger");
+        let s = stats.unwrap();
+        assert!(s.turns_compacted >= 4);
+        assert!(s.chars_saved > 0);
+
+        let msgs = body["messages"].as_array().unwrap();
+        // System prompt preserved at index 0
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are a pentester.");
+
+        // Checkpoint message at index 1
+        assert_eq!(msgs[1]["role"], "user");
+        let checkpoint = msgs[1]["content"].as_str().unwrap();
+        assert!(checkpoint.contains("Historical Context Checkpoint"));
+        assert!(checkpoint.contains("Explore target 1"));
+
+        // Recent turns preserved at the end
+        let last_user = &msgs[msgs.len() - 2];
+        let last_asst = &msgs[msgs.len() - 1];
+        assert_eq!(last_user["role"], "user");
+        assert_eq!(last_user["content"], "Recent active user request");
+        assert_eq!(last_asst["role"], "assistant");
+        assert_eq!(last_asst["content"], "Recent active assistant reply");
     }
 }

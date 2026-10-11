@@ -103,4 +103,8 @@ impl ResponseCache {
             },
         );
     }
+
+    pub async fn len(&self) -> usize {
+        self.store.read().await.len()
+    }
 }

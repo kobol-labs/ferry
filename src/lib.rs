@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod cache;
 pub mod condenser;
 pub mod config;
