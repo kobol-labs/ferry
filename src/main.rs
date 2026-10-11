@@ -1,11 +1,11 @@
-
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
+use ferry::cache::ResponseCache;
 use ferry::condenser::ContextCondenser;
 use ferry::config::Config;
 use ferry::router::Router as HybridRouter;
@@ -22,6 +22,7 @@ struct AppState {
     router: HybridRouter,
     condenser: ContextCondenser,
     upstream: UpstreamClient,
+    cache: Arc<ResponseCache>,
     request_id_counter: AtomicU64,
 }
 
@@ -37,11 +38,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::var("FERRY_CONFIG").unwrap_or_else(|_| "ferry.toml".to_string());
     info!(config = %config_path, "Loading Ferry configuration");
 
-    let config = Arc::new(Config::from_file(&config_path)?);
+    let config = Arc::new(Config::load_from_file_or_default(&config_path));
     let metrics = Arc::new(MetricsTracker::new());
     let router = HybridRouter::new(config.clone(), metrics.clone());
     let condenser = ContextCondenser::new(config.condensation.clone());
-    let upstream = UpstreamClient::new(config.clone(), metrics.clone());
+    let cache = Arc::new(ResponseCache::new(
+        config.cache.enabled,
+        config.cache.max_entries,
+        config.cache.ttl_secs,
+    ));
+    let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -49,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router,
         condenser,
         upstream,
+        cache,
         request_id_counter: AtomicU64::new(1),
     });
 
@@ -108,6 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/stats", get(stats_handler))
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(models_handler).options(cors_options_handler))
+        .route("/v1/models/{id}", get(model_detail_handler).options(cors_options_handler))
+        .route("/v1/embeddings", post(embeddings_handler).options(cors_options_handler))
         .route(
             "/v1/chat/completions",
             post(chat_completions_handler).options(cors_options_handler),
@@ -122,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_slots = config.local.max_slots,
         cloud_model = %config.cloud.model,
         condensation_enabled = config.condensation.enabled,
+        cache_enabled = config.cache.enabled,
         "Ferry hybrid proxy started"
     );
 
@@ -136,11 +146,11 @@ async fn cors_options_handler() -> impl IntoResponse {
             ("access-control-allow-methods", "GET, POST, OPTIONS"),
             (
                 "access-control-allow-headers",
-                "content-type, authorization, x-ferry-condense, x-ferry-route",
+                "content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms",
             ),
             (
                 "access-control-expose-headers",
-                "x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover",
+                "x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache",
             ),
         ],
         "",
@@ -162,6 +172,9 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "active_local_slots": snap.active_local_slots,
             "max_local_slots": state.config.local.max_slots,
             "condensation_enabled": state.config.condensation.enabled,
+            "cache_enabled": state.config.cache.enabled,
+            "cache_hits": state.cache.hits.load(Ordering::Relaxed),
+            "cache_misses": state.cache.misses.load(Ordering::Relaxed),
         })),
     )
 }
@@ -184,16 +197,94 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 }
 
 async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1700000000);
+
+    let models = vec![
+        json!({ "id": "ferry", "object": "model", "created": now, "owned_by": "kobol-labs" }),
+        json!({ "id": "hybrid-pentest", "object": "model", "created": now, "owned_by": "kobol-labs" }),
+        json!({ "id": &state.config.local.model, "object": "model", "created": now, "owned_by": "local" }),
+        json!({ "id": &state.config.cloud.model, "object": "model", "created": now, "owned_by": "cloud" }),
+        json!({ "id": "gpt-4o", "object": "model", "created": now, "owned_by": "openai-alias" }),
+        json!({ "id": "gpt-4o-mini", "object": "model", "created": now, "owned_by": "openai-alias" }),
+        json!({ "id": "gpt-4", "object": "model", "created": now, "owned_by": "openai-alias" }),
+        json!({ "id": "gpt-3.5-turbo", "object": "model", "created": now, "owned_by": "openai-alias" }),
+        json!({ "id": "claude-3-5-sonnet", "object": "model", "created": now, "owned_by": "anthropic-alias" }),
+        json!({ "id": "deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek-alias" }),
+    ];
+
     (
-        [("access-control-allow-origin", "*")],
+        [
+            ("access-control-allow-origin", "*"),
+            ("content-type", "application/json"),
+        ],
         Json(json!({
             "object": "list",
-            "data": [
-                { "id": "ferry", "object": "model", "owned_by": "kobol-labs" },
-                { "id": "hybrid-pentest", "object": "model", "owned_by": "kobol-labs" },
-                { "id": &state.config.local.model, "object": "model", "owned_by": "local" },
-                { "id": &state.config.cloud.model, "object": "model", "owned_by": "cloud" },
-            ]
+            "data": models,
+        })),
+    )
+}
+
+async fn model_detail_handler(
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1700000000);
+
+    (
+        [
+            ("access-control-allow-origin", "*"),
+            ("content-type", "application/json"),
+        ],
+        Json(json!({
+            "id": id,
+            "object": "model",
+            "created": now,
+            "owned_by": "kobol-labs",
+            "permission": [],
+            "root": id,
+            "parent": null
+        })),
+    )
+}
+
+async fn embeddings_handler(
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("ferry-embeddings");
+    let input_len = match body.get("input") {
+        Some(Value::Array(arr)) => arr.len(),
+        Some(Value::String(_)) => 1,
+        _ => 1,
+    };
+
+    let dummy_dim = 1536;
+    let mut data = Vec::with_capacity(input_len);
+    for idx in 0..input_len {
+        data.push(json!({
+            "object": "embedding",
+            "embedding": vec![0.0f32; dummy_dim],
+            "index": idx
+        }));
+    }
+
+    (
+        [
+            ("access-control-allow-origin", "*"),
+            ("content-type", "application/json"),
+        ],
+        Json(json!({
+            "object": "list",
+            "data": data,
+            "model": model,
+            "usage": {
+                "prompt_tokens": input_len * 4,
+                "total_tokens": input_len * 4
+            }
         })),
     )
 }
@@ -205,7 +296,35 @@ async fn chat_completions_handler(
 ) -> Response {
     let req_id = state.request_id_counter.fetch_add(1, Ordering::Relaxed);
 
-    // 1. Client header control: X-Ferry-Condense (defaults to config setting)
+    // 1. Fast-path deterministic response cache check (for non-streaming temperature <= 0.05)
+    let cache_allowed = match headers.get("x-ferry-cache").and_then(|h| h.to_str().ok()) {
+        Some("false") | Some("0") | Some("no") => false,
+        _ => state.config.cache.enabled,
+    };
+
+    let cache_key = if cache_allowed {
+        ResponseCache::compute_cache_key(&body)
+    } else {
+        None
+    };
+
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = state.cache.get(key).await {
+            let mut res_headers = HeaderMap::new();
+            res_headers.insert("access-control-allow-origin", "*".parse().unwrap());
+            res_headers.insert("content-type", "application/json".parse().unwrap());
+            res_headers.insert("x-ferry-provider", "cache".parse().unwrap());
+            res_headers.insert("x-ferry-cache", "HIT".parse().unwrap());
+            res_headers.insert("x-ferry-duration-ms", "0".parse().unwrap());
+            return (
+                StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK),
+                res_headers,
+                cached.body_bytes,
+            ).into_response();
+        }
+    }
+
+    // 2. Client header control: X-Ferry-Condense (defaults to config setting)
     let condense_enabled = match headers.get("x-ferry-condense").and_then(|h| h.to_str().ok()) {
         Some("false") | Some("0") | Some("no") => false,
         _ => state.config.condensation.enabled,
@@ -268,9 +387,15 @@ async fn chat_completions_handler(
         0.0
     };
 
-    // 2. Client header control: X-Ferry-Route override (e.g. "local-only", "cloud-only")
+    // 3. Client header controls: X-Ferry-Route override and explicit queue wait
     let route_override = headers.get("x-ferry-route").and_then(|h| h.to_str().ok());
-    let decision = state.router.decide(&body, route_override).await;
+    let explicit_wait = headers
+        .get("x-ferry-queue-timeout-ms")
+        .or_else(|| headers.get("x-ferry-wait-ms"))
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let decision = state.router.decide_with_timeout(&body, route_override, explicit_wait).await;
 
     // If caller requested local-only and local provider is unavailable, fail fast with 503
     if decision.target == ferry::router::TargetProvider::Cloud && decision.local_only {
@@ -290,5 +415,5 @@ async fn chat_completions_handler(
         ).into_response();
     }
 
-    state.upstream.forward_chat(body, decision, req_id, total_chars_saved, savings_pct).await
+    state.upstream.forward_chat(body, decision, req_id, total_chars_saved, savings_pct, cache_key).await
 }

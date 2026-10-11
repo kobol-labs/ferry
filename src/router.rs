@@ -65,9 +65,20 @@ impl Router {
     }
 
     pub async fn decide(&self, body: &Value, route_override: Option<&str>) -> RouteDecision {
+        self.decide_with_timeout(body, route_override, None).await
+    }
+
+    pub async fn decide_with_timeout(
+        &self,
+        body: &Value,
+        route_override: Option<&str>,
+        explicit_timeout_ms: Option<u64>,
+    ) -> RouteDecision {
         let est_tokens = Self::estimate_tokens(body);
         let local_only = matches!(route_override, Some("local-only") | Some("local"));
+        let local_prefer = matches!(route_override, Some("local-prefer") | Some("prefer-local"));
         let cloud_only = matches!(route_override, Some("cloud-only") | Some("cloud"));
+        let fast_mode = matches!(route_override, Some("fast") | Some("low-latency"));
 
         // 1. Force Cloud if client header requested cloud-only
         if cloud_only {
@@ -142,10 +153,17 @@ impl Router {
             };
         }
 
-        // Short-context priority: if prompt <= 35,000 tokens, grant an extended contention wait
-        // because short turns take <1s to run and keeping them local maximizes throughput and reduces cloud cost.
-        let effective_wait_ms = if est_tokens <= 35000 {
-            queue_timeout_ms.max(12000)
+        // Adaptive Queueing: Determine wait limit based on client hints and token size
+        let effective_wait_ms = if let Some(ms) = explicit_timeout_ms {
+            ms
+        } else if fast_mode {
+            500
+        } else if local_only {
+            30000
+        } else if local_prefer {
+            25000
+        } else if est_tokens <= max_context {
+            queue_timeout_ms.max(15000)
         } else {
             queue_timeout_ms
         };

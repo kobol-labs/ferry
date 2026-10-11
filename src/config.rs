@@ -11,6 +11,8 @@ pub struct Config {
     pub cloud: CloudConfig,
     #[serde(default)]
     pub condensation: CondenserConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +75,7 @@ fn default_timeout_secs() -> u64 { 90 }
 fn default_connect_timeout_secs() -> u64 { 3 }
 fn default_circuit_breaker_threshold() -> u32 { 3 }
 fn default_probe_interval_secs() -> u64 { 5 }
-fn default_queue_timeout_ms() -> u64 { 8000 }
+fn default_queue_timeout_ms() -> u64 { 15000 }
 
 impl Default for LocalConfig {
     fn default() -> Self {
@@ -123,12 +125,36 @@ impl Default for CloudConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CondenserConfig {
-    #[serde(default = "default_true")]
+pub struct CacheConfig {
+    #[serde(default = "default_cache_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+fn default_cache_enabled() -> bool { true }
+fn default_cache_max_entries() -> usize { 500 }
+fn default_cache_ttl_secs() -> u64 { 600 }
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            max_entries: default_cache_max_entries(),
+            ttl_secs: default_cache_ttl_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CondenserConfig {
+    #[serde(default = "default_condensation_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_drop_historical_reasoning")]
     pub drop_historical_reasoning: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_truncate_tool_outputs")]
     pub truncate_tool_outputs: bool,
     #[serde(default = "default_keep_recent_turns")]
     pub keep_recent_turns: usize,
@@ -140,75 +166,91 @@ pub struct CondenserConfig {
     pub head_lines: usize,
     #[serde(default = "default_tail_lines")]
     pub tail_lines: usize,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_strip_terminal_noise")]
     pub strip_terminal_noise: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_deduplicate_lines")]
     pub deduplicate_lines: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_minify_json")]
     pub minify_json_outputs: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_fold_repeated_tool_failures")]
     pub fold_repeated_tool_failures: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_condensation_enabled() -> bool { true }
+fn default_drop_historical_reasoning() -> bool { true }
+fn default_truncate_tool_outputs() -> bool { true }
 fn default_keep_recent_turns() -> usize { 1 }
 fn default_max_tool_chars() -> usize { 2000 }
 fn default_recent_max_tool_chars() -> usize { 60000 }
 fn default_head_lines() -> usize { 15 }
 fn default_tail_lines() -> usize { 10 }
+fn default_strip_terminal_noise() -> bool { true }
+fn default_deduplicate_lines() -> bool { true }
+fn default_minify_json() -> bool { true }
+fn default_fold_repeated_tool_failures() -> bool { true }
 
 impl Default for CondenserConfig {
     fn default() -> Self {
         Self {
-            enabled: default_true(),
-            drop_historical_reasoning: default_true(),
-            truncate_tool_outputs: default_true(),
+            enabled: default_condensation_enabled(),
+            drop_historical_reasoning: default_drop_historical_reasoning(),
+            truncate_tool_outputs: default_truncate_tool_outputs(),
             keep_recent_turns: default_keep_recent_turns(),
             max_tool_chars: default_max_tool_chars(),
             recent_max_tool_chars: default_recent_max_tool_chars(),
             head_lines: default_head_lines(),
             tail_lines: default_tail_lines(),
-            strip_terminal_noise: default_true(),
-            deduplicate_lines: default_true(),
-            minify_json_outputs: default_true(),
-            fold_repeated_tool_failures: default_true(),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            local: LocalConfig::default(),
-            cloud: CloudConfig::default(),
-            condensation: CondenserConfig::default(),
+            strip_terminal_noise: default_strip_terminal_noise(),
+            deduplicate_lines: default_deduplicate_lines(),
+            minify_json_outputs: default_minify_json(),
+            fold_repeated_tool_failures: default_fold_repeated_tool_failures(),
         }
     }
 }
 
 impl Config {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let mut config: Config = if content.trim().is_empty() {
-            Config::default()
+    pub fn load_from_file_or_default<P: AsRef<Path>>(path: P) -> Self {
+        let mut cfg = if path.as_ref().exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match toml::from_str(&content) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[warn] failed to parse {}: {}, using defaults", path.as_ref().display(), e);
+                        Self::default()
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[warn] failed to read {}: {}, using defaults", path.as_ref().display(), e);
+                    Self::default()
+                }
+            }
         } else {
-            toml::from_str(&content)?
+            Self::default()
         };
 
-        config.apply_env_overrides();
-        Ok(config)
+        cfg.apply_env_overrides();
+        cfg
     }
 
-    pub fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("FERRY_BIND") { if !v.trim().is_empty() { self.server.bind = v; } }
+    pub fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            local: LocalConfig::default(),
+            cloud: CloudConfig::default(),
+            condensation: CondenserConfig::default(),
+            cache: CacheConfig::default(),
+        }
+    }
+
+    fn apply_env_overrides(&mut self) {
+        if let Ok(v) = std::env::var("FERRY_BIND") { self.server.bind = v; }
         if let Ok(v) = std::env::var("FERRY_LOCAL_API_BASE") { if !v.trim().is_empty() { self.local.api_base = v; } }
         if let Ok(v) = std::env::var("FERRY_LOCAL_API_KEY") { if !v.trim().is_empty() { self.local.api_key = v; } }
         if let Ok(v) = std::env::var("FERRY_LOCAL_MODEL") { if !v.trim().is_empty() { self.local.model = v; } }
         if let Ok(v) = std::env::var("FERRY_LOCAL_MAX_SLOTS") {
             if let Ok(n) = v.parse() { self.local.max_slots = n; }
         }
-        if let Ok(v) = std::env::var("FERRY_LOCAL_MAX_CONTEXT") {
+        if let Ok(v) = std::env::var("FERRY_LOCAL_MAX_CONTEXT_TOKENS") {
             if let Ok(n) = v.parse() { self.local.max_context_tokens = n; }
         }
         if let Ok(v) = std::env::var("FERRY_LOCAL_TIMEOUT_SECS") {
@@ -276,6 +318,15 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_FOLD_REPEATED_TOOL_FAILURES") {
             if let Some(b) = parse_bool(&v) { self.condensation.fold_repeated_tool_failures = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_CACHE_ENABLED") {
+            if let Some(b) = parse_bool(&v) { self.cache.enabled = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_CACHE_MAX_ENTRIES") {
+            if let Ok(n) = v.parse() { self.cache.max_entries = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_CACHE_TTL_SECS") {
+            if let Ok(n) = v.parse() { self.cache.ttl_secs = n; }
         }
     }
 }

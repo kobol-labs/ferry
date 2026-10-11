@@ -1,7 +1,7 @@
 use ferry::condenser::ContextCondenser;
 use ferry::config::CondenserConfig;
 use ferry::stats::MetricsTracker;
-use ferry::router::Router;
+use ferry::router::{Router, TargetProvider};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -551,7 +551,7 @@ fn test_windows_path_anchors_preserved() {
 #[tokio::test]
 async fn test_explicit_cloud_model_selection_router() {
     use ferry::config::Config;
-    use ferry::router::Router;
+    use ferry::router::{Router, TargetProvider};
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -574,7 +574,7 @@ async fn test_explicit_cloud_model_selection_router() {
 #[tokio::test]
 async fn test_circuit_breaker_trip_and_recovery() {
     use ferry::config::Config;
-    use ferry::router::Router;
+    use ferry::router::{Router, TargetProvider};
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -625,7 +625,7 @@ async fn test_circuit_breaker_trip_and_recovery() {
 #[tokio::test]
 async fn test_route_override_client_headers() {
     use ferry::config::Config;
-    use ferry::router::Router;
+    use ferry::router::{Router, TargetProvider};
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -659,7 +659,7 @@ async fn test_route_override_client_headers() {
 #[tokio::test]
 async fn test_queue_contention_slot_release() {
     use ferry::config::Config;
-    use ferry::router::Router;
+    use ferry::router::{Router, TargetProvider};
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -700,7 +700,7 @@ async fn test_queue_contention_slot_release() {
 #[tokio::test]
 async fn test_atomic_slot_concurrency_no_oversubscription() {
     use ferry::config::Config;
-    use ferry::router::Router;
+    use ferry::router::{Router, TargetProvider};
     use ferry::stats::MetricsTracker;
     use std::sync::Arc;
 
@@ -1013,4 +1013,79 @@ async fn test_short_context_priority_queueing_wait_limit() {
     let decision = router.decide(&body, None).await;
     assert_eq!(decision.target, ferry::router::TargetProvider::Local);
     assert!(decision.reason.contains("contention queue"));
+}
+
+#[tokio::test]
+async fn test_response_cache_deterministic_hit_and_miss() {
+    use ferry::cache::ResponseCache;
+    use serde_json::json;
+
+    let cache = ResponseCache::new(true, 10, 60);
+
+    let body_deterministic = json!({
+        "model": "ferry",
+        "messages": [
+            { "role": "system", "content": "You are a test" },
+            { "role": "user", "content": "test question" }
+        ],
+        "temperature": 0.0,
+        "stream": false
+    });
+
+    let body_streaming = json!({
+        "model": "ferry",
+        "messages": [
+            { "role": "user", "content": "test question" }
+        ],
+        "stream": true
+    });
+
+    // 1. Streaming should never be cached
+    assert!(ResponseCache::compute_cache_key(&body_streaming).is_none());
+
+    // 2. Deterministic non-streaming should generate a key
+    let key = ResponseCache::compute_cache_key(&body_deterministic);
+    assert!(key.is_some());
+    let key = key.unwrap();
+
+    // 3. Cache miss initially
+    assert!(cache.get(&key).await.is_none());
+
+    // 4. Populate cache
+    cache.set(key.clone(), bytes::Bytes::from("{\"result\": \"4\"}"), 200, vec![]).await;
+
+    // 5. Cache hit
+    let hit = cache.get(&key).await;
+    assert!(hit.is_some());
+    assert_eq!(hit.unwrap().body_bytes, bytes::Bytes::from("{\"result\": \"4\"}"));
+    assert_eq!(cache.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_adaptive_queueing_wait_timeout_override() {
+    use ferry::config::Config;
+    use ferry::router::Router;
+    use ferry::stats::MetricsTracker;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let mut config = Config::default();
+    config.local.max_slots = 1;
+    config.local.queue_timeout_ms = 100;
+    let config = Arc::new(config);
+    let metrics = Arc::new(MetricsTracker::new());
+    let router = Router::new(config, metrics.clone());
+
+    let body = json!({
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+
+    // Acquire the only slot
+    let d1 = router.decide(&body, None).await;
+    assert_eq!(d1.target, ferry::router::TargetProvider::Local);
+
+    // Client requests fast mode -> should spill almost immediately (500ms max)
+    let d_fast = router.decide_with_timeout(&body, Some("fast"), None).await;
+    assert_eq!(d_fast.target, ferry::router::TargetProvider::Cloud);
+    assert!(d_fast.is_spillover);
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ferry"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 authors = ["Kobol Labs <team@kobol.ai>"]
 description = "Ultra-fast hybrid LLM router and metrics proxy for on-prem GPU hardware with cloud overflow"

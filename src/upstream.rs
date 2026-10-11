@@ -1,3 +1,4 @@
+use crate::cache::ResponseCache;
 use crate::config::Config;
 use crate::router::{RouteDecision, TargetProvider};
 use crate::stats::MetricsTracker;
@@ -115,10 +116,11 @@ pub struct UpstreamClient {
     client: Client,
     config: Arc<Config>,
     metrics: Arc<MetricsTracker>,
+    cache: Arc<ResponseCache>,
 }
 
 impl UpstreamClient {
-    pub fn new(config: Arc<Config>, metrics: Arc<MetricsTracker>) -> Self {
+    pub fn new(config: Arc<Config>, metrics: Arc<MetricsTracker>, cache: Arc<ResponseCache>) -> Self {
         let client = Client::builder()
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .pool_max_idle_per_host(10)
@@ -131,6 +133,7 @@ impl UpstreamClient {
             client,
             config,
             metrics,
+            cache,
         }
     }
 
@@ -141,6 +144,7 @@ impl UpstreamClient {
         req_id: u64,
         chars_saved: usize,
         savings_pct: f64,
+        cache_key: Option<String>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -190,7 +194,7 @@ impl UpstreamClient {
                             duration_ms: duration.as_millis(),
                             is_failover: false,
                         };
-                        self.handle_upstream_response(resp, is_stream, slot_guard, meta)
+                        self.handle_upstream_response(resp, is_stream, slot_guard, meta, cache_key).await
                     }
                     Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
                         self.metrics.record_local_success();
@@ -212,7 +216,7 @@ impl UpstreamClient {
                             duration_ms: duration.as_millis(),
                             is_failover: false,
                         };
-                        self.handle_upstream_response(resp, is_stream, slot_guard, meta)
+                        self.handle_upstream_response(resp, is_stream, slot_guard, meta, None).await
                     }
                     Ok(resp) => {
                         let status = resp.status();
@@ -234,7 +238,7 @@ impl UpstreamClient {
                         drop(slot_guard); // Release local slot immediately before failing over to Cloud
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
-                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct).await
+                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key).await
                     }
                     Err(err) => {
                         warn!(
@@ -253,13 +257,13 @@ impl UpstreamClient {
                         drop(slot_guard); // Release local slot immediately before failing over to Cloud
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
-                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct).await
+                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key).await
                     }
                 }
             }
             TargetProvider::Cloud => {
                 self.metrics.inc_cloud(decision.est_tokens, decision.is_spillover);
-                self.dispatch_cloud(body, decision, req_id, false, chars_saved, savings_pct).await
+                self.dispatch_cloud(body, decision, req_id, false, chars_saved, savings_pct, cache_key).await
             }
         }
     }
@@ -272,6 +276,7 @@ impl UpstreamClient {
         is_failover: bool,
         chars_saved: usize,
         savings_pct: f64,
+        cache_key: Option<String>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -318,7 +323,7 @@ impl UpstreamClient {
                     duration_ms: duration.as_millis(),
                     is_failover,
                 };
-                self.handle_upstream_response(resp, is_stream, None, meta)
+                self.handle_upstream_response(resp, is_stream, None, meta, cache_key).await
             }
             Err(err) => {
                 error!(req_id = req_id, error = %err, "Cloud request failed");
@@ -335,12 +340,13 @@ impl UpstreamClient {
         }
     }
 
-    fn handle_upstream_response(
+    async fn handle_upstream_response(
         &self,
         resp: reqwest::Response,
         _is_stream: bool,
         guard: Option<crate::router::LocalSlotGuard>,
         meta: ResponseMeta,
+        cache_key: Option<String>,
     ) -> Response {
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
         let mut headers = HeaderMap::new();
@@ -360,7 +366,7 @@ impl UpstreamClient {
         // Always ensure universal CORS headers so browser-based clients (OpenWebUI, dashboards) are never blocked
         headers.insert(HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*"));
         headers.insert(HeaderName::from_static("access-control-allow-methods"), HeaderValue::from_static("GET, POST, OPTIONS"));
-        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route"));
+        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms"));
 
         // Observability headers
         headers.insert(HeaderName::from_static("x-ferry-provider"), HeaderValue::from_static(meta.provider));
@@ -385,7 +391,7 @@ impl UpstreamClient {
         );
         headers.insert(
             HeaderName::from_static("access-control-expose-headers"),
-            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover"),
+            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache"),
         );
 
         let is_sse = _is_stream
@@ -395,6 +401,16 @@ impl UpstreamClient {
                 .and_then(|v| v.to_str().ok())
                 .map(|ct| ct.contains("text/event-stream"))
                 .unwrap_or(false);
+
+        // Fast path for non-streaming responses: read bytes directly, release slot immediately, populate cache
+        if !_is_stream && !is_sse {
+            drop(guard); // Free local slot immediately!
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            if let Some(key) = cache_key {
+                self.cache.set(key, body_bytes.clone(), status.as_u16(), vec![]).await;
+            }
+            return (status, headers, body_bytes).into_response();
+        }
 
         let keepalive_duration = std::time::Duration::from_secs(3);
         let guarded = GuardedStream::new(resp.bytes_stream(), guard, is_sse, keepalive_duration);
@@ -419,9 +435,6 @@ pub fn normalize_wire_format(body: &mut Value, target_model: &str) {
                         m_obj.insert("role".to_string(), Value::String("tool".to_string()));
                         if let Some(call_id) = m_obj.get("call_id").cloned() {
                             m_obj.insert("tool_call_id".to_string(), call_id);
-                        }
-                        if let Some(out_val) = m_obj.remove("output") {
-                            m_obj.insert("content".to_string(), out_val);
                         }
                     }
                 }
