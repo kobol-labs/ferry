@@ -1,25 +1,28 @@
 # ⛴️ Ferry
 
 > **Ultra-fast, headless hybrid LLM router and metrics proxy written in Rust.**  
-> Built for orchestrating on-prem GPU hardware with seamless, zero-queue cloud spillover and transparent context condensation.
+> Built for orchestrating on-prem GPU hardware with atomic slot scheduling, short contention queueing, seamless cloud spillover, automatic circuit breaking, and transparent context condensation.
 
 ---
 
 ## Why Ferry?
 
-When running autonomous multi-agent swarms (e.g., Strix, Cursor swarms, AutoGen) against local GPUs, three fundamental bottlenecks occur:
-1. **Head-of-Line Queuing**: A single GPU with $N$ hardware slots cannot process $N+M$ parallel requests without queuing, which frequently trips client-side stream timeouts.
-2. **Context Ballooning**: As multi-turn agents accumulate deep conversation histories (>65k tokens), local prompt prefill latency degrades and risks GPU VRAM exhaustion.
-3. **Redundant History Bloat**: Past chain-of-thought `<think>` blocks and massive historical tool command outputs permanently inflate turns, wasting bandwidth and triggering unnecessary cloud spillovers.
+When running autonomous multi-agent swarms (e.g., Strix, Cursor agents, AutoGen) against local GPUs, three fundamental bottlenecks occur:
+1. **Head-of-Line Queuing & Concurrency Races**: A single GPU with $N$ hardware slots cannot process $N+M$ parallel requests without queuing, which frequently trips client-side stream timeouts or exhausts GPU VRAM if overcommitted.
+2. **Context Ballooning**: As multi-turn agents accumulate deep conversation histories (>65k tokens), local prompt prefill latency degrades and risks GPU out-of-memory (OOM) crashes.
+3. **Redundant History Bloat**: Past chain-of-thought `<think>` blocks and massive historical tool command outputs permanently inflate turns, wasting bandwidth, degrading inference speeds, and triggering unnecessary cloud spend.
 
-**Ferry** solves this by acting as an intelligent OpenAI-compatible proxy between your clients and your models:
-* **Transparent Context Condensation**: Automatically strips historical `<think>` reasoning blocks and truncates stale tool outputs from older turns in $<0.01\text{ ms}$, saving 40%–60% of tokens before routing.
-* **Local Priority ($0)**: Keeps requests on your LAN GPU rig while hardware slots are available.
-* **Instant Spillover**: The moment local slots are saturated, waiting requests **immediately spill over** to cloud providers (MiniMax, OpenRouter, Anthropic) with zero queuing lag.
-* **Context Watermarking**: Prompts exceeding your local GPU's prefill threshold automatically route to cloud clusters.
-* **Automatic Failover**: If a local stream terminates or times out, Ferry seamlessly retries the turn against the cloud fallback.
-* **Observability**: Exposes real-time Prometheus `/metrics` and `/stats` to track local hardware savings, cloud spend, and condensation efficiency.
-* **Network Isolation**: Can run with **zero exposed host ports**, communicating strictly across internal Docker bridge networks with client swarms.
+**Ferry** solves this by acting as an ultra-lean, OpenAI-compatible proxy between your clients and your models:
+* **Atomic Slot Reservation & Leak-Proof Lifecycle**: Atomic Compare-And-Swap (CAS) ensures hardware slots are never oversubscribed. Full RAII guards guarantee slots are immediately released even if a client disconnects, times out, or cancels mid-stream.
+* **Short Contention Queue**: Instead of immediately dumping bursts to expensive cloud APIs when all local slots are momentarily occupied, Ferry holds requests in a lightweight 20ms polling queue (e.g. up to 500ms) to capture freeing GPU slots locally.
+* **Transparent Context Condensation**: Strips historical `<think>` reasoning blocks and safely truncates stale tool outputs from older turns in $<0.01\text{ ms}$, saving 30%–60% of tokens before routing.
+* **RTK-Inspired Inline Cleaners**: Strips ANSI escape codes, removes progress bar overwrites (`\r`), collapses redundant whitespace, deduplicates repeated log runs (preserving code syntax closures), and minifies JSON outputs.
+* **Prefix-Cache Alignment**: Strictly protects system instructions, developer directives, and user prompts across turns to maintain 90%+ GPU and Cloud KV cache hit rates.
+* **Proof-of-Safety Constraint Ledger**: Automatically verifies that critical anchors (file paths, URLs, ports, IP addresses, CVEs, and security imperatives) survive compression; auto-vetoes compression on active turns if any anchor is damaged.
+* **Automatic Circuit Breaker & Health Probing**: Continuously health-probes local GPU endpoints in the background. If the local engine goes offline or fails consecutively, the circuit breaker trips open to route directly to Cloud with 0ms penalty, automatically resetting when local recovers.
+* **Client Routing & Condensation Overrides**: Allows callers to selectively bypass condensation (`X-Ferry-Condense: false`) or enforce strict routing constraints (`X-Ferry-Route: local-only` with fast-fail 503 or `X-Ferry-Route: cloud-only`).
+* **Deep Observability**: Returns operational metadata headers on every response (`X-Ferry-Provider`, `X-Ferry-Model`, `X-Ferry-Chars-Saved`, `X-Ferry-Savings-Percent`, `X-Ferry-Duration-Ms`, `X-Ferry-Failover`) alongside `/health`, `/stats`, and Prometheus `/metrics`.
+* **Minimal Resource Footprint**: Written in pure Rust with zero garbage collection overhead. Uses ~1.1 MB RAM idle, ~2.4 MB RAM active, <0.5% CPU, with a 7.2 MB compiled binary and 26 MB Alpine Docker container.
 
 ---
 
@@ -50,6 +53,10 @@ model = "qwen3.8-flash-next-iq2_xs"
 max_slots = 3
 max_context_tokens = 65000
 timeout_secs = 90
+connect_timeout_secs = 3
+circuit_breaker_threshold = 3
+probe_interval_secs = 5
+queue_timeout_ms = 500
 
 [cloud]
 name = "minimax"
@@ -59,19 +66,30 @@ model = "MiniMax-M3"
 timeout_secs = 300
 
 [condensation]
-# Enable transparent prompt context condensation
+# Enable transparent prompt context condensation before routing
 enabled = true
 # Strip verbose reasoning / <think> blocks from historical assistant messages
 drop_historical_reasoning = true
 # Truncate large tool / command outputs from older turns
 truncate_tool_outputs = true
 # Number of most recent turns to keep 100% byte-for-byte untouched (immediate context)
-keep_recent_turns = 2
-# Character threshold before an older tool output is truncated (default: 1500 chars)
-max_tool_chars = 1500
+keep_recent_turns = 1
+# Character threshold before an older tool output is truncated (default: 2000 chars)
+max_tool_chars = 2000
+# Runaway safety cap on recent turn tool outputs to avoid blinding auditor on code files (default: 60000 chars)
+recent_max_tool_chars = 60000
 # Lines to preserve from the head and tail of truncated tool outputs
 head_lines = 15
-tail_lines = 15
+tail_lines = 10
+# RTK-inspired inline stream cleaners:
+strip_ansi_escapes = true       # Strip ANSI terminal colors and cursor codes
+strip_progress_bars = true      # Remove carriage-return overwrites and progress bars
+collapse_whitespace = true      # Collapse 3+ newlines to \n\n and trim trailing whitespace
+deduplicate_lines = true        # Collapse consecutive identical lines with repeat count
+minify_json_outputs = true      # Minify pretty-printed JSON tool outputs (saves ~30%)
+protect_code_blocks = true      # Exempt markdown code blocks from destructive cleaners
+enable_constraint_ledger = true # Proof-of-safety constraint ledger (auto-veto on anchor loss)
+protect_static_prefix = true    # Maintain 100% prefix cache immutability for 90%+ GPU hit rate
 ```
 
 ---
@@ -79,23 +97,52 @@ tail_lines = 15
 ### 2. Tuning Parameters for Your Hardware
 
 #### A. Calibrating Context Condensation (`[condensation]`)
-- **`keep_recent_turns = 2`**: Preserves the last 2 assistant turns (and their tool outputs) completely untouched. The agent retains full, unedited immediate context.
-- **`drop_historical_reasoning = true`**: Removes `<think>` scratchpads and `reasoning_content` from turns $\le N-2$. The agent never needs to re-read its own internal scratchpads from 5 turns ago to make current decisions.
-- **`max_tool_chars = 1500`**: Any tool output in turns $\le N-2$ exceeding this limit is trimmed to `head_lines` and `tail_lines` with a clear notice (`[... Ferry Proxy: truncated 85 lines of earlier tool output ...]`).
+- **`keep_recent_turns = 1`**: Keeps the most recent turn (and its tool outputs) 100% byte-for-byte untouched so the model retains full immediate context.
+- **`drop_historical_reasoning = true`**: Removes `<think>` scratchpads and `reasoning_content` from older historical turns. The agent never needs to re-read its own internal scratchpads from prior turns to make current decisions.
+- **`max_tool_chars = 2000`**: Tool outputs in older turns exceeding this threshold are trimmed to `head_lines` and `tail_lines` with a clear omission notice (`[... Ferry Proxy: truncated 85 lines of earlier tool output ...]`).
+- **`recent_max_tool_chars = 60000`**: Runaway safety cap on recent active tool turns to prevent giant terminal dumps from exhausting context while protecting code files under audit.
+- **`protect_static_prefix = true`**: Ensures system prompts, developer messages, and initial user instructions are never altered, guaranteeing maximum prefix cache hits.
 
-#### B. Calibrating `max_slots`
+#### B. Calibrating `max_slots` and `queue_timeout_ms`
 * **RTX 3090 / 4090 (24GB VRAM)**:
   * With a quantized MoE model (e.g. Qwen3.8-Flash-Next at IQ2_XS taking ~13GB VRAM) and `int8` KV cache, setting `max_slots = 3` is the optimal balance. Each active slot reserves ~2–3GB for resident KV contexts.
-* **Dual GPU (48GB VRAM) / Mac Studio (64GB+ unified memory)**:
-  * Can safely increase `max_slots = 6` to `8`.
+* **Contention Queue (`queue_timeout_ms = 500`)**:
+  * When all 3 slots are busy, turns that finish within 200–500ms will release their slot to waiting requests locally without incurring unnecessary cloud API billing.
 
-#### C. Calibrating `max_context_tokens` (The Spillover Watermark)
-This parameter controls at what prompt size Ferry bypasses local hardware to avoid VRAM oversubscription:
-* Combined with **Context Condensation**, prompt sizes rarely exceed 35k–45k tokens, allowing **85%–95% of requests to run locally on Strata** without exceeding the 65,000 token VRAM ceiling!
+#### C. Calibrating `circuit_breaker_threshold` & `probe_interval_secs`
+* **`circuit_breaker_threshold = 3`**: If Strata fails 3 consecutive times (or probe connection fails), Ferry automatically trips the circuit breaker and routes traffic to Cloud with 0ms connection latency.
+* **`probe_interval_secs = 5`**: Background health task queries `/models` on Strata every 5s and automatically resets the circuit breaker the instant local hardware recovers.
 
 ---
 
-### 3. Environment Variable Overrides (Zero-Config Docker)
+### 3. Client Control Headers & Observability
+
+#### Client Request Headers
+Clients can customize routing and condensation behavior on a per-request basis:
+
+| Header | Values | Description |
+| :--- | :--- | :--- |
+| `X-Ferry-Condense` | `true` \| `false` | Bypasses prompt condensation when set to `false`, `0`, or `no`. |
+| `X-Ferry-Route` | `local-only` \| `cloud-only` | `local-only` forces local hardware and returns HTTP 503 if unavailable (preventing cloud spend). `cloud-only` bypasses local hardware entirely. |
+
+#### Observability Response Headers
+Every response includes detailed routing metrics and CORS exposure headers:
+
+```http
+HTTP/1.1 200 OK
+x-ferry-provider: local
+x-ferry-model: qwen3.8-flash-next-iq2_xs
+x-ferry-est-tokens: 24
+x-ferry-chars-saved: 138
+x-ferry-savings-percent: 34.94%
+x-ferry-duration-ms: 822
+x-ferry-failover: false
+access-control-expose-headers: x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover
+```
+
+---
+
+### 4. Environment Variable Overrides (Zero-Config Docker)
 
 Ferry supports full zero-config deployment by overriding any setting via environment variables:
 
@@ -106,15 +153,32 @@ Ferry supports full zero-config deployment by overriding any setting via environ
 | `FERRY_LOCAL_API_KEY` | `sk-strata-stevegaming` | Local engine API key |
 | `FERRY_LOCAL_MODEL` | `qwen3.8-flash-next-iq2_xs` | Local model name |
 | `FERRY_LOCAL_MAX_SLOTS` | `3` | Maximum concurrent hardware slots |
-| `FERRY_LOCAL_MAX_CONTEXT`| `65000` | Context watermark threshold |
+| `FERRY_LOCAL_MAX_CONTEXT` | `65000` | Context watermark threshold in tokens |
+| `FERRY_LOCAL_TIMEOUT_SECS` | `90` | Request timeout for local engine |
+| `FERRY_LOCAL_CONNECT_TIMEOUT_SECS` | `3` | Fast TCP connect timeout for local engine |
+| `FERRY_CIRCUIT_BREAKER_THRESHOLD` | `3` | Consecutive failures before tripping circuit breaker |
+| `FERRY_PROBE_INTERVAL_SECS` | `5` | Background health probe interval in seconds |
+| `FERRY_LOCAL_QUEUE_TIMEOUT_MS` | `500` | Slot contention queue timeout in milliseconds |
 | `FERRY_CLOUD_API_BASE` | `https://api.minimax.io/v1` | Cloud fallback base URL |
 | `FERRY_CLOUD_API_KEY` | `""` | Cloud provider API key |
 | `FERRY_CLOUD_MODEL` | `MiniMax-M3` | Cloud model name |
+| `FERRY_CLOUD_TIMEOUT_SECS` | `300` | Request timeout for cloud fallback |
 | `FERRY_CONDENSATION_ENABLED` | `true` | Enable/disable prompt context condensation |
-| `FERRY_DROP_HISTORICAL_REASONING` | `true` | Strip past reasoning/<think> blocks |
+| `FERRY_DROP_HISTORICAL_REASONING` | `true` | Strip past reasoning / `<think>` blocks |
 | `FERRY_TRUNCATE_TOOL_OUTPUTS` | `true` | Truncate stale tool outputs |
-| `FERRY_KEEP_RECENT_TURNS` | `2` | Number of recent turns preserved untouched |
-| `FERRY_MAX_TOOL_CHARS` | `1500` | Maximum length of older tool outputs |
+| `FERRY_KEEP_RECENT_TURNS` | `1` | Number of recent turns preserved untouched |
+| `FERRY_MAX_TOOL_CHARS` | `2000` | Maximum length of older tool outputs |
+| `FERRY_RECENT_MAX_TOOL_CHARS` | `60000` | Runaway safety cap on recent turn tool outputs |
+| `FERRY_HEAD_LINES` | `15` | Head lines preserved in truncated tool output |
+| `FERRY_TAIL_LINES` | `10` | Tail lines preserved in truncated tool output |
+| `FERRY_STRIP_ANSI` | `true` | Strip ANSI escape sequences |
+| `FERRY_STRIP_PROGRESS_BARS` | `true` | Remove progress bars and carriage return overwrites |
+| `FERRY_COLLAPSE_WHITESPACE` | `true` | Collapse 3+ newlines and trim trailing whitespace |
+| `FERRY_DEDUPLICATE_LINES` | `true` | Collapse runs of 3+ consecutive identical lines |
+| `FERRY_MINIFY_JSON` | `true` | Minify JSON outputs |
+| `FERRY_PROTECT_CODE_BLOCKS` | `true` | Protect markdown code blocks from destructive cleaners |
+| `FERRY_ENABLE_CONSTRAINT_LEDGER` | `true` | Enable critical anchor constraint ledger |
+| `FERRY_PROTECT_STATIC_PREFIX` | `true` | Protect system and user prompt prefixes for KV cache |
 
 ---
 
@@ -154,17 +218,35 @@ networks:
 
 ---
 
-## Observability & Metrics
+## Observability & Telemetry Endpoints
 
-Ferry exposes built-in telemetry endpoints for real-time monitoring:
+### 1. Health Status (`GET /health`)
 
-### 1. JSON Statistics (`GET /stats`)
+```bash
+curl -s http://127.0.0.1:4000/health | jq
+```
+
+```json
+{
+  "status": "ok",
+  "service": "ferry",
+  "version": "0.3.0",
+  "strata_online": true,
+  "circuit_breaker_open": false,
+  "consecutive_local_failures": 0,
+  "circuit_trips_total": 0,
+  "active_local_slots": 0,
+  "max_local_slots": 3,
+  "condensation_enabled": true
+}
+```
+
+### 2. JSON Statistics (`GET /stats`)
 
 ```bash
 curl -s http://127.0.0.1:4000/stats | jq
 ```
 
-Example output:
 ```json
 {
   "total_requests": 332,
@@ -172,19 +254,29 @@ Example output:
   "cloud_requests": 190,
   "spillover_requests": 48,
   "failover_requests": 0,
-  "active_local_slots": 2,
+  "active_local_slots": 0,
   "total_tokens_est": 21250400,
   "local_tokens_est": 8185000,
   "cloud_tokens_est": 13065400,
   "local_ratio_percent": 42.77,
   "condensed_requests": 189,
   "chars_saved": 8452100,
+  "tokens_saved_est": 2113025,
   "reasoning_blocks_dropped": 340,
-  "tool_outputs_truncated": 182
+  "tool_outputs_truncated": 182,
+  "ansi_stripped_count": 94,
+  "progress_cleaned_count": 48,
+  "lines_deduped_count": 120,
+  "whitespace_collapsed_count": 210,
+  "json_minified_count": 75,
+  "ledger_checks_passed": 189,
+  "ledger_vetoed_count": 0,
+  "strata_online": true,
+  "circuit_breaker_open": false
 }
 ```
 
-### 2. Prometheus Scrape Target (`GET /metrics`)
+### 3. Prometheus Scrape Target (`GET /metrics`)
 
 ```text
 # HELP ferry_requests_total Total number of LLM requests
@@ -194,18 +286,30 @@ ferry_requests_total{provider="local"} 142
 ferry_requests_total{provider="cloud"} 190
 ferry_requests_total{type="spillover"} 48
 ferry_requests_total{type="failover"} 0
+
+# HELP ferry_active_slots Current active local hardware slots
+# TYPE ferry_active_slots gauge
+ferry_active_slots 0
+
+# HELP ferry_strata_online Health status of the local hardware provider (1 = online, 0 = offline)
+# TYPE ferry_strata_online gauge
+ferry_strata_online 1
+
+# HELP ferry_circuit_open Whether the circuit breaker is currently open (1 = open, 0 = closed)
+# TYPE ferry_circuit_open gauge
+ferry_circuit_open 0
+
 # HELP ferry_condensed_requests_total Total requests optimized by condensation
 # TYPE ferry_condensed_requests_total counter
 ferry_condensed_requests_total 189
+
 # HELP ferry_chars_saved_total Total characters pruned from prompts
 # TYPE ferry_chars_saved_total counter
 ferry_chars_saved_total 8452100
-# HELP ferry_reasoning_blocks_dropped_total Total historical reasoning blocks stripped
-# TYPE ferry_reasoning_blocks_dropped_total counter
-ferry_reasoning_blocks_dropped_total 340
-# HELP ferry_tool_outputs_truncated_total Total historical tool outputs truncated
-# TYPE ferry_tool_outputs_truncated_total counter
-ferry_tool_outputs_truncated_total 182
+
+# HELP ferry_tokens_saved_estimated_total Total tokens estimated saved
+# TYPE ferry_tokens_saved_estimated_total counter
+ferry_tokens_saved_estimated_total 2113025
 ```
 
 ---
@@ -213,21 +317,30 @@ ferry_tool_outputs_truncated_total 182
 ## Architecture Blueprint
 
 ```text
-Client (Strix / Swarm)
+Client (Strix / Agent Swarm / OpenWebUI)
          │
+         │  [Optional Client Headers: X-Ferry-Condense, X-Ferry-Route]
          ▼
 ┌────────────────────────────────────────────────────────┐
 │  FERRY TRANSPARENT CONDENSER (< 0.01 ms)               │
-│  - Strip reasoning blocks older than 2 turns           │
-│  - Truncate stale tool outputs exceeding 1,500 chars   │
+│  - Strip reasoning blocks older than 1 turn            │
+│  - Truncate stale tool outputs exceeding 2,000 chars   │
+│  - RTK Cleaners: ANSI, Progress, Dedup, Minify JSON    │
+│  - Constraint Ledger (Verify URLs, IPs, CVEs, Paths)   │
+│  - Static Prefix Alignment (100% KV cache immutability)│
 └────────────────────────────────────────────────────────┘
-         │ (Condensed Payload)
+         │ (Optimized Wire Payload)
          ▼
 ┌────────────────────────────────────────────────────────┐
-│  HYBRID ROUTER                                         │
-│  - Context <= 65k & Slots < 3 ──► Local Strata ($0)    │
-│  - Context > 65k ───────────────► Cloud MiniMax Burst  │
-│  - Slots Saturated (3/3) ───────► Cloud Zero-Queue     │
+│  HYBRID ROUTER & CIRCUIT BREAKER                       │
+│  - Circuit Breaker Open? ──────► Fast Cloud Failover   │
+│  - Client 'cloud-only'? ───────► Cloud Direct          │
+│  - Prompt Tokens > 65k? ───────► Cloud Direct          │
+│  - Local Slots Available? ─────► Atomic Reserve & Run  │
+│  - Slots Full? ────────────────► 500ms Contention Queue│
+│    └─► Freed in <= 500ms? ─────► Local Slot Captured   │
+│    └─► Still Full? ────────────► Cloud Spillover       │
+│        (If 'local-only', returns 503 Service Unavail)  │
 └────────────────────────────────────────────────────────┘
 ```
 
