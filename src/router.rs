@@ -15,6 +15,7 @@ pub struct RouteDecision {
     pub est_tokens: u64,
     pub is_spillover: bool,
     pub reason: String,
+    pub local_only: bool,
 }
 
 pub struct Router {
@@ -57,49 +58,83 @@ impl Router {
         (char_count as f64 / 3.0).ceil() as u64
     }
 
-    pub fn decide(&self, body: &Value) -> RouteDecision {
+    pub async fn decide(&self, body: &Value, route_override: Option<&str>) -> RouteDecision {
         let est_tokens = Self::estimate_tokens(body);
+        let local_only = matches!(route_override, Some("local-only") | Some("local"));
+        let cloud_only = matches!(route_override, Some("cloud-only") | Some("cloud"));
 
-        // Check if the client explicitly requested the cloud model
-        if let Some(requested_model) = body.get("model").and_then(|m| m.as_str()) {
-            if requested_model == self.config.cloud.model || requested_model == "cloud" {
-                return RouteDecision {
-                    target: TargetProvider::Cloud,
-                    est_tokens,
-                    is_spillover: false,
-                    reason: format!("explicitly requested cloud model ({requested_model})"),
-                };
-            }
+        // 1. Force Cloud if client header requested cloud-only
+        if cloud_only {
+            return RouteDecision {
+                target: TargetProvider::Cloud,
+                est_tokens,
+                is_spillover: false,
+                reason: "client header X-Ferry-Route requested cloud-only".to_string(),
+                local_only: false,
+            };
         }
 
-        // Check if circuit breaker is open (Strata is offline / failing)
+        // 2. Check if circuit breaker is open (Strata is offline / failing)
         if self.metrics.is_circuit_open() {
             let failures = self.metrics.consecutive_local_failures.load(std::sync::atomic::Ordering::Relaxed);
             return RouteDecision {
                 target: TargetProvider::Cloud,
                 est_tokens,
                 is_spillover: false,
-                reason: format!("circuit breaker open (Strata offline, {failures} failures) -> instant cloud fallback"),
+                reason: format!("circuit breaker open (Strata offline, {failures} failures)"),
+                local_only,
             };
+        }
+
+        // 3. Check if the client explicitly requested the cloud model (when not local_only)
+        if !local_only {
+            if let Some(requested_model) = body.get("model").and_then(|m| m.as_str()) {
+                if requested_model == self.config.cloud.model || requested_model == "cloud" {
+                    return RouteDecision {
+                        target: TargetProvider::Cloud,
+                        est_tokens,
+                        is_spillover: false,
+                        reason: format!("explicitly requested cloud model ({requested_model})"),
+                        local_only: false,
+                    };
+                }
+            }
         }
 
         let max_context = self.config.local.max_context_tokens as u64;
         let max_slots = self.config.local.max_slots;
-        let active_slots = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
 
+        // 4. Context window threshold check
         if est_tokens > max_context {
-            RouteDecision {
+            return RouteDecision {
                 target: TargetProvider::Cloud,
                 est_tokens,
                 is_spillover: false,
                 reason: format!("context tokens ({est_tokens}) > local max ({max_context})"),
+                local_only,
+            };
+        }
+
+        // 5. Check slot availability with contention queue support
+        let mut active_slots = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+        let queue_timeout_ms = self.config.local.queue_timeout_ms;
+
+        if active_slots >= max_slots && queue_timeout_ms > 0 {
+            let start = std::time::Instant::now();
+            let wait_limit = std::time::Duration::from_millis(queue_timeout_ms);
+            while active_slots >= max_slots && start.elapsed() < wait_limit {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                active_slots = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
             }
-        } else if active_slots < max_slots {
+        }
+
+        if active_slots < max_slots {
             RouteDecision {
                 target: TargetProvider::Local,
                 est_tokens,
                 is_spillover: false,
                 reason: format!("local slot available ({active_slots}/{max_slots})"),
+                local_only,
             }
         } else {
             RouteDecision {
@@ -107,6 +142,7 @@ impl Router {
                 est_tokens,
                 is_spillover: true,
                 reason: format!("local slots saturated ({active_slots}/{max_slots}) -> cloud spillover"),
+                local_only,
             }
         }
     }

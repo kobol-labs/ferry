@@ -53,6 +53,8 @@ pub struct LocalConfig {
     pub circuit_breaker_threshold: u32,
     #[serde(default = "default_probe_interval_secs")]
     pub probe_interval_secs: u64,
+    #[serde(default = "default_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
 }
 
 fn default_local_name() -> String { "strata".to_string() }
@@ -65,6 +67,7 @@ fn default_timeout_secs() -> u64 { 90 }
 fn default_connect_timeout_secs() -> u64 { 3 }
 fn default_circuit_breaker_threshold() -> u32 { 3 }
 fn default_probe_interval_secs() -> u64 { 5 }
+fn default_queue_timeout_ms() -> u64 { 0 }
 
 impl Default for LocalConfig {
     fn default() -> Self {
@@ -79,6 +82,7 @@ impl Default for LocalConfig {
             connect_timeout_secs: default_connect_timeout_secs(),
             circuit_breaker_threshold: default_circuit_breaker_threshold(),
             probe_interval_secs: default_probe_interval_secs(),
+            queue_timeout_ms: default_queue_timeout_ms(),
         }
     }
 }
@@ -236,6 +240,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_PROBE_INTERVAL_SECS") {
             if let Ok(n) = v.parse() { self.local.probe_interval_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_LOCAL_QUEUE_TIMEOUT_MS") {
+            if let Ok(n) = v.parse() { self.local.queue_timeout_ms = n; }
         }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { if !v.trim().is_empty() { self.cloud.api_base = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { if !v.trim().is_empty() { self.cloud.api_key = v; } }

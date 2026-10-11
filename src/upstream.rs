@@ -37,6 +37,17 @@ impl<S: Stream + Unpin> Stream for GuardedStream<S> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ResponseMeta {
+    pub provider: &'static str,
+    pub model: String,
+    pub est_tokens: u64,
+    pub chars_saved: usize,
+    pub savings_pct: f64,
+    pub duration_ms: u128,
+    pub is_failover: bool,
+}
+
 pub struct UpstreamClient {
     client: Client,
     config: Arc<Config>,
@@ -64,6 +75,8 @@ impl UpstreamClient {
         body: Value,
         decision: RouteDecision,
         req_id: u64,
+        chars_saved: usize,
+        savings_pct: f64,
     ) -> Response {
         let start = Instant::now();
         let is_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -103,7 +116,16 @@ impl UpstreamClient {
                             duration_ms = duration.as_millis(),
                             "Local turn completed successfully"
                         );
-                        self.handle_upstream_response(resp, is_stream, true)
+                        let meta = ResponseMeta {
+                            provider: "local",
+                            model: self.config.local.model.clone(),
+                            est_tokens: decision.est_tokens,
+                            chars_saved,
+                            savings_pct,
+                            duration_ms: duration.as_millis(),
+                            is_failover: false,
+                        };
+                        self.handle_upstream_response(resp, is_stream, true, meta)
                     }
                     Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
                         self.metrics.record_local_success();
@@ -115,7 +137,16 @@ impl UpstreamClient {
                             duration_ms = duration.as_millis(),
                             "Local provider returned client error (forwarding to client, not failing over)"
                         );
-                        self.handle_upstream_response(resp, is_stream, true)
+                        let meta = ResponseMeta {
+                            provider: "local",
+                            model: self.config.local.model.clone(),
+                            est_tokens: decision.est_tokens,
+                            chars_saved,
+                            savings_pct,
+                            duration_ms: duration.as_millis(),
+                            is_failover: false,
+                        };
+                        self.handle_upstream_response(resp, is_stream, true, meta)
                     }
                     Ok(resp) => {
                         let status = resp.status();
@@ -137,7 +168,7 @@ impl UpstreamClient {
                         self.metrics.dec_local();
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
-                        self.dispatch_cloud(body, decision, req_id, true).await
+                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct).await
                     }
                     Err(err) => {
                         warn!(
@@ -156,13 +187,13 @@ impl UpstreamClient {
                         self.metrics.dec_local();
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
-                        self.dispatch_cloud(body, decision, req_id, true).await
+                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct).await
                     }
                 }
             }
             TargetProvider::Cloud => {
                 self.metrics.inc_cloud(decision.est_tokens, decision.is_spillover);
-                self.dispatch_cloud(body, decision, req_id, false).await
+                self.dispatch_cloud(body, decision, req_id, false, chars_saved, savings_pct).await
             }
         }
     }
@@ -173,6 +204,8 @@ impl UpstreamClient {
         decision: RouteDecision,
         req_id: u64,
         is_failover: bool,
+        chars_saved: usize,
+        savings_pct: f64,
     ) -> Response {
         let start = Instant::now();
         let is_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -210,7 +243,16 @@ impl UpstreamClient {
                     duration_ms = duration.as_millis(),
                     "Cloud turn completed"
                 );
-                self.handle_upstream_response(resp, is_stream, false)
+                let meta = ResponseMeta {
+                    provider: "cloud",
+                    model: self.config.cloud.model.clone(),
+                    est_tokens: decision.est_tokens,
+                    chars_saved,
+                    savings_pct,
+                    duration_ms: duration.as_millis(),
+                    is_failover,
+                };
+                self.handle_upstream_response(resp, is_stream, false, meta)
             }
             Err(err) => {
                 error!(req_id = req_id, error = %err, "Cloud request failed");
@@ -232,6 +274,7 @@ impl UpstreamClient {
         resp: reqwest::Response,
         _is_stream: bool,
         is_local: bool,
+        meta: ResponseMeta,
     ) -> Response {
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
         let mut headers = HeaderMap::new();
@@ -251,7 +294,33 @@ impl UpstreamClient {
         // Always ensure universal CORS headers so browser-based clients (OpenWebUI, dashboards) are never blocked
         headers.insert(HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*"));
         headers.insert(HeaderName::from_static("access-control-allow-methods"), HeaderValue::from_static("GET, POST, OPTIONS"));
-        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization"));
+        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route"));
+
+        // Observability headers
+        headers.insert(HeaderName::from_static("x-ferry-provider"), HeaderValue::from_static(meta.provider));
+        if let Ok(val) = HeaderValue::from_str(&meta.model) {
+            headers.insert(HeaderName::from_static("x-ferry-model"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&meta.est_tokens.to_string()) {
+            headers.insert(HeaderName::from_static("x-ferry-est-tokens"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&meta.chars_saved.to_string()) {
+            headers.insert(HeaderName::from_static("x-ferry-chars-saved"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&format!("{:.2}%", meta.savings_pct)) {
+            headers.insert(HeaderName::from_static("x-ferry-savings-percent"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&meta.duration_ms.to_string()) {
+            headers.insert(HeaderName::from_static("x-ferry-duration-ms"), val);
+        }
+        headers.insert(
+            HeaderName::from_static("x-ferry-failover"),
+            HeaderValue::from_static(if meta.is_failover { "true" } else { "false" }),
+        );
+        headers.insert(
+            HeaderName::from_static("access-control-expose-headers"),
+            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover"),
+        );
 
         let metrics = if is_local {
             Some(self.metrics.clone())

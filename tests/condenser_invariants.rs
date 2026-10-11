@@ -557,8 +557,8 @@ fn test_windows_path_anchors_preserved() {
     assert!(anchors.iter().any(|a| a.contains("docker.go")));
 }
 
-#[test]
-fn test_explicit_cloud_model_selection_router() {
+#[tokio::test]
+async fn test_explicit_cloud_model_selection_router() {
     use ferry::config::Config;
     use ferry::router::{Router, TargetProvider};
     use ferry::stats::MetricsTracker;
@@ -575,13 +575,13 @@ fn test_explicit_cloud_model_selection_router() {
         ]
     });
 
-    let decision = router.decide(&body);
+    let decision = router.decide(&body, None).await;
     assert_eq!(decision.target, TargetProvider::Cloud);
     assert!(decision.reason.contains("explicitly requested"));
 }
 
-#[test]
-fn test_circuit_breaker_trip_and_recovery() {
+#[tokio::test]
+async fn test_circuit_breaker_trip_and_recovery() {
     use ferry::config::Config;
     use ferry::router::{Router, TargetProvider};
     use ferry::stats::MetricsTracker;
@@ -598,7 +598,7 @@ fn test_circuit_breaker_trip_and_recovery() {
     });
 
     // 1. Initial healthy state: routes to local
-    let d1 = router.decide(&body);
+    let d1 = router.decide(&body, None).await;
     assert_eq!(d1.target, TargetProvider::Local);
     assert!(!metrics.is_circuit_open());
     assert!(metrics.strata_online.load(std::sync::atomic::Ordering::Relaxed));
@@ -616,7 +616,7 @@ fn test_circuit_breaker_trip_and_recovery() {
     assert_eq!(metrics.circuit_trips_total.load(std::sync::atomic::Ordering::Relaxed), 1);
 
     // 4. Now router MUST immediately route to Cloud with 0ms delay!
-    let d2 = router.decide(&body);
+    let d2 = router.decide(&body, None).await;
     assert_eq!(d2.target, TargetProvider::Cloud);
     assert!(d2.reason.contains("circuit breaker open"));
 
@@ -627,8 +627,77 @@ fn test_circuit_breaker_trip_and_recovery() {
     assert_eq!(metrics.consecutive_local_failures.load(std::sync::atomic::Ordering::Relaxed), 0);
 
     // 6. Router immediately resumes local GPU routing!
-    let d3 = router.decide(&body);
+    let d3 = router.decide(&body, None).await;
     assert_eq!(d3.target, TargetProvider::Local);
+}
+
+#[tokio::test]
+async fn test_route_override_client_headers() {
+    use ferry::config::Config;
+    use ferry::router::{Router, TargetProvider};
+    use ferry::stats::MetricsTracker;
+    use std::sync::Arc;
+
+    let config = Arc::new(Config::default());
+    let metrics = Arc::new(MetricsTracker::new());
+    let router = Router::new(config, metrics.clone());
+
+    let body = json!({
+        "messages": [
+            { "role": "user", "content": "Query" }
+        ]
+    });
+
+    // Cloud-only override
+    let d_cloud = router.decide(&body, Some("cloud-only")).await;
+    assert_eq!(d_cloud.target, TargetProvider::Cloud);
+    assert!(!d_cloud.local_only);
+
+    // Local-only override when healthy
+    let d_local = router.decide(&body, Some("local-only")).await;
+    assert_eq!(d_local.target, TargetProvider::Local);
+    assert!(d_local.local_only);
+
+    // Local-only override when circuit is open
+    metrics.record_local_failure(1);
+    let d_fail = router.decide(&body, Some("local-only")).await;
+    assert!(d_fail.local_only);
+    assert_eq!(d_fail.target, TargetProvider::Cloud);
+}
+
+#[tokio::test]
+async fn test_queue_contention_slot_release() {
+    use ferry::config::Config;
+    use ferry::router::{Router, TargetProvider};
+    use ferry::stats::MetricsTracker;
+    use std::sync::Arc;
+
+    let mut cfg = Config::default();
+    cfg.local.max_slots = 1;
+    cfg.local.queue_timeout_ms = 100; // wait up to 100ms
+    let config = Arc::new(cfg);
+    let metrics = Arc::new(MetricsTracker::new());
+    let router = Router::new(config, metrics.clone());
+
+    let body = json!({
+        "messages": [
+            { "role": "user", "content": "Query" }
+        ]
+    });
+
+    // Saturate the only slot
+    metrics.active_local_slots.store(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Spawn a worker to free the slot in 30ms
+    let m = metrics.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+        m.active_local_slots.store(0, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    // Router should wait in queue, notice slot free, and route to Local!
+    let d = router.decide(&body, None).await;
+    assert_eq!(d.target, TargetProvider::Local);
 }
 
 

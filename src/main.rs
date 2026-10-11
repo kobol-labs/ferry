@@ -1,6 +1,7 @@
 
 use axum::{
     extract::State,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -188,12 +189,23 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
     let req_id = state.request_id_counter.fetch_add(1, Ordering::Relaxed);
 
-    // Context condensation: strip past reasoning & truncate stale tool dumps
-    let cond_stats = state.condenser.condense(&mut body);
+    // 1. Client header control: X-Ferry-Condense (defaults to config setting)
+    let condense_enabled = match headers.get("x-ferry-condense").and_then(|h| h.to_str().ok()) {
+        Some("false") | Some("0") | Some("no") => false,
+        _ => state.config.condensation.enabled,
+    };
+
+    let cond_stats = if condense_enabled {
+        state.condenser.condense(&mut body)
+    } else {
+        ferry::condenser::CondensationStats::default()
+    };
+
     if cond_stats.orig_chars > 0 {
         let orig_tokens = (cond_stats.orig_chars / 4) as u64;
         let cond_tokens = (cond_stats.cond_chars / 4) as u64;
@@ -213,6 +225,33 @@ async fn chat_completions_handler(
         );
     }
 
-    let decision = state.router.decide(&body);
-    state.upstream.forward_chat(body, decision, req_id).await
+    let savings_pct = if cond_stats.orig_chars > 0 && cond_stats.chars_saved > 0 {
+        (cond_stats.chars_saved as f64 / cond_stats.orig_chars as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // 2. Client header control: X-Ferry-Route override (e.g. "local-only", "cloud-only")
+    let route_override = headers.get("x-ferry-route").and_then(|h| h.to_str().ok());
+    let decision = state.router.decide(&body, route_override).await;
+
+    // If caller requested local-only and local provider is unavailable, fail fast with 503
+    if decision.target == ferry::router::TargetProvider::Cloud && decision.local_only {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("access-control-allow-origin", "*"),
+                ("content-type", "application/json"),
+            ],
+            json!({
+                "error": {
+                    "message": format!("Local provider unavailable and local-only routing requested: {}", decision.reason),
+                    "type": "ferry_routing_error",
+                    "code": "local_unavailable"
+                }
+            }).to_string(),
+        ).into_response();
+    }
+
+    state.upstream.forward_chat(body, decision, req_id, cond_stats.chars_saved, savings_pct).await
 }
