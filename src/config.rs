@@ -9,6 +9,8 @@ pub struct Config {
     pub local: LocalConfig,
     #[serde(default)]
     pub cloud: CloudConfig,
+    #[serde(default)]
+    pub condensation: CondenserConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,12 +102,53 @@ impl Default for CloudConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CondenserConfig {
+    #[serde(default = "default_condensation_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_drop_historical_reasoning")]
+    pub drop_historical_reasoning: bool,
+    #[serde(default = "default_truncate_tool_outputs")]
+    pub truncate_tool_outputs: bool,
+    #[serde(default = "default_keep_recent_turns")]
+    pub keep_recent_turns: usize,
+    #[serde(default = "default_max_tool_chars")]
+    pub max_tool_chars: usize,
+    #[serde(default = "default_head_lines")]
+    pub head_lines: usize,
+    #[serde(default = "default_tail_lines")]
+    pub tail_lines: usize,
+}
+
+fn default_condensation_enabled() -> bool { true }
+fn default_drop_historical_reasoning() -> bool { true }
+fn default_truncate_tool_outputs() -> bool { true }
+fn default_keep_recent_turns() -> usize { 2 }
+fn default_max_tool_chars() -> usize { 1500 }
+fn default_head_lines() -> usize { 15 }
+fn default_tail_lines() -> usize { 15 }
+
+impl Default for CondenserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_condensation_enabled(),
+            drop_historical_reasoning: default_drop_historical_reasoning(),
+            truncate_tool_outputs: default_truncate_tool_outputs(),
+            keep_recent_turns: default_keep_recent_turns(),
+            max_tool_chars: default_max_tool_chars(),
+            head_lines: default_head_lines(),
+            tail_lines: default_tail_lines(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
             local: LocalConfig::default(),
             cloud: CloudConfig::default(),
+            condensation: CondenserConfig::default(),
         }
     }
 }
@@ -137,5 +180,20 @@ impl Config {
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_BASE") { if !v.trim().is_empty() { self.cloud.api_base = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_API_KEY") { if !v.trim().is_empty() { self.cloud.api_key = v; } }
         if let Ok(v) = std::env::var("FERRY_CLOUD_MODEL") { if !v.trim().is_empty() { self.cloud.model = v; } }
+        if let Ok(v) = std::env::var("FERRY_CONDENSATION_ENABLED") {
+            if let Ok(b) = v.parse() { self.condensation.enabled = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_DROP_HISTORICAL_REASONING") {
+            if let Ok(b) = v.parse() { self.condensation.drop_historical_reasoning = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_TRUNCATE_TOOL_OUTPUTS") {
+            if let Ok(b) = v.parse() { self.condensation.truncate_tool_outputs = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_KEEP_RECENT_TURNS") {
+            if let Ok(n) = v.parse() { self.condensation.keep_recent_turns = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_MAX_TOOL_CHARS") {
+            if let Ok(n) = v.parse() { self.condensation.max_tool_chars = n; }
+        }
     }
 }

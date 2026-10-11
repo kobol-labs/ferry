@@ -16,3 +16,18 @@ api_base = "https://api.minimax.io/v1"
 api_key = ""
 model = "MiniMax-M3"
 timeout_secs = 300
+
+[condensation]
+# Enable transparent prompt context condensation before routing
+enabled = true
+# Strip verbose reasoning / <think> blocks from historical assistant messages
+drop_historical_reasoning = true
+# Truncate large tool / command outputs from older turns
+truncate_tool_outputs = true
+# Number of most recent turns to keep 100% byte-for-byte untouched (immediate context)
+keep_recent_turns = 2
+# Character threshold before an older tool output is truncated (default: 1500 chars)
+max_tool_chars = 1500
+# Lines to preserve from the head and tail of truncated tool outputs
+head_lines = 15
+tail_lines = 15

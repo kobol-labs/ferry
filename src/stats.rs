@@ -12,6 +12,12 @@ pub struct MetricsTracker {
     pub total_tokens_est: AtomicU64,
     pub local_tokens_est: AtomicU64,
     pub cloud_tokens_est: AtomicU64,
+
+    // Condensation statistics
+    pub condensed_requests: AtomicU64,
+    pub chars_saved: AtomicU64,
+    pub reasoning_blocks_dropped: AtomicU64,
+    pub tool_outputs_truncated: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,6 +32,11 @@ pub struct StatsSnapshot {
     pub local_tokens_est: u64,
     pub cloud_tokens_est: u64,
     pub local_ratio_percent: f64,
+
+    pub condensed_requests: u64,
+    pub chars_saved: u64,
+    pub reasoning_blocks_dropped: u64,
+    pub tool_outputs_truncated: u64,
 }
 
 impl MetricsTracker {
@@ -59,6 +70,15 @@ impl MetricsTracker {
         self.failover_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_condensation(&self, reasoning_dropped: usize, tools_truncated: usize, chars_saved: usize) {
+        if chars_saved > 0 {
+            self.condensed_requests.fetch_add(1, Ordering::Relaxed);
+            self.chars_saved.fetch_add(chars_saved as u64, Ordering::Relaxed);
+            self.reasoning_blocks_dropped.fetch_add(reasoning_dropped as u64, Ordering::Relaxed);
+            self.tool_outputs_truncated.fetch_add(tools_truncated as u64, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         let total = self.total_requests.load(Ordering::Relaxed);
         let local = self.local_requests.load(Ordering::Relaxed);
@@ -79,6 +99,10 @@ impl MetricsTracker {
             local_tokens_est: self.local_tokens_est.load(Ordering::Relaxed),
             cloud_tokens_est: self.cloud_tokens_est.load(Ordering::Relaxed),
             local_ratio_percent: (ratio * 100.0).round() / 100.0,
+            condensed_requests: self.condensed_requests.load(Ordering::Relaxed),
+            chars_saved: self.chars_saved.load(Ordering::Relaxed),
+            reasoning_blocks_dropped: self.reasoning_blocks_dropped.load(Ordering::Relaxed),
+            tool_outputs_truncated: self.tool_outputs_truncated.load(Ordering::Relaxed),
         }
     }
 
@@ -99,7 +123,19 @@ impl MetricsTracker {
              # TYPE ferry_tokens_estimated counter\n\
              ferry_tokens_estimated {tokens}\n\
              ferry_tokens_estimated{{provider=\"local\"}} {ltokens}\n\
-             ferry_tokens_estimated{{provider=\"cloud\"}} {ctokens}\n",
+             ferry_tokens_estimated{{provider=\"cloud\"}} {ctokens}\n\
+             # HELP ferry_condensed_requests_total Total requests optimized by condensation\n\
+             # TYPE ferry_condensed_requests_total counter\n\
+             ferry_condensed_requests_total {condensed_reqs}\n\
+             # HELP ferry_chars_saved_total Total characters pruned from prompts\n\
+             # TYPE ferry_chars_saved_total counter\n\
+             ferry_chars_saved_total {chars_saved}\n\
+             # HELP ferry_reasoning_blocks_dropped_total Total historical reasoning blocks stripped\n\
+             # TYPE ferry_reasoning_blocks_dropped_total counter\n\
+             ferry_reasoning_blocks_dropped_total {reasoning_dropped}\n\
+             # HELP ferry_tool_outputs_truncated_total Total historical tool outputs truncated\n\
+             # TYPE ferry_tool_outputs_truncated_total counter\n\
+             ferry_tool_outputs_truncated_total {tools_truncated}\n",
             total = s.total_requests,
             local = s.local_requests,
             cloud = s.cloud_requests,
@@ -109,6 +145,10 @@ impl MetricsTracker {
             tokens = s.total_tokens_est,
             ltokens = s.local_tokens_est,
             ctokens = s.cloud_tokens_est,
+            condensed_reqs = s.condensed_requests,
+            chars_saved = s.chars_saved,
+            reasoning_dropped = s.reasoning_blocks_dropped,
+            tools_truncated = s.tool_outputs_truncated,
         )
     }
 }

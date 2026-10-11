@@ -1,3 +1,4 @@
+mod condenser;
 mod config;
 mod router;
 mod stats;
@@ -9,6 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use condenser::ContextCondenser;
 use config::Config;
 use router::Router as HybridRouter;
 use serde_json::{json, Value};
@@ -22,6 +24,7 @@ struct AppState {
     config: Arc<Config>,
     metrics: Arc<MetricsTracker>,
     router: HybridRouter,
+    condenser: ContextCondenser,
     upstream: UpstreamClient,
     request_id_counter: AtomicU64,
 }
@@ -41,12 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::from_file(&config_path)?);
     let metrics = Arc::new(MetricsTracker::new());
     let router = HybridRouter::new(config.clone(), metrics.clone());
+    let condenser = ContextCondenser::new(config.condensation.clone());
     let upstream = UpstreamClient::new(config.clone(), metrics.clone());
 
     let state = Arc::new(AppState {
         config: config.clone(),
         metrics: metrics.clone(),
         router,
+        condenser,
         upstream,
         request_id_counter: AtomicU64::new(1),
     });
@@ -65,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_model = %config.local.model,
         local_slots = config.local.max_slots,
         cloud_model = %config.cloud.model,
+        condensation_enabled = config.condensation.enabled,
         "Ferry hybrid proxy started"
     );
 
@@ -80,6 +86,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "version": env!("CARGO_PKG_VERSION"),
         "active_local_slots": snap.active_local_slots,
         "max_local_slots": state.config.local.max_slots,
+        "condensation_enabled": state.config.condensation.enabled,
     }))
 }
 
@@ -108,9 +115,20 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
     let req_id = state.request_id_counter.fetch_add(1, Ordering::Relaxed);
+
+    // Context condensation: strip past reasoning & truncate stale tool dumps
+    let cond_stats = state.condenser.condense(&mut body);
+    if cond_stats.chars_saved > 0 {
+        state.metrics.record_condensation(
+            cond_stats.reasoning_blocks_dropped,
+            cond_stats.tool_outputs_truncated,
+            cond_stats.chars_saved,
+        );
+    }
+
     let decision = state.router.decide(&body);
     state.upstream.forward_chat(body, decision, req_id).await
 }
