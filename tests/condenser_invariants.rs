@@ -813,5 +813,79 @@ fn test_zero_allocation_char_counting_parity() {
     assert_eq!(count, 77);
 }
 
+#[test]
+fn test_signal_aware_truncation_preserves_middle_error() {
+    use ferry::condenser::truncate_tool_content_smart;
+
+    let mut lines = Vec::new();
+    for i in 1..=100 {
+        if i == 50 {
+            lines.push("fatal error: connection to postgres failed: password authentication failed".to_string());
+        } else {
+            lines.push(format!("info: log event {i} passed successfully"));
+        }
+    }
+    let full_text = lines.join("\n");
+
+    let mut signals_extracted = 0;
+    // With signal_aware = true, head 5 lines, tail 5 lines
+    let truncated = truncate_tool_content_smart(&full_text, 5, 5, true, &mut signals_extracted);
+
+    assert_eq!(signals_extracted, 1);
+    assert!(truncated.contains("fatal error: connection to postgres failed"));
+    assert!(truncated.contains("info: log event 1"));
+    assert!(truncated.contains("info: log event 100"));
+    assert!(truncated.contains("Ferry Proxy: truncated"));
+
+    // Compare with signal_aware = false: line 50 should be completely dropped
+    let mut no_signals = 0;
+    let blind_truncated = truncate_tool_content_smart(&full_text, 5, 5, false, &mut no_signals);
+    assert_eq!(no_signals, 0);
+    assert!(!blind_truncated.contains("fatal error: connection to postgres failed"));
+}
+
+#[test]
+fn test_runaway_repetition_folding_collapses_duplicate_historical_failures() {
+    let config = CondenserConfig {
+        enabled: true,
+        fold_repeated_tool_failures: true,
+        keep_recent_turns: 1,
+        truncate_tool_outputs: false, // focus purely on loop folding
+        ..Default::default()
+    };
+    let condenser = ContextCondenser::new(config);
+
+    let repeated_error = "curl: (7) Failed to connect to localhost port 8000: Connection refused (repeated attempt)";
+
+    let mut body = json!({
+        "messages": [
+            { "role": "system", "content": "You are a scanner." },
+            { "role": "user", "content": "Probe endpoint" },
+            { "role": "assistant", "content": "Attempt 1" },
+            { "role": "tool", "content": repeated_error },
+            { "role": "assistant", "content": "Attempt 2" },
+            { "role": "tool", "content": repeated_error },
+            { "role": "assistant", "content": "Attempt 3" },
+            { "role": "tool", "content": repeated_error },
+            { "role": "assistant", "content": "Recent active turn" },
+            { "role": "tool", "content": repeated_error } // recent turn: must be untouched
+        ]
+    });
+
+    let stats = condenser.condense(&mut body);
+    assert!(stats.loops_collapsed_count >= 1);
+
+    let msgs = body["messages"].as_array().unwrap();
+    // Attempt 1: preserved verbatim
+    assert_eq!(msgs[3]["content"], repeated_error);
+    // Attempt 2: folded
+    assert!(msgs[5]["content"].as_str().unwrap().contains("Repeated identical tool failure suppressed"));
+    // Attempt 3: folded
+    assert!(msgs[7]["content"].as_str().unwrap().contains("Repeated identical tool failure suppressed"));
+    // Recent turn (Attempt 4): untouched
+    assert_eq!(msgs[9]["content"], repeated_error);
+}
+
+
 
 

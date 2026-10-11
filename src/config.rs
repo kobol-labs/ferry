@@ -152,11 +152,17 @@ pub struct CondenserConfig {
     pub enable_constraint_ledger: bool,
     #[serde(default = "default_protect_static_prefix")]
     pub protect_static_prefix: bool,
+    #[serde(default = "default_signal_aware_truncation")]
+    pub signal_aware_truncation: bool,
+    #[serde(default = "default_fold_repeated_tool_failures")]
+    pub fold_repeated_tool_failures: bool,
 }
 
 fn default_condensation_enabled() -> bool { true }
 fn default_drop_historical_reasoning() -> bool { true }
 fn default_truncate_tool_outputs() -> bool { true }
+fn default_signal_aware_truncation() -> bool { true }
+fn default_fold_repeated_tool_failures() -> bool { true }
 fn default_keep_recent_turns() -> usize { 1 }
 fn default_max_tool_chars() -> usize { 2000 }
 fn default_recent_max_tool_chars() -> usize { 60000 }
@@ -190,6 +196,8 @@ impl Default for CondenserConfig {
             protect_code_blocks: default_protect_code_blocks(),
             enable_constraint_ledger: default_enable_constraint_ledger(),
             protect_static_prefix: default_protect_static_prefix(),
+            signal_aware_truncation: default_signal_aware_truncation(),
+            fold_repeated_tool_failures: default_fold_repeated_tool_failures(),
         }
     }
 }
@@ -297,6 +305,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_PROTECT_STATIC_PREFIX") {
             if let Some(b) = parse_bool(&v) { self.condensation.protect_static_prefix = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_SIGNAL_AWARE_TRUNCATION") {
+            if let Some(b) = parse_bool(&v) { self.condensation.signal_aware_truncation = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_FOLD_REPEATED_TOOL_FAILURES") {
+            if let Some(b) = parse_bool(&v) { self.condensation.fold_repeated_tool_failures = b; }
         }
     }
 }

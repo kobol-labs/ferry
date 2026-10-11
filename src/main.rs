@@ -233,6 +233,8 @@ async fn chat_completions_handler(
             cond_stats.json_minified_count,
             cond_stats.ledger_checks_passed,
             cond_stats.ledger_vetoed_count,
+            cond_stats.signals_extracted_count,
+            cond_stats.loops_collapsed_count,
         );
     }
 

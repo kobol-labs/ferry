@@ -20,6 +20,8 @@ pub struct CondensationStats {
     pub json_minified_count: usize,
     pub ledger_checks_passed: usize,
     pub ledger_vetoed_count: usize,
+    pub signals_extracted_count: usize,
+    pub loops_collapsed_count: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,6 +68,61 @@ impl ContextCondenser {
         };
 
         let mut stats = CondensationStats::default();
+
+        // 1.5. Runaway Repetition Folding:
+        // Identifies identical tool outputs across historical turns and folds redundant repetitions
+        if self.config.fold_repeated_tool_failures && cutoff_index > 1 {
+            let mut seen_historical_outputs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for idx in 0..cutoff_index {
+                let msg = &messages[idx];
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
+                let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                if role == "tool" || msg_type == "tool_result" {
+                    let content_opt = msg.get("content").and_then(|c| c.as_str()).or_else(|| msg.get("output").and_then(|o| o.as_str()));
+                    if let Some(content) = content_opt {
+                        let trimmed = content.trim();
+                        if trimmed.len() >= 25 {
+                            *seen_historical_outputs.entry(trimmed.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            if seen_historical_outputs.values().any(|&count| count >= 2) {
+                let mut kept_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for idx in 0..cutoff_index {
+                    let msg = &mut messages[idx];
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default().to_string();
+                    let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+                    if role == "tool" || msg_type == "tool_result" {
+                        let content_opt = msg.get("content").and_then(|c| c.as_str()).or_else(|| msg.get("output").and_then(|o| o.as_str())).map(|s| s.to_string());
+                        if let Some(content) = content_opt {
+                            let trimmed = content.trim();
+                            if let Some(&total_count) = seen_historical_outputs.get(trimmed) {
+                                if total_count >= 2 {
+                                    let seen_so_far = kept_counts.entry(trimmed.to_string()).or_insert(0);
+                                    *seen_so_far += 1;
+                                    if *seen_so_far > 1 {
+                                        if let Some(obj) = msg.as_object_mut() {
+                                            let folded = format!(
+                                                "[... Ferry Proxy: Repeated identical tool failure suppressed (attempt {} of {}); see earlier turn for output ...]",
+                                                *seen_so_far, total_count
+                                            );
+                                            if obj.contains_key("content") {
+                                                obj.insert("content".to_string(), Value::String(folded));
+                                            } else if obj.contains_key("output") {
+                                                obj.insert("output".to_string(), Value::String(folded));
+                                            }
+                                            stats.loops_collapsed_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // 2. Iterate through all messages
         for idx in 0..messages.len() {
@@ -190,10 +247,12 @@ impl ContextCondenser {
             if is_historical {
                 // Historical turns: aggressive truncation to max_tool_chars
                 if processed.len() > self.config.max_tool_chars {
-                    processed = truncate_tool_content(
+                    processed = truncate_tool_content_smart(
                         &processed,
                         self.config.head_lines,
                         self.config.tail_lines,
+                        self.config.signal_aware_truncation,
+                        &mut stats.signals_extracted_count,
                     );
                     stats.tool_outputs_truncated += 1;
                 }
@@ -201,7 +260,13 @@ impl ContextCondenser {
                 // Recent active turn: generous runaway safety cap (default 60k chars)
                 // Prevents blinding the auditor on code files being analyzed
                 if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
-                    processed = truncate_tool_content(&processed, 30, 20);
+                    processed = truncate_tool_content_smart(
+                        &processed,
+                        30,
+                        20,
+                        self.config.signal_aware_truncation,
+                        &mut stats.signals_extracted_count,
+                    );
                     stats.tool_outputs_truncated += 1;
                 }
             }
@@ -531,9 +596,71 @@ fn safe_ceil_char_boundary(s: &str, mut index: usize) -> usize {
     index
 }
 
+pub const DIAGNOSTIC_SIGNALS: &[&str] = &[
+    "error:",
+    "error[",
+    "failed",
+    "failure",
+    "exception",
+    "panic:",
+    "panicked",
+    "fatal:",
+    "vulnerability",
+    "vulnerabilities",
+    "cwe-",
+    "cve-",
+    "assert",
+    "traceback",
+    "syntaxerror",
+    "typeerror",
+    "referenceerror",
+    "status 500",
+    "internal server error",
+    "connection refused",
+    "timed out",
+    "timeout",
+];
+
+/// Scans lines for diagnostic error signals and returns line index of the highest density signal region
+pub fn find_diagnostic_signal_index(lines: &[&str], start_idx: usize, end_idx: usize) -> Option<usize> {
+    if start_idx >= end_idx || lines.is_empty() {
+        return None;
+    }
+    let mut best_idx = None;
+    let mut best_score = 0;
+
+    for i in start_idx..end_idx.min(lines.len()) {
+        let line_lower = lines[i].to_ascii_lowercase();
+        let mut score = 0;
+        for sig in DIAGNOSTIC_SIGNALS {
+            if line_lower.contains(sig) {
+                score += 10;
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best_idx = Some(i);
+        }
+    }
+
+    best_idx
+}
+
 /// Truncates long tool content keeping head and tail lines with omission indicator.
 /// Guarantees 100% panic-freedom on multi-byte UTF-8 inputs.
 pub fn truncate_tool_content(text: &str, head_lines: usize, tail_lines: usize) -> String {
+    let mut dummy = 0;
+    truncate_tool_content_smart(text, head_lines, tail_lines, false, &mut dummy)
+}
+
+/// Signal-aware smart truncation that preserves error diagnostic regions in the middle of long outputs.
+pub fn truncate_tool_content_smart(
+    text: &str,
+    head_lines: usize,
+    tail_lines: usize,
+    signal_aware: bool,
+    signals_extracted: &mut usize,
+) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= head_lines + tail_lines {
         // Line count is small, do byte/char boundary truncation safely on UTF-8 boundaries
@@ -553,6 +680,39 @@ pub fn truncate_tool_content(text: &str, head_lines: usize, tail_lines: usize) -
             dropped,
             tail_str
         );
+    }
+
+    // Check if middle lines contain diagnostic failure signals
+    if signal_aware {
+        let mid_start = head_lines;
+        let mid_end = lines.len().saturating_sub(tail_lines);
+        if let Some(signal_line_idx) = find_diagnostic_signal_index(&lines, mid_start, mid_end) {
+            *signals_extracted += 1;
+            let win_start = signal_line_idx.saturating_sub(4).max(head_lines);
+            let win_end = (signal_line_idx + 8).min(mid_end);
+
+            let head_part = lines[..head_lines].join("\n");
+            let signal_part = lines[win_start..win_end].join("\n");
+            let tail_part = lines[lines.len() - tail_lines..].join("\n");
+
+            let dropped_before = win_start.saturating_sub(head_lines);
+            let dropped_after = mid_end.saturating_sub(win_end);
+
+            let mut out = head_part;
+            if dropped_before > 0 {
+                out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_before} lines of passing logs ...]\n\n"));
+            } else {
+                out.push('\n');
+            }
+            out.push_str(&signal_part);
+            if dropped_after > 0 {
+                out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_after} lines ...]\n\n"));
+            } else {
+                out.push('\n');
+            }
+            out.push_str(&tail_part);
+            return out;
+        }
     }
 
     let head_part = lines[..head_lines].join("\n");
