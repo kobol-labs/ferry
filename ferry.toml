@@ -39,3 +39,6 @@ strip_progress_bars = true      # Remove carriage-return overwrites and progress
 collapse_whitespace = true      # Collapse 3+ newlines to \n\n and trim trailing whitespace
 deduplicate_lines = true        # Collapse consecutive identical lines with repeat count
 minify_json_outputs = true      # Minify pretty-printed JSON tool outputs (saves ~30%)
+protect_code_blocks = true      # Exempt markdown code blocks from destructive cleaners
+enable_constraint_ledger = true # Proof-of-safety constraint ledger (auto-veto on anchor loss)
+protect_static_prefix = true    # Maintain 100% prefix cache immutability for 90%+ GPU hit rate
