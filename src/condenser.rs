@@ -355,6 +355,8 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
             continue;
         }
 
+        let upper = clean.to_ascii_uppercase();
+
         // 1. URLs
         if clean.starts_with("http://") || clean.starts_with("https://") {
             anchors.push(clean.to_string());
