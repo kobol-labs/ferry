@@ -84,11 +84,17 @@ impl SessionAffinityTracker {
         self.try_acquire_slot_with_prefix(session_id, 0).map(|(s, aff)| (s, aff.is_hit()))
     }
 
-    /// Attempts to acquire an execution slot for a session.
+    /// Attempts to acquire an execution slot for a session (with eviction allowed).
+    pub fn try_acquire_slot_with_prefix(&self, session_id: &str, prefix_hash: u64) -> Option<(usize, AffinityType)> {
+        self.try_acquire_slot_opt(session_id, prefix_hash, true)
+    }
+
+    /// Attempts to acquire an execution slot for a session with optional eviction.
     /// If session has a preferred slot that is idle, acquires it (SessionHit).
     /// If session is new or preferred slot is busy, looks for an idle slot with matching prefix_hash (PrefixHit).
-    /// Otherwise acquires an unassigned idle slot, or least-recently-used assigned slot.
-    pub fn try_acquire_slot_with_prefix(&self, session_id: &str, prefix_hash: u64) -> Option<(usize, AffinityType)> {
+    /// Otherwise acquires an unassigned idle slot.
+    /// If allow_eviction is true, can evict an idle slot assigned to an inactive session (LRU).
+    pub fn try_acquire_slot_opt(&self, session_id: &str, prefix_hash: u64, allow_eviction: bool) -> Option<(usize, AffinityType)> {
         if !self.enabled || self.max_slots == 0 {
             return Some((0, AffinityType::NewSlot));
         }
@@ -196,6 +202,10 @@ impl SessionAffinityTracker {
         }
 
         // 4. All idle slots are assigned to other sessions.
+        if !allow_eviction {
+            return None;
+        }
+
         // Pick an idle slot whose assigned session was active longest ago (LRU eviction).
         let mut candidates: Vec<usize> = (0..self.max_slots).collect();
         candidates.sort_by_key(|slot| assigned_slots.get(slot).copied().unwrap_or(now));
@@ -324,5 +334,32 @@ mod tests {
 
         tracker.release_slot(slot_sub1);
         tracker.release_slot(slot_sub2);
+    }
+
+    #[test]
+    fn test_anti_eviction_hysteresis() {
+        let tracker = SessionAffinityTracker::new(true, 2);
+
+        // Session 1 acquires and occupies slot 0
+        let (s1, _) = tracker.try_acquire_slot_opt("session-1", 100, true).unwrap();
+        assert_eq!(s1, 0);
+
+        // Session 2 acquires and occupies slot 1
+        let (s2, _) = tracker.try_acquire_slot_opt("session-2", 200, true).unwrap();
+        assert_eq!(s2, 1);
+
+        // Session 1 and 2 finish turn and release their slots (both slots are idle, but assigned to session-1 and session-2)
+        tracker.release_slot(s1);
+        tracker.release_slot(s2);
+
+        // Session 3 arrives with prefix 300, with allow_eviction = false.
+        // Both slot 0 and slot 1 are assigned to other sessions and have different prefixes.
+        // With allow_eviction = false, it must NOT evict either session!
+        let no_evict = tracker.try_acquire_slot_opt("session-3", 300, false);
+        assert!(no_evict.is_none(), "Should not evict assigned slots when allow_eviction is false");
+
+        // When allow_eviction = true (e.g. after queue timeout threshold), it can evict LRU slot
+        let evict = tracker.try_acquire_slot_opt("session-3", 300, true);
+        assert!(evict.is_some(), "Should evict assigned slot when allow_eviction is true");
     }
 }

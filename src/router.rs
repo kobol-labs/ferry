@@ -140,6 +140,78 @@ impl Router {
         crate::condenser::estimate_tokens_from_chars(total_chars)
     }
 
+    pub fn detect_orchestrator(body: &Value, session_id: &str, priority_override: Option<&str>) -> bool {
+        if let Some(prio) = priority_override {
+            let p_lower = prio.to_lowercase();
+            if matches!(p_lower.as_str(), "high" | "orchestrator" | "root" | "prio") {
+                return true;
+            }
+        }
+
+        if session_id.to_lowercase().contains("root") || session_id.to_lowercase().contains("orchestrat") {
+            return true;
+        }
+
+        if let Some(user) = body.get("user").and_then(|u| u.as_str()) {
+            let u_lower = user.to_lowercase();
+            if u_lower.contains("root") || u_lower.contains("orchestrat") {
+                return true;
+            }
+        }
+
+        if let Some(meta) = body.get("metadata").and_then(|m| m.as_object()) {
+            for key in &["agent_id", "agent_name", "role", "agent"] {
+                if let Some(val) = meta.get(*key).and_then(|v| v.as_str()) {
+                    let v_lower = val.to_lowercase();
+                    if v_lower.contains("root") || v_lower.contains("orchestrat") {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Inspect messages for orchestrator signatures (Root Agent / coordination skills)
+        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+            for msg in messages {
+                if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+                    if role == "system" {
+                        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                            let c_lower = content.to_lowercase();
+                            if c_lower.contains("root agent")
+                                || c_lower.contains("root=true")
+                                || c_lower.contains("coordination/root_agent")
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    let c_lower = content.to_lowercase();
+                    if c_lower.contains("as the root agent")
+                        || c_lower.contains("wait_for_agents")
+                        || c_lower.contains("list_coverage")
+                    {
+                        return true;
+                    }
+                }
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        if let Some(func) = tc.get("function") {
+                            if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                if matches!(name, "wait_for_agents" | "list_coverage" | "list_reports" | "assign_task") {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     pub async fn decide(&self, body: &Value, route_override: Option<&str>) -> RouteDecision {
         self.decide_for_session(body, route_override, None, "default").await
     }
@@ -257,7 +329,12 @@ impl Router {
         }
 
         // 5. Atomic local slot & token capacity acquisition with session & prefix affinity
-        if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_with_prefix(session_id, prefix_hash) {
+        let is_orchestrator = Self::detect_orchestrator(body, session_id, route_override);
+        if is_orchestrator {
+            self.metrics.orchestrator_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, is_orchestrator) {
             let is_hit = aff_type.is_hit();
             if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
                 self.metrics.record_affinity(is_hit);
@@ -298,10 +375,12 @@ impl Router {
             500
         } else if local_only {
             60000
+        } else if is_orchestrator {
+            15000 // 15s fast-spillover for orchestrators so swarm is never blocked
         } else if local_prefer {
             45000
         } else if est_tokens <= max_context {
-            queue_timeout_ms.max(35000)
+            queue_timeout_ms.max(40000) // 40s for workers to maximize local execution
         } else {
             queue_timeout_ms
         };
@@ -309,13 +388,12 @@ impl Router {
         if effective_wait_ms > 0 {
             let start = std::time::Instant::now();
             let wait_limit = std::time::Duration::from_millis(effective_wait_ms);
-            let poll_interval = if fast_mode { 10 } else { 25 };
+            let poll_interval = if is_orchestrator || fast_mode { 5 } else { 25 };
             let mut logged_queue_entry = false;
             let mut last_queue_heartbeat = start;
             while start.elapsed() < wait_limit {
                 if !logged_queue_entry {
-                    let is_priority = local_only || local_prefer || session_id.contains("root");
-                    let prio_label = if is_priority { "orchestrator" } else { "standard" };
+                    let prio_label = if is_orchestrator { "orchestrator" } else { "standard" };
                     tracing::info!(
                         session = %session_id,
                         est_tokens,
@@ -334,7 +412,9 @@ impl Router {
                     last_queue_heartbeat = std::time::Instant::now();
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval)).await;
-                if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_with_prefix(session_id, prefix_hash) {
+                // Allow eviction for orchestrators immediately, or for workers after waiting 70% of timeout
+                let allow_eviction = is_orchestrator || (start.elapsed().as_millis() >= (effective_wait_ms as u128 * 7 / 10));
+                if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, allow_eviction) {
                     let is_hit = aff_type.is_hit();
                     if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
                         let wait_ms = start.elapsed().as_millis() as u64;
@@ -373,6 +453,10 @@ impl Router {
                 let wait_ms = start.elapsed().as_millis() as u64;
                 self.metrics.record_queue_wait(wait_ms);
             }
+        }
+
+        if is_orchestrator {
+            self.metrics.orchestrator_spillover.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);

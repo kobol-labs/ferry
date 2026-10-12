@@ -455,13 +455,13 @@ impl UpstreamClient {
             return (status, headers, body_bytes).into_response();
         }
 
-        // Streaming SSE path with background keepalive heartbeat
+        // Streaming SSE path with background keepalive heartbeat (5s heartbeat to prevent client socket drops)
         let byte_stream = resp.bytes_stream();
         let guarded_stream = GuardedStream::new(
             byte_stream,
             guard,
             is_sse,
-            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(5),
         );
 
         (status, headers, Body::from_stream(guarded_stream)).into_response()

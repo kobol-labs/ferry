@@ -56,6 +56,10 @@ pub struct MetricsTracker {
     pub queued_requests: AtomicU64,
     pub queue_wait_ms_total: AtomicU64,
     pub last_queue_wait_ms: AtomicU64,
+
+    // Orchestrator priority metrics
+    pub orchestrator_requests: AtomicU64,
+    pub orchestrator_spillover: AtomicU64,
 }
 
 impl Default for MetricsTracker {
@@ -109,6 +113,9 @@ impl Default for MetricsTracker {
             queued_requests: AtomicU64::new(0),
             queue_wait_ms_total: AtomicU64::new(0),
             last_queue_wait_ms: AtomicU64::new(0),
+
+            orchestrator_requests: AtomicU64::new(0),
+            orchestrator_spillover: AtomicU64::new(0),
         }
     }
 }
@@ -166,6 +173,9 @@ pub struct StatsSnapshot {
     pub queue_wait_ms_total: u64,
     pub last_queue_wait_ms: u64,
     pub avg_queue_wait_ms: f64,
+
+    pub orchestrator_requests_total: u64,
+    pub orchestrator_spillover_total: u64,
 }
 
 impl MetricsTracker {
@@ -442,6 +452,9 @@ impl MetricsTracker {
             queue_wait_ms_total: queue_wait_total,
             last_queue_wait_ms: last_queue_wait,
             avg_queue_wait_ms: avg_queue_wait,
+
+            orchestrator_requests_total: self.orchestrator_requests.load(Ordering::Relaxed),
+            orchestrator_spillover_total: self.orchestrator_spillover.load(Ordering::Relaxed),
         }
     }
 
@@ -529,9 +542,15 @@ impl MetricsTracker {
              # HELP ferry_queue_wait_ms_total Total milliseconds spent waiting in contention queue\n\
              # TYPE ferry_queue_wait_ms_total counter\n\
              ferry_queue_wait_ms_total {queue_wait}\n\
-             # HELP ferry_last_queue_wait_ms Latency of most recent contention queue wait in ms\n\
-             # TYPE ferry_last_queue_wait_ms gauge\n\
-             ferry_last_queue_wait_ms {last_queue}\n",
+              # HELP ferry_last_queue_wait_ms Latency of most recent contention queue wait in ms\n\
+              # TYPE ferry_last_queue_wait_ms gauge\n\
+              ferry_last_queue_wait_ms {last_queue}\n\
+              # HELP ferry_orchestrator_requests_total Total requests identified and prioritized as orchestrator/root turns\n\
+              # TYPE ferry_orchestrator_requests_total counter\n\
+              ferry_orchestrator_requests_total {orchestrator_total}\n\
+              # HELP ferry_orchestrator_spillover_total Total orchestrator turns spilled to cloud due to local saturation\n\
+              # TYPE ferry_orchestrator_spillover_total counter\n\
+              ferry_orchestrator_spillover_total {orchestrator_spill}\n",
             total = s.total_requests,
             local = s.local_requests,
             cloud = s.cloud_requests,
@@ -574,6 +593,8 @@ impl MetricsTracker {
             queued = s.queued_requests_total,
             queue_wait = s.queue_wait_ms_total,
             last_queue = s.last_queue_wait_ms,
+            orchestrator_total = s.orchestrator_requests_total,
+            orchestrator_spill = s.orchestrator_spillover_total,
         )
     }
 
@@ -585,7 +606,8 @@ impl MetricsTracker {
         }
     }
 
-    pub fn record_rolling_compaction(&self, chars_saved: usize) {        self.rolling_compact_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_rolling_compaction(&self, chars_saved: usize) {
+        self.rolling_compact_count.fetch_add(1, Ordering::Relaxed);
         self.rolling_compact_chars_saved.fetch_add(chars_saved as u64, Ordering::Relaxed);
     }
 
@@ -593,6 +615,13 @@ impl MetricsTracker {
         self.queued_requests.fetch_add(1, Ordering::Relaxed);
         self.queue_wait_ms_total.fetch_add(wait_ms, Ordering::Relaxed);
         self.last_queue_wait_ms.store(wait_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_orchestrator(&self, is_spillover: bool) {
+        self.orchestrator_requests.fetch_add(1, Ordering::Relaxed);
+        if is_spillover {
+            self.orchestrator_spillover.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
