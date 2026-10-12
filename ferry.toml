@@ -2,50 +2,51 @@
 bind = "0.0.0.0:4000"
 
 [local]
+name = "strata"
 api_base = "http://192.168.9.99:8080/v1"
 api_key = "sk-strata-stevegaming"
 model = "qwen3.8-flash-next-iq2_xs"
-max_slots = 2
-max_context_tokens = 128000
-total_kv_token_budget = 260000
+max_slots = 3
+max_context_tokens = 256000
+total_kv_token_budget = 768000
 adaptive_squeezing = true
 adaptive_squeeze_ratio = 1.35
-timeout_secs = 90
-connect_timeout_secs = 3
+timeout_secs = 240
+connect_timeout_secs = 5
 circuit_breaker_threshold = 3
 probe_interval_secs = 5
-queue_timeout_ms = 3500
+queue_timeout_ms = 35000
 
 [cloud]
+name = "minimax"
 api_base = "https://api.minimax.io/v1"
 api_key = ""
 model = "MiniMax-M3"
 timeout_secs = 300
 
-[condensation]
-# Enable transparent prompt context condensation before routing
+[affinity]
 enabled = true
-# Strip verbose reasoning / <think> blocks from historical assistant messages
+max_slots = 3
+timeout_secs = 3600
+
+[condensation]
+enabled = true
 drop_historical_reasoning = true
-# Truncate large tool / command outputs from older turns
 truncate_tool_outputs = true
-# Number of most recent turns to keep 100% byte-for-byte untouched (immediate context)
 keep_recent_turns = 1
-# Character threshold before an older tool output is truncated (default: 2000 chars)
 max_tool_chars = 2000
-# Runaway safety cap on recent turn tool outputs to avoid blinding auditor on code files (default: 60000 chars)
 recent_max_tool_chars = 60000
-# Lines to preserve from the head and tail of truncated tool outputs
 head_lines = 15
 tail_lines = 10
-# Streamlined cleaners & folding:
-strip_terminal_noise = true          # Strip ANSI escapes, progress bar overwrites, and collapse excess blank lines
-deduplicate_lines = true             # Collapse consecutive identical lines with repeat count
-minify_json_outputs = true           # Minify pretty-printed JSON tool outputs (saves ~30%)
-fold_repeated_tool_failures = true   # Fold runaway repetitive tool errors across historical turns
-
-# Engine Invariants (always enforced, zero configuration needed):
-# - Static Prefix Protection: 100% byte-for-byte immutable system/developer/user prompts for 90%+ KV cache hit rate
-# - Markdown Code Block Protection: code blocks are 100% exempt from destructive cleaners
-# - Signal-Aware Truncation: diagnostic errors/exceptions in middle of long logs are automatically detected and preserved
-# - Constraint Ledger Verification: safety anchors (IPs, paths, CVEs, security imperatives) are verified with automatic rollback
+strip_ansi_escapes = true
+strip_progress_bars = true
+collapse_whitespace = true
+deduplicate_lines = true
+minify_json_outputs = true
+protect_code_blocks = true
+enable_constraint_ledger = true
+protect_static_prefix = true
+fold_repeated_tool_failures = true
+rolling_compaction = true
+compact_threshold_tokens = 128000
+compact_keep_recent_turns = 4
