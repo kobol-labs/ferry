@@ -7,7 +7,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::stream::Stream;
+use futures_util::stream::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
 use pin_project_lite::pin_project;
@@ -17,6 +17,27 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tracing::{error, info, warn};
+
+pin_project! {
+    pub struct ReceiverStream<T> {
+        #[pin]
+        rx: tokio::sync::mpsc::Receiver<T>,
+    }
+}
+
+impl<T> ReceiverStream<T> {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<T>) -> Self {
+        Self { rx }
+    }
+}
+
+impl<T> Stream for ReceiverStream<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().rx.poll_recv(cx)
+    }
+}
 
 pin_project! {
     pub struct GuardedStream<S> {
@@ -181,6 +202,31 @@ impl UpstreamClient {
                     .header(header::CONTENT_TYPE, "application/json")
                     .json(&body)
                     .timeout(std::time::Duration::from_secs(self.config.local.timeout_secs));
+
+                if is_stream {
+                    let meta = ResponseMeta {
+                        provider: "local",
+                        model: self.config.local.model.clone(),
+                        est_tokens: decision.est_tokens,
+                        chars_saved,
+                        savings_pct,
+                        duration_ms: 0,
+                        is_failover: false,
+                        slot_id: decision.slot_id,
+                        is_affinity_hit: decision.is_affinity_hit,
+                        affinity_type: decision.affinity_type,
+                        session_id: decision.session_id.clone(),
+                    };
+                    return self
+                        .stream_local_response_with_prefill_keepalive(
+                            req,
+                            slot_guard,
+                            meta,
+                            req_id,
+                            start,
+                        )
+                        .await;
+                }
 
                 match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
@@ -465,6 +511,153 @@ impl UpstreamClient {
         );
 
         (status, headers, Body::from_stream(guarded_stream)).into_response()
+    }
+
+    async fn stream_local_response_with_prefill_keepalive(
+        &self,
+        req: reqwest::RequestBuilder,
+        guard: Option<crate::router::LocalSlotGuard>,
+        meta: ResponseMeta,
+        req_id: u64,
+        start: Instant,
+    ) -> Response {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let metrics = self.metrics.clone();
+        let cb_threshold = self.config.local.circuit_breaker_threshold;
+
+        tokio::spawn(async move {
+            let keepalive_chunk = bytes::Bytes::from("data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"ferry\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n");
+
+            // Prefill heartbeat: emit an empty completion delta every 4 seconds while awaiting upstream response headers
+            let mut prefill_interval = tokio::time::interval(std::time::Duration::from_secs(4));
+            prefill_interval.tick().await; // consume immediate first tick
+
+            let mut req_fut = Box::pin(req.send());
+
+            let resp = loop {
+                tokio::select! {
+                    _ = prefill_interval.tick() => {
+                        if tx.send(Ok(keepalive_chunk.clone())).await.is_err() {
+                            warn!(req_id = req_id, "Client disconnected during upstream prefill; dropping turn");
+                            drop(guard);
+                            return;
+                        }
+                    }
+                    res = &mut req_fut => {
+                        break res;
+                    }
+                }
+            };
+
+            match resp {
+                Ok(resp) if resp.status().is_success() => {
+                    metrics.record_local_success();
+                    let duration = start.elapsed();
+                    metrics.record_local_completion(duration.as_millis());
+                    info!(
+                        req_id = req_id,
+                        target = "local",
+                        status = resp.status().as_u16(),
+                        duration_ms = duration.as_millis(),
+                        "Local prefill finished; streaming chunks to client"
+                    );
+
+                    let mut stream = resp.bytes_stream();
+                    let mut stream_interval = tokio::time::interval(std::time::Duration::from_secs(4));
+                    stream_interval.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            _ = stream_interval.tick() => {
+                                if tx.send(Ok(keepalive_chunk.clone())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            item = stream.next() => {
+                                match item {
+                                    Some(Ok(bytes)) => {
+                                        if tx.send(Ok(bytes)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        warn!(req_id = req_id, error = %e, "Upstream stream error; closing client stream");
+                                        let _ = tx.send(Ok(bytes::Bytes::from("data: [DONE]\n\n"))).await;
+                                        break;
+                                    }
+                                    None => {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(guard);
+                }
+                Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
+                    metrics.record_local_success();
+                    let status = resp.status();
+                    let err_text = resp.text().await.unwrap_or_default();
+                    warn!(req_id = req_id, status = status.as_u16(), error = %err_text, "Local provider returned client error");
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {{\"error\": \"{}\"}}\n\ndata: [DONE]\n\n", err_text)))).await;
+                    drop(guard);
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let err_text = resp.text().await.unwrap_or_default();
+                    warn!(req_id = req_id, status = status.as_u16(), error = %err_text, "Local provider returned server error");
+                    metrics.record_local_failure(cb_threshold);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {{\"error\": \"Local upstream error: {}\"}}\n\ndata: [DONE]\n\n", err_text)))).await;
+                    drop(guard);
+                }
+                Err(e) => {
+                    error!(req_id = req_id, error = %e, "Local stream request failed");
+                    metrics.record_local_failure(cb_threshold);
+                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {{\"error\": \"Upstream request failed: {}\"}}\n\ndata: [DONE]\n\n", e)))).await;
+                    drop(guard);
+                }
+            }
+        });
+
+        // Assemble immediate 200 OK SSE headers
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        headers.insert(HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*"));
+        headers.insert(HeaderName::from_static("access-control-allow-methods"), HeaderValue::from_static("GET, POST, OPTIONS"));
+        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms, x-ferry-session-id, x-session-id, x-agent-id"));
+        headers.insert(HeaderName::from_static("x-ferry-provider"), HeaderValue::from_static(meta.provider));
+        if let Ok(val) = HeaderValue::from_str(&meta.model) {
+            headers.insert(HeaderName::from_static("x-ferry-model"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&meta.est_tokens.to_string()) {
+            headers.insert(HeaderName::from_static("x-ferry-est-tokens"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&meta.chars_saved.to_string()) {
+            headers.insert(HeaderName::from_static("x-ferry-chars-saved"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&format!("{:.2}%", meta.savings_pct)) {
+            headers.insert(HeaderName::from_static("x-ferry-savings-percent"), val);
+        }
+        headers.insert(HeaderName::from_static("x-ferry-failover"), HeaderValue::from_static("false"));
+        if let Some(slot) = meta.slot_id {
+            if let Ok(val) = HeaderValue::from_str(&slot.to_string()) {
+                headers.insert(HeaderName::from_static("x-ferry-slot"), val);
+            }
+            headers.insert(HeaderName::from_static("x-ferry-affinity"), HeaderValue::from_static(meta.affinity_type.as_str()));
+        }
+        if !meta.session_id.is_empty() {
+            if let Ok(val) = HeaderValue::from_str(&meta.session_id) {
+                headers.insert(HeaderName::from_static("x-ferry-session-id"), val);
+            }
+        }
+        headers.insert(
+            HeaderName::from_static("access-control-expose-headers"),
+            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache, x-ferry-slot, x-ferry-affinity, x-ferry-session-id"),
+        );
+
+        let receiver_stream = ReceiverStream::new(rx);
+        (StatusCode::OK, headers, Body::from_stream(receiver_stream)).into_response()
     }
 }
 
