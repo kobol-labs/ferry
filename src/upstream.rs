@@ -86,7 +86,7 @@ where
                     match Future::poll(this.sleep.as_mut(), cx) {
                         Poll::Ready(()) => {
                             this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
-                            Poll::Ready(Some(Ok(bytes::Bytes::from(": keepalive\n\n"))))
+                            Poll::Ready(Some(Ok(bytes::Bytes::from("data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"ferry\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n"))))
                         }
                         Poll::Pending => Poll::Pending,
                     }
