@@ -15,7 +15,7 @@ timeout_secs = 240
 connect_timeout_secs = 5
 circuit_breaker_threshold = 3
 probe_interval_secs = 5
-queue_timeout_ms = 35000
+queue_timeout_ms = 25000
 
 [cloud]
 name = "minimax"
@@ -28,6 +28,7 @@ timeout_secs = 300
 enabled = true
 max_slots = 3
 timeout_secs = 3600
+idle_reclaim_secs = 10
 
 [condensation]
 enabled = true
