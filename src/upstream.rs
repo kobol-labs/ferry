@@ -87,6 +87,11 @@ where
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
+                let bytes = if *this.is_sse {
+                    transform_strata_chunk(bytes)
+                } else {
+                    bytes
+                };
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -576,6 +581,8 @@ impl UpstreamClient {
                             item = stream.next() => {
                                 match item {
                                     Some(Ok(bytes)) => {
+                                        stream_interval.reset();
+                                        let bytes = transform_strata_chunk(bytes);
                                         if tx.send(Ok(bytes)).await.is_err() {
                                             break;
                                         }
@@ -666,3 +673,23 @@ pub fn normalize_wire_format(body: &mut Value, target_model: &str) {
         obj.insert("model".to_string(), Value::String(target_model.to_string()));
     }
 }
+
+pub fn transform_strata_chunk(bytes: bytes::Bytes) -> bytes::Bytes {
+    let s = bytes.as_ref();
+    let mut trimmed = s;
+    while let Some(rest) = trimmed
+        .strip_prefix(b" ")
+        .or_else(|| trimmed.strip_prefix(b"\t"))
+        .or_else(|| trimmed.strip_prefix(b"\r"))
+        .or_else(|| trimmed.strip_prefix(b"\n"))
+    {
+        trimmed = rest;
+    }
+
+    if trimmed.starts_with(b":") && !s.windows(5).any(|w| w == b"data:") {
+        bytes::Bytes::from("data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"ferry\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n")
+    } else {
+        bytes
+    }
+}
+
