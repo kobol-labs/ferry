@@ -39,14 +39,25 @@ impl Default for ServerConfig {
 pub struct AffinityConfig {
     #[serde(default = "default_affinity_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_max_slots")]
+    pub max_slots: usize,
+    #[serde(default = "default_affinity_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_idle_reclaim_secs")]
+    pub idle_reclaim_secs: u64,
 }
 
 fn default_affinity_enabled() -> bool { true }
+fn default_affinity_timeout_secs() -> u64 { 3600 }
+fn default_idle_reclaim_secs() -> u64 { 10 }
 
 impl Default for AffinityConfig {
     fn default() -> Self {
         Self {
             enabled: default_affinity_enabled(),
+            max_slots: default_max_slots(),
+            timeout_secs: default_affinity_timeout_secs(),
+            idle_reclaim_secs: default_idle_reclaim_secs(),
         }
     }
 }
@@ -370,6 +381,12 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_AFFINITY_ENABLED") {
             if let Some(b) = parse_bool(&v) { self.affinity.enabled = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_AFFINITY_TIMEOUT_SECS") {
+            if let Ok(n) = v.parse() { self.affinity.timeout_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_IDLE_RECLAIM_SECS").or_else(|_| std::env::var("FERRY_AFFINITY_IDLE_RECLAIM_SECS")) {
+            if let Ok(n) = v.parse() { self.affinity.idle_reclaim_secs = n; }
         }
     }
 }

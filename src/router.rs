@@ -75,9 +75,10 @@ pub struct Router {
 
 impl Router {
     pub fn new(config: Arc<Config>, metrics: Arc<MetricsTracker>) -> Self {
-        let affinity_tracker = Arc::new(SessionAffinityTracker::new(
+        let affinity_tracker = Arc::new(SessionAffinityTracker::with_idle_reclaim(
             config.affinity.enabled,
             config.local.max_slots,
+            config.affinity.idle_reclaim_secs,
         ));
         Self::with_affinity(config, metrics, affinity_tracker)
     }
@@ -379,8 +380,10 @@ impl Router {
             15000 // 15s fast-spillover for orchestrators so swarm is never blocked
         } else if local_prefer {
             45000
+        } else if queue_timeout_ms == 0 {
+            0
         } else if est_tokens <= max_context {
-            queue_timeout_ms.max(40000) // 40s for workers to maximize local execution
+            queue_timeout_ms.clamp(5000, 120000)
         } else {
             queue_timeout_ms
         };
@@ -412,8 +415,8 @@ impl Router {
                     last_queue_heartbeat = std::time::Instant::now();
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(poll_interval)).await;
-                // Allow eviction for orchestrators immediately, or for workers after waiting 70% of timeout
-                let allow_eviction = is_orchestrator || (start.elapsed().as_millis() >= (effective_wait_ms as u128 * 7 / 10));
+                // Allow eviction for orchestrators immediately, or for workers after waiting 70% of timeout (capped at 15s)
+                let allow_eviction = is_orchestrator || (start.elapsed().as_millis() >= (effective_wait_ms as u128 * 7 / 10).min(15000));
                 if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, allow_eviction) {
                     let is_hit = aff_type.is_hit();
                     if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {

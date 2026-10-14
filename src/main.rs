@@ -41,9 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Arc::new(Config::load_from_file_or_default(&config_path));
     let metrics = Arc::new(MetricsTracker::new());
-    let affinity_tracker = Arc::new(SessionAffinityTracker::new(
+    let affinity_tracker = Arc::new(SessionAffinityTracker::with_idle_reclaim(
         config.affinity.enabled,
         config.local.max_slots,
+        config.affinity.idle_reclaim_secs,
     ));
     let router = HybridRouter::with_affinity(config.clone(), metrics.clone(), affinity_tracker.clone());
     let condenser = ContextCondenser::new(config.condensation.clone());

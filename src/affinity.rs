@@ -38,6 +38,7 @@ pub struct SessionEntry {
 pub struct SessionAffinityTracker {
     enabled: bool,
     max_slots: usize,
+    idle_reclaim_secs: u64,
     sessions: RwLock<HashMap<String, SessionEntry>>,
     slot_busy: Vec<AtomicBool>,
     slot_prefix: RwLock<Vec<Option<u64>>>,
@@ -60,6 +61,10 @@ pub fn compute_prefix_hash(messages: &[serde_json::Value]) -> u64 {
 
 impl SessionAffinityTracker {
     pub fn new(enabled: bool, max_slots: usize) -> Self {
+        Self::with_idle_reclaim(enabled, max_slots, 10)
+    }
+
+    pub fn with_idle_reclaim(enabled: bool, max_slots: usize, idle_reclaim_secs: u64) -> Self {
         let mut slot_busy = Vec::with_capacity(max_slots);
         let mut slot_prefix = Vec::with_capacity(max_slots);
         let mut slot_last_active = Vec::with_capacity(max_slots);
@@ -72,6 +77,7 @@ impl SessionAffinityTracker {
         Self {
             enabled,
             max_slots,
+            idle_reclaim_secs,
             sessions: RwLock::new(HashMap::new()),
             slot_busy,
             slot_prefix: RwLock::new(slot_prefix),
@@ -166,16 +172,21 @@ impl SessionAffinityTracker {
             }
         }
 
-        // 3. Find an idle slot, prioritizing slots NOT assigned to any session.
-        let assigned_slots: HashMap<usize, Instant> = {
+        // 3. Find an idle slot, prioritizing unassigned slots or slots whose lease expired (idle >= idle_reclaim_secs).
+        let active_assigned_slots: HashMap<usize, Instant> = {
             let read = self.sessions.read().ok()?;
-            read.values().map(|e| (e.slot_id, e.last_active)).collect()
+            read.values()
+                .filter(|e| now.duration_since(e.last_active).as_secs() < self.idle_reclaim_secs)
+                .map(|e| (e.slot_id, e.last_active))
+                .collect()
         };
 
         for slot in 0..self.max_slots {
-            if !assigned_slots.contains_key(&slot) {
+            if !active_assigned_slots.contains_key(&slot) {
                 if !self.slot_busy[slot].swap(true, Ordering::SeqCst) {
                     if let Ok(mut write) = self.sessions.write() {
+                        // Evict stale inactive session if one previously held this slot
+                        write.retain(|k, v| k == session_id || v.slot_id != slot);
                         write.insert(
                             session_id.to_string(),
                             SessionEntry {
@@ -201,14 +212,19 @@ impl SessionAffinityTracker {
             }
         }
 
-        // 4. All idle slots are assigned to other sessions.
+        // 4. All idle slots are actively assigned to other recent sessions (< idle_reclaim_secs).
         if !allow_eviction {
             return None;
         }
 
         // Pick an idle slot whose assigned session was active longest ago (LRU eviction).
+        let all_assigned_slots: HashMap<usize, Instant> = {
+            let read = self.sessions.read().ok()?;
+            read.values().map(|e| (e.slot_id, e.last_active)).collect()
+        };
+
         let mut candidates: Vec<usize> = (0..self.max_slots).collect();
-        candidates.sort_by_key(|slot| assigned_slots.get(slot).copied().unwrap_or(now));
+        candidates.sort_by_key(|slot| all_assigned_slots.get(slot).copied().unwrap_or(now));
 
         for slot in candidates {
             if !self.slot_busy[slot].swap(true, Ordering::SeqCst) {
@@ -361,5 +377,23 @@ mod tests {
         // When allow_eviction = true (e.g. after queue timeout threshold), it can evict LRU slot
         let evict = tracker.try_acquire_slot_opt("session-3", 300, true);
         assert!(evict.is_some(), "Should evict assigned slot when allow_eviction is true");
+    }
+
+    #[test]
+    fn test_idle_lease_reclaim_without_eviction_flag() {
+        // Tracker with 0s idle reclaim threshold: once a slot is released, it is immediately reclaimable
+        let tracker = SessionAffinityTracker::with_idle_reclaim(true, 1, 0);
+
+        let (s1, _) = tracker.try_acquire_slot_opt("session-1", 100, true).unwrap();
+        assert_eq!(s1, 0);
+        tracker.release_slot(s1);
+
+        // Session 2 arrives with allow_eviction = false.
+        // Because session-1's slot is idle and its lease expired (>= 0s), session-2 acquires it immediately!
+        let s2 = tracker.try_acquire_slot_opt("session-2", 200, false);
+        assert!(s2.is_some(), "Expired idle slot should be reclaimable even with allow_eviction = false");
+        let (slot2, aff2) = s2.unwrap();
+        assert_eq!(slot2, 0);
+        assert_eq!(aff2, AffinityType::NewSlot);
     }
 }
