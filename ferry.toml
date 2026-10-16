@@ -26,9 +26,9 @@ timeout_secs = 300
 
 [affinity]
 enabled = true
-max_slots = 3
+max_slots = 5
 timeout_secs = 3600
-idle_reclaim_secs = 10
+idle_reclaim_secs = 60
 
 [condensation]
 enabled = true
