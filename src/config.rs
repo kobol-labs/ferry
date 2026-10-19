@@ -95,7 +95,7 @@ pub struct LocalConfig {
 fn default_local_base() -> String { "http://192.168.9.99:8080/v1".to_string() }
 fn default_local_key() -> String { "sk-strata-stevegaming".to_string() }
 fn default_local_model() -> String { "qwen3.8-flash-next-iq2_xs".to_string() }
-fn default_max_slots() -> usize { 3 }
+fn default_max_slots() -> usize { 4 }
 fn default_max_context_tokens() -> usize { 128000 }
 fn default_total_kv_token_budget() -> usize { 390000 }
 fn default_adaptive_squeezing() -> bool { true }

@@ -6,9 +6,9 @@ name = "strata"
 api_base = "http://192.168.9.99:8080/v1"
 api_key = "sk-strata-stevegaming"
 model = "qwen3.8-flash-next-iq2_xs"
-max_slots = 3
+max_slots = 4
 max_context_tokens = 256000
-total_kv_token_budget = 768000
+total_kv_token_budget = 1024000
 adaptive_squeezing = true
 adaptive_squeeze_ratio = 1.35
 timeout_secs = 240
@@ -26,7 +26,7 @@ timeout_secs = 300
 
 [affinity]
 enabled = true
-max_slots = 5
+max_slots = 4
 timeout_secs = 3600
 idle_reclaim_secs = 60
 
