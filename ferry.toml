@@ -15,7 +15,7 @@ timeout_secs = 240
 connect_timeout_secs = 5
 circuit_breaker_threshold = 3
 probe_interval_secs = 5
-queue_timeout_ms = 25000
+queue_timeout_ms = 45000
 
 [cloud]
 name = "minimax"
@@ -49,7 +49,7 @@ enable_constraint_ledger = true
 protect_static_prefix = true
 fold_repeated_tool_failures = true
 rolling_compaction = true
-compact_threshold_tokens = 28000
+compact_threshold_tokens = 16000
 compact_keep_recent_turns = 3
 
 [telemetry]
