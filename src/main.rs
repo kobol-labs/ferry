@@ -119,6 +119,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn background Pushgateway telemetry pusher if enabled
+    if state.config.telemetry.enabled {
+        let push_metrics = state.metrics.clone();
+        let push_url = format!(
+            "{}/metrics/job/{}",
+            state.config.telemetry.pushgateway_url.trim_end_matches('/'),
+            state.config.telemetry.job_name
+        );
+        let push_interval = std::time::Duration::from_secs(state.config.telemetry.push_interval_secs);
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(4))
+                .build()
+                .unwrap_or_default();
+
+            info!(
+                url = %push_url,
+                interval_secs = push_interval.as_secs(),
+                "Ferry Pushgateway telemetry exporter active"
+            );
+
+            loop {
+                tokio::time::sleep(push_interval).await;
+                let payload = push_metrics.prometheus_metrics();
+                if let Err(err) = client.post(&push_url).body(payload).send().await {
+                    tracing::debug!(url = %push_url, error = %err, "Failed to push metrics to Pushgateway");
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         // Universal endpoints
         .route("/health", get(health_handler))
@@ -386,6 +417,14 @@ async fn chat_completions_handler(
 ) -> Response {
     let req_id = state.request_id_counter.fetch_add(1, Ordering::Relaxed);
     let session_id = extract_session_id(&headers, &body);
+
+    if let Some(pillar) = headers
+        .get("x-sentinel-pillar")
+        .or_else(|| headers.get("x-pillar"))
+        .and_then(|h| h.to_str().ok())
+    {
+        state.metrics.record_pillar(pillar);
+    }
 
     // 1. Fast-path deterministic response cache check (for non-streaming temperature <= 0.05)
     let cache_allowed = match headers.get("x-ferry-cache").and_then(|h| h.to_str().ok()) {

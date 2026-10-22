@@ -15,6 +15,8 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub affinity: AffinityConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +283,7 @@ impl Config {
             condensation: CondenserConfig::default(),
             cache: CacheConfig::default(),
             affinity: AffinityConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 
@@ -387,6 +390,47 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_IDLE_RECLAIM_SECS").or_else(|_| std::env::var("FERRY_AFFINITY_IDLE_RECLAIM_SECS")) {
             if let Ok(n) = v.parse() { self.affinity.idle_reclaim_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_TELEMETRY_ENABLED") {
+            if let Some(b) = parse_bool(&v) { self.telemetry.enabled = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_PUSHGATEWAY_URL") {
+            self.telemetry.pushgateway_url = v;
+            self.telemetry.enabled = true;
+        }
+        if let Ok(v) = std::env::var("FERRY_TELEMETRY_JOB") {
+            self.telemetry.job_name = v;
+        }
+        if let Ok(v) = std::env::var("FERRY_TELEMETRY_INTERVAL_SECS") {
+            if let Ok(n) = v.parse() { self.telemetry.push_interval_secs = n; }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    #[serde(default = "default_telemetry_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_pushgateway_url")]
+    pub pushgateway_url: String,
+    #[serde(default = "default_push_interval_secs")]
+    pub push_interval_secs: u64,
+    #[serde(default = "default_job_name")]
+    pub job_name: String,
+}
+
+fn default_telemetry_enabled() -> bool { false }
+fn default_pushgateway_url() -> String { "http://10.10.10.101:9091".to_string() }
+fn default_push_interval_secs() -> u64 { 5 }
+fn default_job_name() -> String { "sentry_ferry".to_string() }
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_telemetry_enabled(),
+            pushgateway_url: default_pushgateway_url(),
+            push_interval_secs: default_push_interval_secs(),
+            job_name: default_job_name(),
         }
     }
 }

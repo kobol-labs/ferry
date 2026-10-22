@@ -60,6 +60,11 @@ pub struct MetricsTracker {
     // Orchestrator priority metrics
     pub orchestrator_requests: AtomicU64,
     pub orchestrator_spillover: AtomicU64,
+
+    // Sentinel Pillar metrics
+    pub security_requests: AtomicU64,
+    pub fuzzer_requests: AtomicU64,
+    pub explorer_requests: AtomicU64,
 }
 
 impl Default for MetricsTracker {
@@ -116,6 +121,10 @@ impl Default for MetricsTracker {
 
             orchestrator_requests: AtomicU64::new(0),
             orchestrator_spillover: AtomicU64::new(0),
+
+            security_requests: AtomicU64::new(0),
+            fuzzer_requests: AtomicU64::new(0),
+            explorer_requests: AtomicU64::new(0),
         }
     }
 }
@@ -176,6 +185,10 @@ pub struct StatsSnapshot {
 
     pub orchestrator_requests_total: u64,
     pub orchestrator_spillover_total: u64,
+
+    pub security_requests_total: u64,
+    pub fuzzer_requests_total: u64,
+    pub explorer_requests_total: u64,
 }
 
 impl MetricsTracker {
@@ -455,6 +468,10 @@ impl MetricsTracker {
 
             orchestrator_requests_total: self.orchestrator_requests.load(Ordering::Relaxed),
             orchestrator_spillover_total: self.orchestrator_spillover.load(Ordering::Relaxed),
+
+            security_requests_total: self.security_requests.load(Ordering::Relaxed),
+            fuzzer_requests_total: self.fuzzer_requests.load(Ordering::Relaxed),
+            explorer_requests_total: self.explorer_requests.load(Ordering::Relaxed),
         }
     }
 
@@ -550,7 +567,12 @@ impl MetricsTracker {
               ferry_orchestrator_requests_total {orchestrator_total}\n\
               # HELP ferry_orchestrator_spillover_total Total orchestrator turns spilled to cloud due to local saturation\n\
               # TYPE ferry_orchestrator_spillover_total counter\n\
-              ferry_orchestrator_spillover_total {orchestrator_spill}\n",
+              ferry_orchestrator_spillover_total {orchestrator_spill}\n\
+              # HELP ferry_pillar_requests_total Total requests processed per sentinel pipeline pillar\n\
+              # TYPE ferry_pillar_requests_total counter\n\
+              ferry_pillar_requests_total{{pillar=\"security\"}} {sec_reqs}\n\
+              ferry_pillar_requests_total{{pillar=\"fuzzer\"}} {fuzz_reqs}\n\
+              ferry_pillar_requests_total{{pillar=\"explorer\"}} {exp_reqs}\n",
             total = s.total_requests,
             local = s.local_requests,
             cloud = s.cloud_requests,
@@ -595,7 +617,19 @@ impl MetricsTracker {
             last_queue = s.last_queue_wait_ms,
             orchestrator_total = s.orchestrator_requests_total,
             orchestrator_spill = s.orchestrator_spillover_total,
+            sec_reqs = s.security_requests_total,
+            fuzz_reqs = s.fuzzer_requests_total,
+            exp_reqs = s.explorer_requests_total,
         )
+    }
+
+    pub fn record_pillar(&self, pillar: &str) {
+        match pillar.to_lowercase().as_str() {
+            "security" => { self.security_requests.fetch_add(1, Ordering::Relaxed); }
+            "fuzzer" => { self.fuzzer_requests.fetch_add(1, Ordering::Relaxed); }
+            "explorer" => { self.explorer_requests.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
     }
 
     pub fn record_affinity(&self, is_hit: bool) {

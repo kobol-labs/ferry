@@ -51,3 +51,9 @@ fold_repeated_tool_failures = true
 rolling_compaction = true
 compact_threshold_tokens = 28000
 compact_keep_recent_turns = 3
+
+[telemetry]
+enabled = true
+pushgateway_url = "http://10.10.10.101:9091"
+push_interval_secs = 5
+job_name = "sentry_ferry"
