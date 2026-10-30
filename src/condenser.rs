@@ -455,6 +455,9 @@ impl ContextCondenser {
         }
 
         let mut summary_lines = Vec::new();
+        let mut preserved_endpoints: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut preserved_auth: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut preserved_anomalies: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let num_compacted = split_idx - start_idx;
 
         for msg in &messages[start_idx..split_idx] {
@@ -464,29 +467,75 @@ impl ContextCondenser {
                     if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                         let snippet: String = content.chars().take(250).collect();
                         summary_lines.push(format!("• [User Request]: {}", snippet.trim()));
+                        collect_discovered_entities(content, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
                     }
                 }
                 "assistant" => {
                     if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
                         for tc in tool_calls {
                             let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("tool");
-                            summary_lines.push(format!("• [Executed Tool]: {}", name));
+                            let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("");
+
+                            let args_snippet = if !args.is_empty() {
+                                extract_compact_tool_arguments(args)
+                            } else {
+                                String::new()
+                            };
+
+                            if args_snippet.is_empty() {
+                                summary_lines.push(format!("• [Executed Tool]: {}", name));
+                            } else {
+                                summary_lines.push(format!("• [Executed Tool]: {}({})", name, args_snippet));
+                            }
+
+                            collect_discovered_entities(args, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
                         }
                     } else if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                         let snippet: String = content.chars().take(250).collect();
                         summary_lines.push(format!("• [Assistant Finding]: {}", snippet.trim()));
+                        collect_discovered_entities(content, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
                     }
                 }
                 "tool" => {
                     let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                     if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                        let first_line = content.lines().next().unwrap_or("").trim();
-                        let snippet: String = first_line.chars().take(150).collect();
-                        summary_lines.push(format!("  └─ [{name} result]: {}", snippet));
+                        collect_discovered_entities(content, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
+
+                        let signal_line = content.lines().find(|l| {
+                            let lower = l.to_ascii_lowercase();
+                            DIAGNOSTIC_SIGNALS.iter().any(|sig| lower.contains(sig))
+                        });
+
+                        if let Some(sig) = signal_line {
+                            let snippet: String = sig.trim().chars().take(180).collect();
+                            summary_lines.push(format!("  └─ [{name} result]: ⚠️ Signal: {}", snippet));
+                        } else {
+                            let first_line = content.lines().next().unwrap_or("").trim();
+                            let snippet: String = first_line.chars().take(150).collect();
+                            summary_lines.push(format!("  └─ [{name} result]: {}", snippet));
+                        }
                     }
                 }
                 _ => {}
             }
+        }
+
+        let mut entity_lines = Vec::new();
+        if !preserved_endpoints.is_empty() {
+            let ep_list: Vec<&str> = preserved_endpoints.iter().take(10).map(|s| s.as_str()).collect();
+            entity_lines.push(format!("• Discovered Endpoints: {}", ep_list.join(", ")));
+        }
+        if !preserved_auth.is_empty() {
+            let auth_list: Vec<&str> = preserved_auth.iter().take(8).map(|s| s.as_str()).collect();
+            entity_lines.push(format!("• Active Auth/Session Artifacts: {}", auth_list.join(", ")));
+        }
+        if !preserved_anomalies.is_empty() {
+            let anom_list: Vec<&str> = preserved_anomalies.iter().take(8).map(|s| s.as_str()).collect();
+            entity_lines.push(format!("• Flagged Security Discoveries: {}", anom_list.join("; ")));
+        }
+        if !entity_lines.is_empty() {
+            summary_lines.push("\n[Preserved Security Discoveries & Entities]".to_string());
+            summary_lines.extend(entity_lines);
         }
 
         let summary_text = format!(
@@ -517,7 +566,63 @@ impl ContextCondenser {
             compacted_chars: new_chars,
         })
     }
+}
 
+pub fn extract_compact_tool_arguments(args_json: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<Value>(args_json) {
+        if let Some(obj) = val.as_object() {
+            for key in &["cmd", "command", "CommandLine", "url", "path", "endpoint", "query", "script"] {
+                if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
+                    let snippet: String = v.chars().take(120).collect();
+                    return format!("{}=\"{}\"", key, snippet.trim());
+                }
+            }
+        }
+    }
+    let snippet: String = args_json.chars().take(100).collect();
+    snippet.trim().to_string()
+}
+
+pub fn collect_discovered_entities(
+    text: &str,
+    endpoints: &mut std::collections::BTreeSet<String>,
+    auth: &mut std::collections::BTreeSet<String>,
+    anomalies: &mut std::collections::BTreeSet<String>,
+) {
+    for token in text.split_whitespace() {
+        let clean = token.trim_matches(|c: char| c == ',' || c == ';' || c == '(' || c == ')' || c == '"' || c == '\'' || c == '[' || c == ']' || c == '<' || c == '>' || c == '{' || c == '}');
+        let upper = clean.to_ascii_uppercase();
+
+        // 1. Endpoints & URLs
+        if (clean.starts_with("/api/") || clean.starts_with("http://") || clean.starts_with("https://")) && clean.len() < 80 {
+            endpoints.insert(clean.to_string());
+            if endpoints.len() > 15 {
+                let first = endpoints.iter().next().cloned().unwrap();
+                endpoints.remove(&first);
+            }
+        }
+
+        // 2. Auth artifacts: tokens, cookies, headers
+        if (clean.starts_with("sps_session") || clean.starts_with("token_version") || clean.starts_with("eyJ") || upper.starts_with("BEARER")) && clean.len() < 80 {
+            auth.insert(clean.to_string());
+            if auth.len() > 10 {
+                let first = auth.iter().next().cloned().unwrap();
+                auth.remove(&first);
+            }
+        }
+
+        // 3. Security Finding IDs (CVE, CWE, GHSA)
+        if (upper.starts_with("CVE-") || upper.starts_with("CWE-") || upper.starts_with("GHSA-")) && clean.len() < 40 {
+            anomalies.insert(clean.to_string());
+            if anomalies.len() > 10 {
+                let first = anomalies.iter().next().cloned().unwrap();
+                anomalies.remove(&first);
+            }
+        }
+    }
+}
+
+impl ContextCondenser {
     fn clean_single_chunk(&self, input: &str, stats: &mut CondensationStats) -> String {
         let mut text = input.to_string();
 
@@ -813,41 +918,106 @@ pub const DIAGNOSTIC_SIGNALS: &[&str] = &[
     "vulnerabilities",
     "cwe-",
     "cve-",
+    "ghsa-",
     "assert",
     "traceback",
     "syntaxerror",
     "typeerror",
     "referenceerror",
     "status 500",
+    "status 502",
+    "status 503",
+    "status 504",
+    "status 401",
+    "status 403",
+    "status 429",
     "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "unauthorized",
+    "forbidden",
+    "access denied",
+    "permission denied",
     "connection refused",
     "timed out",
     "timeout",
+    "sigsegv",
+    "segmentation fault",
+    "sql syntax",
+    "sqlite3.",
+    "syntax error near",
+    "unterminated quotation",
+    "sqli",
+    "xss",
+    "csrf",
+    "idor",
+    "ssrf",
+    "token_version",
+    "jwt",
+    "bearer",
+    "leak",
+    "bypass",
+    "unhandled",
+    "uncaught",
+    "nullpointer",
+    "stack overflow",
 ];
 
 /// Scans lines for diagnostic error signals and returns line index of the highest density signal region
 pub fn find_diagnostic_signal_index(lines: &[&str], start_idx: usize, end_idx: usize) -> Option<usize> {
-    if start_idx >= end_idx || lines.is_empty() {
-        return None;
-    }
-    let mut best_idx = None;
-    let mut best_score = 0;
+    let regions = find_diagnostic_signal_regions(lines, start_idx, end_idx);
+    regions.first().map(|(start, end)| (start + end) / 2)
+}
 
+/// Scans lines for diagnostic error signals and returns up to 3 non-overlapping signal windows (start_line, end_line)
+pub fn find_diagnostic_signal_regions(lines: &[&str], start_idx: usize, end_idx: usize) -> Vec<(usize, usize)> {
+    if start_idx >= end_idx || lines.is_empty() {
+        return Vec::new();
+    }
+    let mut signal_line_indices = Vec::new();
     for i in start_idx..end_idx.min(lines.len()) {
         let line_lower = lines[i].to_ascii_lowercase();
-        let mut score = 0;
-        for sig in DIAGNOSTIC_SIGNALS {
-            if line_lower.contains(sig) {
-                score += 10;
-            }
-        }
-        if score > best_score {
-            best_score = score;
-            best_idx = Some(i);
+        let has_signal = DIAGNOSTIC_SIGNALS.iter().any(|sig| line_lower.contains(sig));
+        if has_signal {
+            signal_line_indices.push(i);
         }
     }
+    if signal_line_indices.is_empty() {
+        return Vec::new();
+    }
 
-    best_idx
+    let mut regions = Vec::new();
+    let mut cur_start = signal_line_indices[0].saturating_sub(2).max(start_idx);
+    let mut cur_end = (signal_line_indices[0] + 5).min(end_idx);
+
+    for &idx in &signal_line_indices[1..] {
+        let win_start = idx.saturating_sub(2).max(start_idx);
+        let win_end = (idx + 5).min(end_idx);
+        if win_start <= cur_end + 2 {
+            if win_end - cur_start <= 12 {
+                cur_end = cur_end.max(win_end);
+            } else {
+                regions.push((cur_start, cur_end));
+                cur_start = win_start;
+                cur_end = win_end;
+                if regions.len() >= 3 {
+                    break;
+                }
+            }
+        } else {
+            regions.push((cur_start, cur_end));
+            cur_start = win_start;
+            cur_end = win_end;
+            if regions.len() >= 3 {
+                break;
+            }
+        }
+    }
+    if regions.len() < 3 && cur_start < cur_end {
+        regions.push((cur_start, cur_end));
+    }
+    regions
 }
 
 /// Truncates long tool content keeping head and tail lines with omission indicator.
@@ -866,12 +1036,44 @@ pub fn truncate_tool_content_smart(
 ) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= head_lines + tail_lines {
-        // Line count is small, do byte/char boundary truncation safely on UTF-8 boundaries
+        // Line count is small, do byte/char boundary truncation safely on UTF-8 boundaries.
+        // First check if the middle portion contains diagnostic/security signals before blind truncation!
         let head_target = 300.min(text.len() / 4);
         let tail_target = 300.min(text.len() / 4);
         let head_idx = safe_floor_char_boundary(text, head_target);
         let tail_start = text.len().saturating_sub(tail_target);
         let tail_idx = safe_ceil_char_boundary(text, tail_start);
+
+        if head_idx < tail_idx {
+            let mid_slice = &text[head_idx..tail_idx];
+            let mid_lower = mid_slice.to_ascii_lowercase();
+            for sig in DIAGNOSTIC_SIGNALS {
+                if let Some(pos_in_mid) = mid_lower.find(sig) {
+                    *signals_extracted += 1;
+                    let abs_pos = head_idx + pos_in_mid;
+                    let sig_start = safe_floor_char_boundary(text, abs_pos.saturating_sub(120).max(head_idx));
+                    let sig_end = safe_ceil_char_boundary(text, (abs_pos + sig.len() + 200).min(tail_idx));
+
+                    let head_part = &text[..head_idx];
+                    let signal_part = &text[sig_start..sig_end];
+                    let tail_part = &text[tail_idx..];
+
+                    let dropped_before = sig_start.saturating_sub(head_idx);
+                    let dropped_after = tail_idx.saturating_sub(sig_end);
+
+                    let mut out = head_part.to_string();
+                    if dropped_before > 0 {
+                        out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_before} characters of passing output ...]\n\n"));
+                    }
+                    out.push_str(signal_part);
+                    if dropped_after > 0 {
+                        out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_after} characters ...]\n\n"));
+                    }
+                    out.push_str(tail_part);
+                    return out;
+                }
+            }
+        }
 
         let head_str = &text[..head_idx];
         let tail_str = &text[tail_idx..];
@@ -885,30 +1087,33 @@ pub fn truncate_tool_content_smart(
         );
     }
 
-    // Check if middle lines contain diagnostic failure signals
+    // Multi-line smart truncation with multi-region signal preservation
     let mid_start = head_lines;
     let mid_end = lines.len().saturating_sub(tail_lines);
-    if let Some(signal_line_idx) = find_diagnostic_signal_index(&lines, mid_start, mid_end) {
-        *signals_extracted += 1;
-        let win_start = signal_line_idx.saturating_sub(4).max(head_lines);
-        let win_end = (signal_line_idx + 8).min(mid_end);
+    let signal_regions = find_diagnostic_signal_regions(&lines, mid_start, mid_end);
 
+    if !signal_regions.is_empty() {
+        *signals_extracted += signal_regions.len();
         let head_part = lines[..head_lines].join("\n");
-        let signal_part = lines[win_start..win_end].join("\n");
         let tail_part = lines[lines.len() - tail_lines..].join("\n");
 
-        let dropped_before = win_start.saturating_sub(head_lines);
-        let dropped_after = mid_end.saturating_sub(win_end);
-
         let mut out = head_part;
-        if dropped_before > 0 {
-            out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_before} lines of passing logs ...]\n\n"));
-        } else {
-            out.push('\n');
+        let mut last_pos = head_lines;
+
+        for (r_start, r_end) in signal_regions {
+            let dropped = r_start.saturating_sub(last_pos);
+            if dropped > 0 {
+                out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped} lines of passing logs ...]\n\n"));
+            } else {
+                out.push('\n');
+            }
+            out.push_str(&lines[r_start..r_end].join("\n"));
+            last_pos = r_end;
         }
-        out.push_str(&signal_part);
-        if dropped_after > 0 {
-            out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_after} lines ...]\n\n"));
+
+        let final_dropped = mid_end.saturating_sub(last_pos);
+        if final_dropped > 0 {
+            out.push_str(&format!("\n\n[... Ferry Proxy: truncated {final_dropped} lines ...]\n\n"));
         } else {
             out.push('\n');
         }
@@ -1558,5 +1763,111 @@ mod tests {
         assert!(cleaned.contains("[... Ferry Proxy: 5 directory entries in node_modules/ suppressed ...]"));
         assert!(cleaned.contains("./Cargo.toml"));
         assert!(!cleaned.contains("./node_modules/c/index.js"));
+    }
+
+    #[test]
+    fn test_multi_region_diagnostic_signal_preservation() {
+        let mut lines = Vec::new();
+        // Head lines
+        for i in 0..5 {
+            lines.push(format!("HEAD line {}", i));
+        }
+        // Filler
+        for i in 0..30 {
+            lines.push(format!("filler passing log {}", i));
+        }
+        // First diagnostic signal region
+        lines.push("CRITICAL ERROR: SQL syntax error near 'OR 1=1' in table users".to_string());
+        // Filler
+        for i in 0..30 {
+            lines.push(format!("more passing info {}", i));
+        }
+        // Second diagnostic signal region
+        lines.push("ALERT: 500 Internal Server Error: unhandled nullpointer exception".to_string());
+        // Filler
+        for i in 0..30 {
+            lines.push(format!("tail filler {}", i));
+        }
+        // Tail lines
+        for i in 0..5 {
+            lines.push(format!("TAIL line {}", i));
+        }
+
+        let full_text = lines.join("\n");
+        let mut signals_extracted = 0;
+        let truncated = truncate_tool_content_smart(&full_text, 5, 5, &mut signals_extracted);
+
+        assert!(signals_extracted >= 2, "Expected at least 2 distinct signals extracted");
+        assert!(truncated.contains("HEAD line 0"));
+        assert!(truncated.contains("TAIL line 4"));
+        assert!(truncated.contains("SQL syntax error near 'OR 1=1'"));
+        assert!(truncated.contains("500 Internal Server Error"));
+        assert!(truncated.contains("truncated"));
+    }
+
+    #[test]
+    fn test_single_line_diagnostic_signal_preservation() {
+        let prefix = "A".repeat(400);
+        let signal = "status 500: Database transaction failed with sqlite3.OperationalError";
+        let suffix = "B".repeat(400);
+        let single_line = format!("{}{}{}", prefix, signal, suffix);
+
+        let mut signals_extracted = 0;
+        let truncated = truncate_tool_content_smart(&single_line, 10, 10, &mut signals_extracted);
+
+        assert_eq!(signals_extracted, 1);
+        assert!(truncated.contains("sqlite3.OperationalError"));
+        assert!(truncated.contains("truncated"));
+    }
+
+    #[test]
+    fn test_rolling_context_compaction_preserves_security_entities() {
+        let config = CondenserConfig {
+            rolling_compaction: true,
+            compact_threshold_tokens: 50,
+            compact_keep_recent_turns: 1,
+            ..Default::default()
+        };
+        let condenser = ContextCondenser::new(config);
+
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "Security Audit System" },
+                { "role": "user", "content": "Analyze authorization endpoints" },
+                {
+                    "role": "assistant",
+                    "content": "Probing backup endpoints",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "run_command",
+                                "arguments": "{\"cmd\": \"curl -s http://sentinel-target:3000/api/backup -H 'Authorization: Bearer sps_session=xyz123'\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "name": "run_command",
+                    "content": "HTTP/1.1 401 Unauthorized\n{\"error\": \"Invalid token_version for CVE-2026-9999\"}\nMore lines\n".repeat(20)
+                },
+                { "role": "user", "content": "Next step user" },
+                { "role": "assistant", "content": "Next step reply" }
+            ]
+        });
+
+        let stats = condenser.rolling_compact(&mut body);
+        assert!(stats.is_some());
+
+        let msgs = body["messages"].as_array().unwrap();
+        let checkpoint = msgs[1]["content"].as_str().unwrap();
+
+        assert!(checkpoint.contains("[Preserved Security Discoveries & Entities]"));
+        assert!(checkpoint.contains("http://sentinel-target:3000/api/backup") || checkpoint.contains("/api/backup"));
+        assert!(checkpoint.contains("sps_session") || checkpoint.contains("token_version"));
+        assert!(checkpoint.contains("CVE-2026-9999"));
+        assert!(checkpoint.contains("⚠️ Signal:"));
     }
 }

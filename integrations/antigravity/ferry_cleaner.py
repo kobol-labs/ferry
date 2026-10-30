@@ -35,16 +35,50 @@ DIAGNOSTIC_SIGNALS = [
     "vulnerabilities",
     "cwe-",
     "cve-",
+    "ghsa-",
     "assert",
     "traceback",
     "syntaxerror",
     "typeerror",
     "referenceerror",
     "status 500",
+    "status 502",
+    "status 503",
+    "status 504",
+    "status 401",
+    "status 403",
+    "status 429",
     "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "unauthorized",
+    "forbidden",
+    "access denied",
+    "permission denied",
     "connection refused",
     "timed out",
     "timeout",
+    "sigsegv",
+    "segmentation fault",
+    "sql syntax",
+    "sqlite3.",
+    "syntax error near",
+    "unterminated quotation",
+    "sqli",
+    "xss",
+    "csrf",
+    "idor",
+    "ssrf",
+    "token_version",
+    "jwt",
+    "bearer",
+    "leak",
+    "bypass",
+    "unhandled",
+    "uncaught",
+    "nullpointer",
+    "stack overflow",
 ]
 
 # Tuning constants
@@ -311,10 +345,10 @@ def truncate_signal_aware(text: str, head_lines: int = DEFAULT_HEAD_LINES, tail_
         banner = f"\n[... Ferry Cleaner: Truncated {dropped_lines} lines (~{dropped_chars} chars) ...]\n"
         return '\n'.join(head) + banner + '\n'.join(tail)
 
-    # Group signals with 1 line of context around them
+    # Group signals with 3 lines before and 4 lines after of context around them
     selected_mid_indices = set()
     for idx in signal_line_indices:
-        for offset in range(-1, 2):
+        for offset in range(-3, 5):
             target = idx + offset
             if 0 <= target < len(mid):
                 selected_mid_indices.add(target)
