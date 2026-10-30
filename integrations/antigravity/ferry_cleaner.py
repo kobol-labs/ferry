@@ -279,7 +279,7 @@ def try_minify_json(text: str) -> str:
     if (trimmed.startswith('{') and trimmed.endswith('}')) or (trimmed.startswith('[') and trimmed.endswith(']')):
         try:
             parsed = json.loads(trimmed)
-            minified = json.dumps(parsed, separators=(',', ':'))
+            minified = json.dumps(parsed, separators=(',', ':'), ensure_ascii=False)
             if len(minified) < len(trimmed):
                 return minified
         except Exception:
@@ -421,6 +421,7 @@ def run_command_wrapped(command_str: str) -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
         executable="/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh",
     )
     stdout_raw, _ = proc.communicate()
@@ -475,7 +476,10 @@ def main():
 
     if len(sys.argv) > 1 and sys.argv[1] == "--":
         # Run command passed as arguments
-        cmd_to_run = " ".join(sys.argv[2:])
+        if len(sys.argv) == 3:
+            cmd_to_run = sys.argv[2]
+        else:
+            cmd_to_run = " ".join(sys.argv[2:])
         exit_code = run_command_wrapped(cmd_to_run)
         sys.exit(exit_code)
 

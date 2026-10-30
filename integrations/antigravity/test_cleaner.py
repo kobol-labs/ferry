@@ -148,4 +148,12 @@ p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, tex
 diff_output, _ = p.communicate(normal_code_diff)
 print("Normal code diff preserved:", "authenticateUser" in diff_output)
 assert "authenticateUser" in diff_output, "BUG: Normal application code diff was pruned!"
-print("\n>>> ALL 11 TESTS PASSED WITH ZERO BUGS! <<<")
+
+print("\n================ TEST 12: SAFETY - NEVER CRASH ON BINARY / NON-UTF8 STDOUT ================")
+binary_cmd = f"python3 '{FERRY}' -- 'python3 -c \"import os; os.write(1, bytes([128, 129, 130]))\"'"
+res = subprocess.run(binary_cmd, shell=True, capture_output=True, text=True)
+print("Binary execution exit code:", res.returncode)
+assert res.returncode == 0, "BUG: Process crashed on non-UTF8 bytes!"
+print("Binary output handled safely without crash!")
+
+print("\n>>> ALL 12 TESTS PASSED WITH ZERO BUGS! <<<")
