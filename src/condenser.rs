@@ -1091,6 +1091,45 @@ const LOCKFILE_EXTENSIONS: &[&str] = &[
     ".bundle.css",
 ];
 
+const COMMON_CODE_EXTS: &[&str] = &[
+    ".rs", ".py", ".js", ".ts", ".go", ".json", ".toml", ".yaml", ".yml",
+    ".md", ".txt", ".html", ".css", ".sh", ".c", ".cpp", ".h", ".sql"
+];
+
+fn is_base64_or_hex_payload(token: &str) -> bool {
+    if token.len() < 120 {
+        return false;
+    }
+    if token.starts_with('/') || token.starts_with("./") || token.starts_with("../") || token.starts_with("http://") || token.starts_with("https://") {
+        return false;
+    }
+    if COMMON_CODE_EXTS.iter().any(|ext| token.ends_with(ext)) {
+        return false;
+    }
+    if token.matches('/').count() >= 2 {
+        return false;
+    }
+    true
+}
+
+fn is_directory_listing_line(line: &str, category: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains(category) {
+        return false;
+    }
+    if trimmed.contains(';') || trimmed.contains('{') || trimmed.contains('}') || trimmed.contains('=') {
+        return false;
+    }
+    if trimmed.starts_with("import ") || trimmed.starts_with("from ")
+        || trimmed.starts_with("def ") || trimmed.starts_with("class ")
+        || trimmed.starts_with("const ") || trimmed.starts_with("let ")
+        || trimmed.starts_with("var ") || trimmed.starts_with("//")
+        || trimmed.starts_with("/*") || trimmed.starts_with('*') || trimmed.starts_with('#') {
+        return false;
+    }
+    true
+}
+
 /// Prunes verbose diff bodies of lockfiles and generated asset bundles in git diff output.
 pub fn prune_git_diff_lockfiles(input: &str) -> (String, usize) {
     if !input.contains("diff --git ") {
@@ -1110,15 +1149,9 @@ pub fn prune_git_diff_lockfiles(input: &str) -> (String, usize) {
     for chunk in &chunks[1..] {
         out.push_str("diff --git ");
         let first_line = chunk.lines().next().unwrap_or("");
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
 
-        let mut is_target_file = false;
-        if parts.len() >= 2 {
-            let target_path = parts[1].strip_prefix("b/").or_else(|| parts[1].strip_prefix("a/")).unwrap_or(parts[1]);
-            let filename = target_path.rsplit('/').next().unwrap_or(target_path);
-            is_target_file = LOCKFILE_NAMES.contains(&filename)
-                || LOCKFILE_EXTENSIONS.iter().any(|ext| filename.ends_with(ext));
-        }
+        let is_target_file = LOCKFILE_NAMES.iter().any(|name| first_line.contains(&format!("/{name}")) || first_line.ends_with(name))
+            || LOCKFILE_EXTENSIONS.iter().any(|ext| first_line.contains(ext));
 
         if is_target_file {
             let mut adds = 0;
@@ -1135,7 +1168,7 @@ pub fn prune_git_diff_lockfiles(input: &str) -> (String, usize) {
                 for line in chunk.lines() {
                     out.push_str(line);
                     out.push('\n');
-                    if line.starts_with("+++") {
+                    if line.starts_with("+++") || line.starts_with("@@") {
                         break;
                     }
                 }
@@ -1174,18 +1207,20 @@ pub fn suppress_base64_and_hex_blobs(input: &str) -> (String, usize) {
 
         while let Some(data_idx) = remainder.find("data:") {
             if let Some(semi_idx) = remainder[data_idx..].find(";base64,") {
-                let base64_start = data_idx + semi_idx + 8;
-                let base64_len = remainder[base64_start..]
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
-                    .count();
+                if semi_idx < 64 && !remainder[data_idx..data_idx + semi_idx].contains(' ') {
+                    let base64_start = data_idx + semi_idx + 8;
+                    let base64_len = remainder[base64_start..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
+                        .count();
 
-                if base64_len >= 80 {
-                    processed_line.push_str(&remainder[..base64_start]);
-                    processed_line.push_str(&format!("[... Ferry Proxy: base64 payload ({base64_len} chars) suppressed ...]"));
-                    remainder = &remainder[base64_start + base64_len..];
-                    suppressed_count += 1;
-                    continue;
+                    if base64_len >= 80 {
+                        processed_line.push_str(&remainder[..base64_start]);
+                        processed_line.push_str(&format!("[... Ferry Proxy: base64 payload ({base64_len} chars) suppressed ...]"));
+                        remainder = &remainder[base64_start + base64_len..];
+                        suppressed_count += 1;
+                        continue;
+                    }
                 }
             }
             processed_line.push_str(&remainder[..data_idx + 5]);
@@ -1201,7 +1236,7 @@ pub fn suppress_base64_and_hex_blobs(input: &str) -> (String, usize) {
             if is_b64_char(c) {
                 current_token.push(c);
             } else {
-                if current_token.len() >= 120 {
+                if is_base64_or_hex_payload(&current_token) {
                     line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
                     suppressed_count += 1;
                 } else {
@@ -1211,7 +1246,7 @@ pub fn suppress_base64_and_hex_blobs(input: &str) -> (String, usize) {
                 line_tokens.push(c.to_string());
             }
         }
-        if current_token.len() >= 120 {
+        if is_base64_or_hex_payload(&current_token) {
             line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
             suppressed_count += 1;
         } else {
@@ -1257,7 +1292,7 @@ pub fn shield_directory_traversals(input: &str) -> (String, usize) {
         let mut matched_cat = None;
 
         for (pattern, cat) in DIR_SHIELD_PATTERNS {
-            if line.contains(pattern) {
+            if is_directory_listing_line(line, pattern) {
                 matched_cat = Some(*cat);
                 break;
             }
@@ -1265,7 +1300,7 @@ pub fn shield_directory_traversals(input: &str) -> (String, usize) {
 
         if let Some(cat) = matched_cat {
             let start_run = idx;
-            while idx < lines.len() && lines[idx].contains(cat) {
+            while idx < lines.len() && is_directory_listing_line(lines[idx], cat) {
                 idx += 1;
             }
             let run_count = idx - start_run;

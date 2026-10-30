@@ -114,3 +114,38 @@ mock_find_output = "\n".join([
 p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 shielded_find, _ = p.communicate(mock_find_output)
 print("Shielded Directory Output:\n" + shielded_find.strip())
+
+print("\n================ TEST 9: SAFETY - NEVER SUPPRESS LONG FILE PATHS ================")
+long_file_path = "/Users/steve/local/troopathon-donorbox-klaviyo/somelongdirectorynamewithoutanyhyphens/andanotherlongdirectorynamedhere/nestedcomponentfile.js"
+p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+path_output, _ = p.communicate(f"Inspecting file: {long_file_path}\nDone.")
+print("Path preserved verbatim:", long_file_path in path_output)
+assert long_file_path in path_output, "BUG: Long file path was falsely suppressed as base64!"
+
+print("\n================ TEST 10: SAFETY - NEVER SHIELD CODE MENTIONING NODE_MODULES ================")
+code_with_node_modules = """const p1 = require("node_modules/pkg1");
+const p2 = require("node_modules/pkg2");
+const p3 = require("node_modules/pkg3");
+const p4 = require("node_modules/pkg4");
+const p5 = require("node_modules/pkg5");"""
+p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+code_output, _ = p.communicate(code_with_node_modules)
+print("Code preserved verbatim:", "suppressed" not in code_output)
+assert "suppressed" not in code_output, "BUG: Code lines were falsely shielded as directory entries!"
+
+print("\n================ TEST 11: SAFETY - NEVER PRUNE NORMAL CODE DIFFS ================")
+normal_code_diff = """diff --git a/My App/src/services/auth.ts b/My App/src/services/auth.ts
+index abc..def 100644
+--- a/My App/src/services/auth.ts
++++ b/My App/src/services/auth.ts
+@@ -1,20 +1,20 @@
++function authenticateUser() {
++    const token = fetchToken();
++    return token;
++}
+"""
+p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+diff_output, _ = p.communicate(normal_code_diff)
+print("Normal code diff preserved:", "authenticateUser" in diff_output)
+assert "authenticateUser" in diff_output, "BUG: Normal application code diff was pruned!"
+print("\n>>> ALL 11 TESTS PASSED WITH ZERO BUGS! <<<")

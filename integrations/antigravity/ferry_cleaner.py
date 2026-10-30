@@ -148,6 +148,40 @@ def deduplicate_consecutive_lines(text: str) -> str:
     return '\n'.join(out)
 
 
+COMMON_CODE_EXTENSIONS = (
+    '.rs', '.py', '.js', '.ts', '.go', '.json', '.toml', '.yaml', '.yml',
+    '.md', '.txt', '.html', '.css', '.sh', '.c', '.cpp', '.h', '.sql'
+)
+
+
+def is_base64_or_hex_payload(token: str) -> bool:
+    """Verifies a token is truly a base64/hex payload and NOT a file path, URL, or code token."""
+    if len(token) < 120:
+        return False
+    # Never suppress file paths, URLs, or command flags
+    if token.startswith('/') or token.startswith('./') or token.startswith('../') or token.startswith('http://') or token.startswith('https://'):
+        return False
+    if any(token.endswith(ext) for ext in COMMON_CODE_EXTENSIONS):
+        return False
+    # Directory paths have multiple forward slashes
+    if token.count('/') >= 2:
+        return False
+    return True
+
+
+def is_directory_listing_line(line: str, category: str) -> bool:
+    """Checks whether a line is a real directory path listing rather than code mentioning a directory."""
+    trimmed = line.strip()
+    if category not in trimmed:
+        return False
+    # If line has code syntax or comment characters, it's code/comment, not a directory listing
+    if ';' in trimmed or '{' in trimmed or '}' in trimmed or '=' in trimmed:
+        return False
+    if trimmed.startswith(('import ', 'from ', 'def ', 'class ', 'const ', 'let ', 'var ', '//', '/*', '*', '#')):
+        return False
+    return True
+
+
 def prune_git_diff_lockfiles(text: str) -> str:
     """Prunes verbose diff bodies of lockfiles and generated asset bundles in git diff output."""
     if "diff --git " not in text:
@@ -159,13 +193,9 @@ def prune_git_diff_lockfiles(text: str) -> str:
     for chunk in chunks[1:]:
         lines = chunk.splitlines()
         header_line = lines[0] if lines else ""
-        parts = header_line.split()
-        target_file = ""
-        if len(parts) >= 2:
-            target_file = re.sub(r'^[ab]/', '', parts[1])
 
-        filename = os.path.basename(target_file)
-        is_lockfile = filename in LOCKFILE_NAMES or any(filename.endswith(ext) for ext in LOCKFILE_EXTENSIONS)
+        is_lockfile = any(f"/{name}" in header_line or header_line.endswith(name) for name in LOCKFILE_NAMES) or \
+                      any(ext in header_line for ext in LOCKFILE_EXTENSIONS)
 
         if is_lockfile:
             adds = sum(1 for l in lines if l.startswith('+') and not l.startswith('+++'))
@@ -173,13 +203,9 @@ def prune_git_diff_lockfiles(text: str) -> str:
 
             if (adds + dels) > 10:
                 header_lines = []
-                body_started = False
                 for line in lines:
-                    if not body_started:
-                        header_lines.append(line)
-                        if line.startswith("+++"):
-                            body_started = True
-                    else:
+                    header_lines.append(line)
+                    if line.startswith("+++") or line.startswith("@@"):
                         break
 
                 out.append('\n'.join(header_lines) + f"\n[... Ferry: lockfile/asset diff suppressed (+{adds} lines, -{dels} lines) ...]\n")
@@ -204,6 +230,8 @@ def suppress_base64_blobs(text: str) -> str:
 
     def _raw_base64_sub(m):
         raw = m.group(1)
+        if not is_base64_or_hex_payload(raw):
+            return m.group(0)
         return f"[... Ferry: base64/hex blob ({len(raw)} chars) suppressed ...]"
 
     text = BASE64_RAW_RE.sub(_raw_base64_sub, text)
@@ -222,14 +250,14 @@ def shield_directory_traversals(text: str) -> str:
         line = lines[idx]
         matched_cat = None
         for pattern, cat in DIR_SHIELD_PATTERNS:
-            if pattern in line:
+            if is_directory_listing_line(line, cat):
                 matched_cat = cat
                 break
 
         if matched_cat is not None:
             start_run = idx
             while idx < len(lines):
-                if matched_cat in lines[idx]:
+                if is_directory_listing_line(lines[idx], matched_cat):
                     idx += 1
                 else:
                     break
