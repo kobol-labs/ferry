@@ -18,6 +18,9 @@ This script maintains strict behavioral parity with `src/condenser.rs`:
 | **Progress Overwrites** | `strip_progress_artifacts` | `strip_progress_artifacts` (collapses `\r` overwrites) |
 | **Whitespace Collapse** | `collapse_excess_whitespace` | `collapse_excess_whitespace` (max 2 consecutive newlines) |
 | **Repetition Folding** | `fold_repeated_tool_failures` | `deduplicate_consecutive_lines` (folds 3+ identical consecutive lines) |
+| **Lockfile Diff Pruning** | `prune_git_diff_lockfiles` | `prune_git_diff_lockfiles` (collapses package-lock/Cargo.lock/bundle diffs) |
+| **Base64 / Hex Suppression** | `suppress_base64_and_hex_blobs` | `suppress_base64_blobs` (replaces large base64/hex blobs with size banner) |
+| **Directory Traversal Shielding** | `shield_directory_traversals` | `shield_directory_traversals` (folds 4+ runs of node_modules/.git/target) |
 | **JSON Minification** | `minify_json_outputs` | `try_minify_json` (compacts pretty-printed JSON) |
 | **Signal-Aware Truncation** | `truncate_tool_content_smart` | `truncate_signal_aware` (head 20, tail 15, scans `DIAGNOSTIC_SIGNALS`) |
 | **Diagnostic Signals** | 21 canonical signals (`DIAGNOSTIC_SIGNALS`) | Exact 21 signals mirrored in `DIAGNOSTIC_SIGNALS` |

@@ -54,6 +54,43 @@ DEFAULT_TAIL_LINES = 15
 
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
 
+LOCKFILE_NAMES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "poetry.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "mix.lock",
+    "flake.lock",
+}
+
+LOCKFILE_EXTENSIONS = (
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".bundle.js",
+    ".bundle.css",
+)
+
+BASE64_DATA_URI_RE = re.compile(
+    r'(data:[a-zA-Z0-9.+_-]+/[a-zA-Z0-9.+_-]+;base64,)[A-Za-z0-9+/=]{80,}'
+)
+BASE64_RAW_RE = re.compile(r'(?<=[\s"\'`=:,(\[])([A-Za-z0-9+/=]{120,})(?=[\s"\'`:,;)\]]|$)')
+
+DIR_SHIELD_PATTERNS = [
+    ("node_modules/", "node_modules/"),
+    (".git/", ".git/"),
+    ("target/debug/", "target/debug/"),
+    ("target/release/", "target/release/"),
+    ("__pycache__/", "__pycache__/"),
+    (".venv/", ".venv/"),
+    ("/venv/", "venv/"),
+    ("vendor/bundle/", "vendor/bundle/"),
+    (".cache/", ".cache/"),
+]
+
 
 def strip_ansi(text: str) -> str:
     """Removes terminal ANSI color and cursor codes."""
@@ -107,6 +144,103 @@ def deduplicate_consecutive_lines(text: str) -> str:
             out.append(f"[... Repeated {repeat_count - 1} more times: {prev_line.strip()} ...]")
         else:
             out.append(prev_line)
+
+    return '\n'.join(out)
+
+
+def prune_git_diff_lockfiles(text: str) -> str:
+    """Prunes verbose diff bodies of lockfiles and generated asset bundles in git diff output."""
+    if "diff --git " not in text:
+        return text
+
+    chunks = text.split("diff --git ")
+    out = [chunks[0]]
+
+    for chunk in chunks[1:]:
+        lines = chunk.splitlines()
+        header_line = lines[0] if lines else ""
+        parts = header_line.split()
+        target_file = ""
+        if len(parts) >= 2:
+            target_file = re.sub(r'^[ab]/', '', parts[1])
+
+        filename = os.path.basename(target_file)
+        is_lockfile = filename in LOCKFILE_NAMES or any(filename.endswith(ext) for ext in LOCKFILE_EXTENSIONS)
+
+        if is_lockfile:
+            adds = sum(1 for l in lines if l.startswith('+') and not l.startswith('+++'))
+            dels = sum(1 for l in lines if l.startswith('-') and not l.startswith('---'))
+
+            if (adds + dels) > 10:
+                header_lines = []
+                body_started = False
+                for line in lines:
+                    if not body_started:
+                        header_lines.append(line)
+                        if line.startswith("+++"):
+                            body_started = True
+                    else:
+                        break
+
+                out.append('\n'.join(header_lines) + f"\n[... Ferry: lockfile/asset diff suppressed (+{adds} lines, -{dels} lines) ...]\n")
+                continue
+
+        out.append(chunk)
+
+    return "diff --git ".join(out)
+
+
+def suppress_base64_blobs(text: str) -> str:
+    """Replaces large inline base64 payloads and continuous hex blobs with size banners."""
+    if len(text) < 120:
+        return text
+
+    def _data_uri_sub(m):
+        prefix = m.group(1)
+        payload_len = len(m.group(0)) - len(prefix)
+        return f"{prefix}[... Ferry: base64 payload ({payload_len} chars) suppressed ...]"
+
+    text = BASE64_DATA_URI_RE.sub(_data_uri_sub, text)
+
+    def _raw_base64_sub(m):
+        raw = m.group(1)
+        return f"[... Ferry: base64/hex blob ({len(raw)} chars) suppressed ...]"
+
+    text = BASE64_RAW_RE.sub(_raw_base64_sub, text)
+    return text
+
+
+def shield_directory_traversals(text: str) -> str:
+    """Folds long runs of file traversals into dependency or cache directories."""
+    lines = text.splitlines()
+    if len(lines) < 6:
+        return text
+
+    out: List[str] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        matched_cat = None
+        for pattern, cat in DIR_SHIELD_PATTERNS:
+            if pattern in line:
+                matched_cat = cat
+                break
+
+        if matched_cat is not None:
+            start_run = idx
+            while idx < len(lines):
+                if matched_cat in lines[idx]:
+                    idx += 1
+                else:
+                    break
+            run_count = idx - start_run
+            if run_count >= 4:
+                out.append(f"[... Ferry: {run_count} directory entries in {matched_cat} suppressed ...]")
+            else:
+                out.extend(lines[start_run:idx])
+        else:
+            out.append(line)
+            idx += 1
 
     return '\n'.join(out)
 
@@ -195,6 +329,9 @@ def record_stats(command_str: str, raw_text: str, cleaned_text: str):
             "ansi_stripped": bool(ANSI_ESCAPE_RE.search(raw_text)),
             "deduped": "[... Repeated" in cleaned_text,
             "truncated": "[... Ferry Cleaner: Truncated" in cleaned_text,
+            "lockfile_pruned": "[... Ferry: lockfile/asset diff suppressed" in cleaned_text,
+            "base64_suppressed": "[... Ferry: base64" in cleaned_text,
+            "dir_shielded": "directory entries in " in cleaned_text,
         }
 
         history = []
@@ -229,10 +366,19 @@ def condense_output(raw_text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     # 4. Deduplicate consecutive repeated lines
     text = deduplicate_consecutive_lines(text)
 
-    # 5. Try minifying JSON if applicable
+    # 5. Prune git diff lockfile and generated bundle noise
+    text = prune_git_diff_lockfiles(text)
+
+    # 6. Suppress massive Base64 payloads and hex blobs
+    text = suppress_base64_blobs(text)
+
+    # 7. Shield directory traversal bombs (node_modules, .git, target, etc.)
+    text = shield_directory_traversals(text)
+
+    # 8. Try minifying JSON if applicable
     text = try_minify_json(text)
 
-    # 6. Signal-aware smart truncation if size exceeds limit
+    # 9. Signal-aware smart truncation if size exceeds limit
     if len(text) > max_chars:
         text = truncate_signal_aware(text)
 

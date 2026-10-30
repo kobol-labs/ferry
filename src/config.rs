@@ -203,6 +203,12 @@ pub struct CondenserConfig {
     pub deduplicate_lines: bool,
     #[serde(default = "default_minify_json")]
     pub minify_json_outputs: bool,
+    #[serde(default = "default_prune_lockfile_diffs")]
+    pub prune_lockfile_diffs: bool,
+    #[serde(default = "default_suppress_base64_blobs")]
+    pub suppress_base64_blobs: bool,
+    #[serde(default = "default_shield_dir_traversals")]
+    pub shield_dir_traversals: bool,
     #[serde(default = "default_fold_repeated_tool_failures")]
     pub fold_repeated_tool_failures: bool,
     #[serde(default = "default_rolling_compaction")]
@@ -224,6 +230,9 @@ fn default_tail_lines() -> usize { 10 }
 fn default_strip_terminal_noise() -> bool { true }
 fn default_deduplicate_lines() -> bool { true }
 fn default_minify_json() -> bool { true }
+fn default_prune_lockfile_diffs() -> bool { true }
+fn default_suppress_base64_blobs() -> bool { true }
+fn default_shield_dir_traversals() -> bool { true }
 fn default_fold_repeated_tool_failures() -> bool { true }
 fn default_rolling_compaction() -> bool { true }
 fn default_compact_threshold_tokens() -> u64 { 64000 }
@@ -243,6 +252,9 @@ impl Default for CondenserConfig {
             strip_terminal_noise: default_strip_terminal_noise(),
             deduplicate_lines: default_deduplicate_lines(),
             minify_json_outputs: default_minify_json(),
+            prune_lockfile_diffs: default_prune_lockfile_diffs(),
+            suppress_base64_blobs: default_suppress_base64_blobs(),
+            shield_dir_traversals: default_shield_dir_traversals(),
             fold_repeated_tool_failures: default_fold_repeated_tool_failures(),
             rolling_compaction: default_rolling_compaction(),
             compact_threshold_tokens: default_compact_threshold_tokens(),

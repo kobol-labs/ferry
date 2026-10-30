@@ -22,6 +22,9 @@ pub struct CondensationStats {
     pub ledger_vetoed_count: usize,
     pub signals_extracted_count: usize,
     pub loops_collapsed_count: usize,
+    pub lockfile_diffs_pruned_count: usize,
+    pub base64_blobs_suppressed_count: usize,
+    pub dir_traversals_shielded_count: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -569,6 +572,33 @@ impl ContextCondenser {
             }
         }
 
+        // 4. Prune verbose lockfile diffs in git output
+        if self.config.prune_lockfile_diffs && text.contains("diff --git ") {
+            let (cleaned, count) = prune_git_diff_lockfiles(&text);
+            if count > 0 {
+                text = cleaned;
+                stats.lockfile_diffs_pruned_count += count;
+            }
+        }
+
+        // 5. Suppress massive Base64 payloads and hex blobs
+        if self.config.suppress_base64_blobs && text.len() >= 120 {
+            let (cleaned, count) = suppress_base64_and_hex_blobs(&text);
+            if count > 0 {
+                text = cleaned;
+                stats.base64_blobs_suppressed_count += count;
+            }
+        }
+
+        // 6. Shield directory traversal bombs (node_modules, .git, target, etc.)
+        if self.config.shield_dir_traversals && text.contains('\n') {
+            let (cleaned, count) = shield_directory_traversals(&text);
+            if count > 0 {
+                text = cleaned;
+                stats.dir_traversals_shielded_count += count;
+            }
+        }
+
         text
     }
 }
@@ -1041,6 +1071,221 @@ pub fn collapse_excess_whitespace(input: &str) -> (String, bool) {
     (out, modified)
 }
 
+const LOCKFILE_NAMES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "poetry.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "mix.lock",
+    "flake.lock",
+];
+
+const LOCKFILE_EXTENSIONS: &[&str] = &[
+    ".min.js",
+    ".min.css",
+    ".map",
+    ".bundle.js",
+    ".bundle.css",
+];
+
+/// Prunes verbose diff bodies of lockfiles and generated asset bundles in git diff output.
+pub fn prune_git_diff_lockfiles(input: &str) -> (String, usize) {
+    if !input.contains("diff --git ") {
+        return (input.to_string(), 0);
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut pruned_count = 0;
+
+    let chunks: Vec<&str> = input.split("diff --git ").collect();
+    if chunks.is_empty() {
+        return (input.to_string(), 0);
+    }
+
+    out.push_str(chunks[0]);
+
+    for chunk in &chunks[1..] {
+        out.push_str("diff --git ");
+        let first_line = chunk.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+        let mut is_target_file = false;
+        if parts.len() >= 2 {
+            let target_path = parts[1].strip_prefix("b/").or_else(|| parts[1].strip_prefix("a/")).unwrap_or(parts[1]);
+            let filename = target_path.rsplit('/').next().unwrap_or(target_path);
+            is_target_file = LOCKFILE_NAMES.contains(&filename)
+                || LOCKFILE_EXTENSIONS.iter().any(|ext| filename.ends_with(ext));
+        }
+
+        if is_target_file {
+            let mut adds = 0;
+            let mut dels = 0;
+            for line in chunk.lines() {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    adds += 1;
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    dels += 1;
+                }
+            }
+
+            if (adds + dels) > 10 {
+                for line in chunk.lines() {
+                    out.push_str(line);
+                    out.push('\n');
+                    if line.starts_with("+++") {
+                        break;
+                    }
+                }
+                out.push_str(&format!(
+                    "[... Ferry Proxy: lockfile/asset diff suppressed (+{adds} lines, -{dels} lines) ...]\n"
+                ));
+                pruned_count += 1;
+                continue;
+            }
+        }
+
+        out.push_str(chunk);
+    }
+
+    (out, pruned_count)
+}
+
+/// Replaces large inline base64 payloads and continuous hex blobs with size banners.
+pub fn suppress_base64_and_hex_blobs(input: &str) -> (String, usize) {
+    if input.len() < 120 {
+        return (input.to_string(), 0);
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut suppressed_count = 0;
+
+    for line in input.lines() {
+        if line.len() < 120 {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        let mut processed_line = String::with_capacity(line.len());
+        let mut remainder = line;
+
+        while let Some(data_idx) = remainder.find("data:") {
+            if let Some(semi_idx) = remainder[data_idx..].find(";base64,") {
+                let base64_start = data_idx + semi_idx + 8;
+                let base64_len = remainder[base64_start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
+                    .count();
+
+                if base64_len >= 80 {
+                    processed_line.push_str(&remainder[..base64_start]);
+                    processed_line.push_str(&format!("[... Ferry Proxy: base64 payload ({base64_len} chars) suppressed ...]"));
+                    remainder = &remainder[base64_start + base64_len..];
+                    suppressed_count += 1;
+                    continue;
+                }
+            }
+            processed_line.push_str(&remainder[..data_idx + 5]);
+            remainder = &remainder[data_idx + 5..];
+        }
+        processed_line.push_str(remainder);
+
+        let mut line_tokens = Vec::new();
+        let mut current_token = String::new();
+        let is_b64_char = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=';
+
+        for c in processed_line.chars() {
+            if is_b64_char(c) {
+                current_token.push(c);
+            } else {
+                if current_token.len() >= 120 {
+                    line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
+                    suppressed_count += 1;
+                } else {
+                    line_tokens.push(current_token.clone());
+                }
+                current_token.clear();
+                line_tokens.push(c.to_string());
+            }
+        }
+        if current_token.len() >= 120 {
+            line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
+            suppressed_count += 1;
+        } else {
+            line_tokens.push(current_token);
+        }
+
+        out.push_str(&line_tokens.concat());
+        out.push('\n');
+    }
+
+    if out.ends_with('\n') && !input.ends_with('\n') {
+        out.pop();
+    }
+
+    (out, suppressed_count)
+}
+
+const DIR_SHIELD_PATTERNS: &[(&str, &str)] = &[
+    ("node_modules/", "node_modules/"),
+    (".git/", ".git/"),
+    ("target/debug/", "target/debug/"),
+    ("target/release/", "target/release/"),
+    ("__pycache__/", "__pycache__/"),
+    (".venv/", ".venv/"),
+    ("/venv/", "venv/"),
+    ("vendor/bundle/", "vendor/bundle/"),
+    (".cache/", ".cache/"),
+];
+
+/// Folds long runs of file traversals into dependency or cache directories.
+pub fn shield_directory_traversals(input: &str) -> (String, usize) {
+    let lines: Vec<&str> = input.lines().collect();
+    if lines.len() < 6 {
+        return (input.to_string(), 0);
+    }
+
+    let mut out = Vec::new();
+    let mut shielded_count = 0;
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        let mut matched_cat = None;
+
+        for (pattern, cat) in DIR_SHIELD_PATTERNS {
+            if line.contains(pattern) {
+                matched_cat = Some(*cat);
+                break;
+            }
+        }
+
+        if let Some(cat) = matched_cat {
+            let start_run = idx;
+            while idx < lines.len() && lines[idx].contains(cat) {
+                idx += 1;
+            }
+            let run_count = idx - start_run;
+            if run_count >= 4 {
+                out.push(format!("[... Ferry Proxy: {run_count} directory entries in {cat} suppressed ...]"));
+                shielded_count += run_count;
+            } else {
+                for i in start_run..idx {
+                    out.push(lines[i].to_string());
+                }
+            }
+        } else {
+            out.push(line.to_string());
+            idx += 1;
+        }
+    }
+
+    (out.join("\n"), shielded_count)
+}
+
 /// Zero-allocation character counter across all OpenAI-compatible message formats.
 /// Traverses existing in-memory JSON values without serializing to strings.
 pub fn count_message_chars(messages: &[Value]) -> usize {
@@ -1245,5 +1490,38 @@ mod tests {
         assert_eq!(last_user["content"], "Recent active user request");
         assert_eq!(last_asst["role"], "assistant");
         assert_eq!(last_asst["content"], "Recent active assistant reply");
+    }
+
+    #[test]
+    fn test_prune_git_diff_lockfiles() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -10,30 +10,30 @@\n+name = \"foo\"\n+version = \"1.0.0\"\n+checksum = \"abc123def456\"\n+name = \"bar\"\n+version = \"2.0.0\"\n+checksum = \"789xyz\"\n+name = \"baz\"\n+version = \"3.0.0\"\n+checksum = \"456qwe\"\n+name = \"qux\"\n+version = \"4.0.0\"\n+checksum = \"rtyuiop\"\n";
+        let (pruned, count) = prune_git_diff_lockfiles(diff);
+        assert_eq!(count, 1);
+        assert!(pruned.contains("diff --git a/src/lib.rs b/src/lib.rs"));
+        assert!(pruned.contains("+new"));
+        assert!(pruned.contains("diff --git a/Cargo.lock b/Cargo.lock"));
+        assert!(pruned.contains("[... Ferry Proxy: lockfile/asset diff suppressed"));
+        assert!(!pruned.contains("checksum = \"abc123def456\""));
+    }
+
+    #[test]
+    fn test_suppress_base64_and_hex_blobs() {
+        let raw = format!("data:image/png;base64,{}\nNormal log line\nRaw token: {}", "A".repeat(150), "B".repeat(160));
+        let (cleaned, count) = suppress_base64_and_hex_blobs(&raw);
+        assert!(count >= 2);
+        assert!(cleaned.contains("[... Ferry Proxy: base64 payload (150 chars) suppressed ...]"));
+        assert!(cleaned.contains("[... Ferry Proxy: base64/hex blob (160 chars) suppressed ...]"));
+        assert!(cleaned.contains("Normal log line"));
+    }
+
+    #[test]
+    fn test_shield_directory_traversals() {
+        let listing = "./src/main.rs\n./node_modules/a/index.js\n./node_modules/b/index.js\n./node_modules/c/index.js\n./node_modules/d/index.js\n./node_modules/e/index.js\n./Cargo.toml\n";
+        let (cleaned, count) = shield_directory_traversals(listing);
+        assert_eq!(count, 5);
+        assert!(cleaned.contains("./src/main.rs"));
+        assert!(cleaned.contains("[... Ferry Proxy: 5 directory entries in node_modules/ suppressed ...]"));
+        assert!(cleaned.contains("./Cargo.toml"));
+        assert!(!cleaned.contains("./node_modules/c/index.js"));
     }
 }
