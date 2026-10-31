@@ -52,8 +52,8 @@ enable_constraint_ledger = true
 protect_static_prefix = true
 fold_repeated_tool_failures = true
 rolling_compaction = true
-compact_threshold_tokens = 16000
-compact_keep_recent_turns = 3
+compact_threshold_tokens = 48000
+compact_keep_recent_turns = 8
 
 [telemetry]
 enabled = true

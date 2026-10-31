@@ -412,11 +412,6 @@ impl ContextCondenser {
 
         let messages = body.get_mut("messages")?.as_array_mut()?;
         let orig_chars = count_message_chars(messages);
-        let est_tokens = estimate_tokens_from_chars(orig_chars);
-
-        if est_tokens <= self.config.compact_threshold_tokens {
-            return None;
-        }
 
         let total_msgs = messages.len();
         let keep_recent = self.config.compact_keep_recent_turns * 2;
@@ -427,6 +422,15 @@ impl ContextCondenser {
         // Preserve system message if present at index 0
         let has_system = messages.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system");
         let start_idx = if has_system { 1 } else { 0 };
+
+        // Exclude static system prompt when measuring against the compaction threshold
+        // so that heavy system prompts (schemas, threat models) do not starve conversational memory.
+        let conv_chars = count_message_chars(&messages[start_idx..]);
+        let conv_tokens = estimate_tokens_from_chars(conv_chars);
+
+        if conv_tokens <= self.config.compact_threshold_tokens {
+            return None;
+        }
 
         let mut split_idx = total_msgs.saturating_sub(keep_recent);
         if split_idx <= start_idx {
