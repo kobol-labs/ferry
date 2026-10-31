@@ -103,7 +103,7 @@ fn default_total_kv_token_budget() -> usize { 390000 }
 fn default_adaptive_squeezing() -> bool { true }
 fn default_adaptive_squeeze_ratio() -> f64 { 1.35 }
 fn default_timeout_secs() -> u64 { 90 }
-fn default_connect_timeout_secs() -> u64 { 3 }
+fn default_connect_timeout_secs() -> u64 { 10 }
 fn default_circuit_breaker_threshold() -> u32 { 3 }
 fn default_probe_interval_secs() -> u64 { 5 }
 fn default_queue_timeout_ms() -> u64 { 15000 }

@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let probe_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(probe_state.config.local.connect_timeout_secs))
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(probe_state.config.local.connect_timeout_secs.max(10)))
             .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_default();
