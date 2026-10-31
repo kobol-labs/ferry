@@ -469,8 +469,18 @@ impl ContextCondenser {
             match role {
                 "user" => {
                     if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                        let snippet: String = content.chars().take(250).collect();
-                        summary_lines.push(format!("• [User Request]: {}", snippet.trim()));
+                        if content.starts_with("[Historical Context Checkpoint:") {
+                            // Unpack existing summary lines from prior compaction pass so historical context is merged seamlessly
+                            for line in content.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.starts_with("• ") || trimmed.starts_with("└─ ") {
+                                    summary_lines.push(trimmed.to_string());
+                                }
+                            }
+                        } else {
+                            let snippet: String = content.chars().take(250).collect();
+                            summary_lines.push(format!("• [User Request]: {}", snippet.trim()));
+                        }
                         collect_discovered_entities(content, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
                     }
                 }
@@ -522,6 +532,16 @@ impl ContextCondenser {
                 }
                 _ => {}
             }
+        }
+
+        if summary_lines.len() > 35 {
+            let head = summary_lines[..10].to_vec();
+            let tail = summary_lines[summary_lines.len() - 20..].to_vec();
+            let omitted = summary_lines.len() - 30;
+            let mut bounded = head;
+            bounded.push(format!("• [... {} earlier milestones collapsed ...]", omitted));
+            bounded.extend(tail);
+            summary_lines = bounded;
         }
 
         let mut entity_lines = Vec::new();
@@ -1873,5 +1893,49 @@ mod tests {
         assert!(checkpoint.contains("sps_session") || checkpoint.contains("token_version"));
         assert!(checkpoint.contains("CVE-2026-9999"));
         assert!(checkpoint.contains("⚠️ Signal:"));
+    }
+
+    #[test]
+    fn test_repeated_rolling_compaction_merges_checkpoints_cleanly() {
+        let config = CondenserConfig {
+            rolling_compaction: true,
+            compact_threshold_tokens: 50,
+            compact_keep_recent_turns: 1,
+            ..Default::default()
+        };
+        let condenser = ContextCondenser::new(config);
+
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "You are a scanner." },
+                { "role": "user", "content": "First audit step" },
+                { "role": "assistant", "content": "Initial probing" },
+                { "role": "tool", "name": "scan", "content": "First tool output findings\n".repeat(30) },
+                { "role": "user", "content": "Recent active user request" },
+                { "role": "assistant", "content": "Recent active assistant reply" }
+            ]
+        });
+
+        let s1 = condenser.rolling_compact(&mut body);
+        assert!(s1.is_some());
+
+        let msgs = body["messages"].as_array_mut().unwrap();
+        msgs.push(json!({ "role": "user", "content": "Second audit step" }));
+        msgs.push(json!({ "role": "assistant", "content": "Second probing phase" }));
+        msgs.push(json!({ "role": "tool", "name": "scan2", "content": "Second tool output findings\n".repeat(30) }));
+        msgs.push(json!({ "role": "user", "content": "Latest user request" }));
+        msgs.push(json!({ "role": "assistant", "content": "Latest assistant reply" }));
+
+        let s2 = condenser.rolling_compact(&mut body);
+        assert!(s2.is_some());
+
+        let final_msgs = body["messages"].as_array().unwrap();
+        assert_eq!(final_msgs[0]["role"], "system");
+        assert_eq!(final_msgs[1]["role"], "user");
+
+        let checkpoint = final_msgs[1]["content"].as_str().unwrap();
+        assert!(!checkpoint.contains("• [User Request]: [Historical Context Checkpoint"));
+        assert!(checkpoint.contains("First audit step"));
+        assert!(checkpoint.contains("Second audit step"));
     }
 }
