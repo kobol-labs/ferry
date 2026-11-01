@@ -76,6 +76,10 @@ api_key = "sk-..."
 model = "MiniMax-M3"
 timeout_secs = 300
 
+[routing]
+# Default routing mode: "local-preferred" (default), "local-only", "hybrid", "cloud-only"
+default_route = "local-preferred"
+
 [condensation]
 # Enable transparent prompt context condensation before routing
 enabled = true
@@ -138,7 +142,7 @@ Clients can customize routing and condensation behavior on a per-request basis:
 | Header | Values | Description |
 | :--- | :--- | :--- |
 | `X-Ferry-Condense` | `true` \| `false` | Bypasses prompt condensation when set to `false`, `0`, or `no`. |
-| `X-Ferry-Route` | `local-only` \| `cloud-only` | `local-only` forces local hardware and returns HTTP 503 if unavailable (preventing cloud spend). `cloud-only` bypasses local hardware entirely. |
+| `X-Ferry-Route` | `local-preferred` \| `local-only` \| `hybrid` \| `cloud-only` | Controls routing tier. `local-preferred` (default) routes 100% locally with cloud spillover on queue timeout. `local-only` guarantees $0 spend by fast-failing with HTTP 503 if unavailable. `hybrid` segregates cognitive turns: routine/mechanical commands stay local, while hard logic / diagnostic failures escalate to Cloud and immediately revert to Local. `cloud-only` bypasses local hardware entirely. |
 
 #### Observability Response Headers
 Every response includes detailed routing metrics and CORS exposure headers:
@@ -178,6 +182,7 @@ Ferry supports full zero-config deployment by overriding any setting via environ
 | `FERRY_CLOUD_API_KEY` | `""` | Cloud provider API key |
 | `FERRY_CLOUD_MODEL` | `MiniMax-M3` | Cloud model name |
 | `FERRY_CLOUD_TIMEOUT_SECS` | `300` | Request timeout for cloud fallback |
+| `FERRY_DEFAULT_ROUTE` | `local-preferred` | Default routing mode (`local-preferred`, `local-only`, `hybrid`, `cloud-only`) |
 | `FERRY_CONDENSATION_ENABLED` | `true` | Enable/disable prompt context condensation |
 | `FERRY_DROP_HISTORICAL_REASONING` | `true` | Strip past reasoning / `<think>` blocks |
 | `FERRY_TRUNCATE_TOOL_OUTPUTS` | `true` | Truncate stale tool outputs |

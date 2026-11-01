@@ -16,7 +16,27 @@ pub struct Config {
     #[serde(default)]
     pub affinity: AffinityConfig,
     #[serde(default)]
+    pub routing: RoutingConfig,
+    #[serde(default)]
     pub telemetry: TelemetryConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    #[serde(default = "default_default_route")]
+    pub default_route: String,
+}
+
+fn default_default_route() -> String {
+    "local-preferred".to_string()
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            default_route: default_default_route(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +413,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_CACHE_TTL_SECS") {
             if let Ok(n) = v.parse() { self.cache.ttl_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_DEFAULT_ROUTE") {
+            if !v.trim().is_empty() { self.routing.default_route = v; }
         }
         if let Ok(v) = std::env::var("FERRY_AFFINITY_ENABLED") {
             if let Some(b) = parse_bool(&v) { self.affinity.enabled = b; }

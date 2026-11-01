@@ -11,6 +11,82 @@ pub enum TargetProvider {
     Cloud,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingMode {
+    LocalOnly,
+    LocalPreferred,
+    Hybrid,
+    CloudOnly,
+}
+
+impl RoutingMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_lowercase();
+        match s.as_str() {
+            "local-only" | "local" => Some(Self::LocalOnly),
+            "local-preferred" | "local-prefer" | "prefer-local" => Some(Self::LocalPreferred),
+            "hybrid" | "hybrid-smart" | "cognitive" => Some(Self::Hybrid),
+            "cloud-only" | "cloud" => Some(Self::CloudOnly),
+            _ => None,
+        }
+    }
+}
+
+pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
+    "panic:",
+    "fatal:",
+    "fatal error:",
+    "traceback (most recent call last):",
+    "nullpointerexception",
+    "segmentation fault",
+    "sigsegv",
+    "sigabrt",
+    "unhandled rejection",
+    "exception in thread",
+    "assertion failed",
+    "cwe-",
+    "cve-",
+    "vulnerability",
+    "security alert",
+    "injection vulnerability",
+    "buffer overflow",
+    "use-after-free",
+    "error[e",
+    "status: 500",
+    "status 500",
+    "status: 502",
+    "status 503",
+    "test failed",
+    "failing tests",
+    "failures:",
+    "failed (",
+    "build failed",
+    "compilation failed",
+];
+
+pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
+    "vulnerability",
+    "exploit",
+    "cve",
+    "audit",
+    "threat model",
+    "architect",
+    "refactor",
+    "diagnose",
+    "root cause",
+    "race condition",
+    "deadlock",
+    "memory leak",
+    "heap dump",
+    "decompile",
+    "disassemble",
+    "invariant",
+    "formal verification",
+    "algorithmic",
+    "security review",
+    "penetration",
+];
+
 pub struct RouteOverride {
     pub route: Option<String>,
     pub queue_timeout_ms: Option<u64>,
@@ -213,6 +289,111 @@ impl Router {
         false
     }
 
+    pub fn extract_message_text(msg: &Value) -> String {
+        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+            return content.to_string();
+        }
+        if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+            let mut text = String::new();
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    text.push_str(t);
+                    text.push('\n');
+                }
+            }
+            return text;
+        }
+        String::new()
+    }
+
+    pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
+        let messages = match body.get("messages").and_then(|m| m.as_array()) {
+            Some(m) if !m.is_empty() => m,
+            _ => return (false, "no messages in request body".to_string()),
+        };
+
+        let last_msg = match messages.last() {
+            Some(m) => m,
+            None => return (false, "empty messages array".to_string()),
+        };
+
+        let role = last_msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let text = Self::extract_message_text(last_msg);
+        let text_lower = text.to_lowercase();
+
+        match role {
+            "tool" => {
+                // Check for diagnostic failure signals, panics, or security alerts
+                for signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
+                    if text_lower.contains(signal) {
+                        return (true, format!("diagnostic signal detected in tool output: '{signal}'"));
+                    }
+                }
+                if text_lower.contains("error:") || text_lower.contains("[error]") || text_lower.contains("err:") {
+                    return (true, "error signal detected in tool output".to_string());
+                }
+                // Check for complex trace or diff (> 60 lines with trace/diff markers)
+                let lines = text.lines().count();
+                if lines > 60 && (text.contains("@@ -") || text.contains("   at ") || text.contains("File \"")) {
+                    return (true, format!("complex trace/diff output ({lines} lines) in tool output"));
+                }
+                (false, "mechanical tool execution".to_string())
+            }
+            "user" => {
+                let trimmed = text.trim();
+                let trimmed_lower = trimmed.to_lowercase();
+
+                // Procedural affirmations stay local
+                let procedural_words = [
+                    "yes", "no", "y", "n", "ok", "okay", "proceed", "continue",
+                    "go ahead", "approved", "run it", "sure", "next", "done", "cancel"
+                ];
+                if procedural_words.contains(&trimmed_lower.as_str()) {
+                    return (false, format!("procedural confirmation: '{trimmed}'"));
+                }
+
+                // Check for high-cognitive keywords
+                for kw in HARD_LOGIC_USER_KEYWORDS {
+                    if text_lower.contains(kw) {
+                        return (true, format!("cognitive prompt keyword: '{kw}'"));
+                    }
+                }
+
+                // Initial prompt framing escalation
+                let non_system_count = messages.iter().filter(|m| {
+                    m.get("role").and_then(|r| r.as_str()) != Some("system")
+                }).count();
+
+                if non_system_count <= 1 && trimmed.len() >= 80 {
+                    return (true, "initial task specification / prompt framing".to_string());
+                }
+
+                if trimmed.len() < 120 {
+                    return (false, "procedural user prompt".to_string());
+                }
+
+                (true, format!("substantive mid-session user prompt ({} chars)", trimmed.len()))
+            }
+            _ => {
+                // For assistant or other roles, inspect preceding message if available
+                if messages.len() >= 2 {
+                    let prev_msg = &messages[messages.len() - 2];
+                    let prev_role = prev_msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if prev_role == "tool" {
+                        let prev_text = Self::extract_message_text(prev_msg);
+                        let prev_lower = prev_text.to_lowercase();
+                        for signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
+                            if prev_lower.contains(signal) {
+                                return (true, format!("diagnostic signal in prior tool output: '{signal}'"));
+                            }
+                        }
+                    }
+                }
+                (false, "default mechanical turn".to_string())
+            }
+        }
+    }
+
     pub async fn decide(&self, body: &Value, route_override: Option<&str>) -> RouteDecision {
         self.decide_for_session(body, route_override, None, "default").await
     }
@@ -244,9 +425,14 @@ impl Router {
         session_id: &str,
     ) -> RouteDecision {
         let est_tokens = Self::estimate_tokens(body);
-        let local_only = matches!(route_override, Some("local-only") | Some("local"));
-        let local_prefer = matches!(route_override, Some("local-prefer") | Some("prefer-local"));
-        let cloud_only = matches!(route_override, Some("cloud-only") | Some("cloud"));
+        let effective_mode = route_override
+            .and_then(RoutingMode::parse)
+            .or_else(|| RoutingMode::parse(&self.config.routing.default_route))
+            .unwrap_or(RoutingMode::LocalPreferred);
+
+        let local_only = effective_mode == RoutingMode::LocalOnly;
+        let local_prefer = effective_mode == RoutingMode::LocalPreferred;
+        let cloud_only = effective_mode == RoutingMode::CloudOnly;
         let fast_mode = matches!(route_override, Some("fast") | Some("low-latency"));
 
         // Extract system prompt prefix hash to enable warm KV cache reuse across subagents
@@ -256,13 +442,13 @@ impl Router {
             .map(|arr| compute_prefix_hash(arr))
             .unwrap_or(0);
 
-        // 1. Force Cloud if client header requested cloud-only
+        // 1. Force Cloud if client header or configuration requested cloud-only
         if cloud_only {
             return RouteDecision {
                 target: TargetProvider::Cloud,
                 est_tokens,
                 is_spillover: false,
-                reason: "client header X-Ferry-Route requested cloud-only".to_string(),
+                reason: "routing mode cloud-only".to_string(),
                 local_only: false,
                 slot_guard: None,
                 slot_id: None,
@@ -309,11 +495,30 @@ impl Router {
             }
         }
 
+        // 4. Hybrid cognitive turn routing (escalate hard logic / diagnostics to Cloud; revert to Local for mechanical)
+        if effective_mode == RoutingMode::Hybrid {
+            let (is_hard, reason) = Self::is_hard_logic_turn(body);
+            if is_hard {
+                return RouteDecision {
+                    target: TargetProvider::Cloud,
+                    est_tokens,
+                    is_spillover: false,
+                    reason: format!("hybrid cognitive escalation: {reason}"),
+                    local_only: false,
+                    slot_guard: None,
+                    slot_id: None,
+                    is_affinity_hit: false,
+                    affinity_type: AffinityType::NewSlot,
+                    session_id: session_id.to_string(),
+                };
+            }
+        }
+
         let max_context = self.config.local.max_context_tokens as u64;
         let max_slots = self.config.local.max_slots;
         let total_kv_budget = self.config.local.total_kv_token_budget as u64;
 
-        // 4. Context window threshold check
+        // 5. Context window threshold check
         if est_tokens > max_context {
             return RouteDecision {
                 target: TargetProvider::Cloud,
@@ -329,7 +534,7 @@ impl Router {
             };
         }
 
-        // 5. Atomic local slot & token capacity acquisition with session & prefix affinity
+        // 6. Atomic local slot & token capacity acquisition with session & prefix affinity
         let is_orchestrator = Self::detect_orchestrator(body, session_id, route_override);
         if is_orchestrator {
             self.metrics.orchestrator_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -378,7 +583,7 @@ impl Router {
             60000
         } else if is_orchestrator {
             15000 // 15s fast-spillover for orchestrators so swarm is never blocked
-        } else if local_prefer {
+        } else if local_prefer || effective_mode == RoutingMode::Hybrid {
             45000
         } else if queue_timeout_ms == 0 {
             0
@@ -476,5 +681,122 @@ impl Router {
             affinity_type: AffinityType::NewSlot,
             session_id: session_id.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_routing_mode_parse() {
+        assert_eq!(RoutingMode::parse("local-only"), Some(RoutingMode::LocalOnly));
+        assert_eq!(RoutingMode::parse("local"), Some(RoutingMode::LocalOnly));
+        assert_eq!(RoutingMode::parse("LOCAL-ONLY"), Some(RoutingMode::LocalOnly));
+
+        assert_eq!(RoutingMode::parse("local-preferred"), Some(RoutingMode::LocalPreferred));
+        assert_eq!(RoutingMode::parse("local-prefer"), Some(RoutingMode::LocalPreferred));
+        assert_eq!(RoutingMode::parse("prefer-local"), Some(RoutingMode::LocalPreferred));
+
+        assert_eq!(RoutingMode::parse("hybrid"), Some(RoutingMode::Hybrid));
+        assert_eq!(RoutingMode::parse("hybrid-smart"), Some(RoutingMode::Hybrid));
+        assert_eq!(RoutingMode::parse("cognitive"), Some(RoutingMode::Hybrid));
+
+        assert_eq!(RoutingMode::parse("cloud-only"), Some(RoutingMode::CloudOnly));
+        assert_eq!(RoutingMode::parse("cloud"), Some(RoutingMode::CloudOnly));
+
+        assert_eq!(RoutingMode::parse("unknown"), None);
+        assert_eq!(RoutingMode::parse("fast"), None);
+    }
+
+    #[test]
+    fn test_hard_logic_diagnostic_signals_in_tool() {
+        // Panic in tool output -> hard logic escalation
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "run the integration tests"},
+                {"role": "assistant", "content": "running tests"},
+                {"role": "tool", "content": "thread 'main' panicked at 'panic: connection refused to 192.168.9.99:8080'"}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body);
+        assert!(is_hard);
+        assert!(reason.contains("panic:"));
+
+        // Status 500 error in tool output -> hard logic escalation
+        let body_500 = json!({
+            "messages": [
+                {"role": "tool", "content": "HTTP/1.1 500 Internal Server Error\nstatus 500\nDatabase down"}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_500);
+        assert!(is_hard);
+        assert!(reason.contains("status 500"));
+
+        // Vulnerability alert in tool output -> hard logic escalation
+        let body_cwe = json!({
+            "messages": [
+                {"role": "tool", "content": "Semgrep found CWE-79 reflected cross-site scripting vulnerability"}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_cwe);
+        assert!(is_hard);
+        assert!(reason.contains("cwe-") || reason.contains("vulnerability"));
+
+        // Clean tool output -> mechanical (local GPU)
+        let body_clean = json!({
+            "messages": [
+                {"role": "user", "content": "check container status"},
+                {"role": "assistant", "content": "running docker ps"},
+                {"role": "tool", "content": "CONTAINER ID   IMAGE      COMMAND                  CREATED         STATUS\n1a2b3c4d       nginx      \"/docker-entrypoint.…\"   2 minutes ago   Up 2 minutes"}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_clean);
+        assert!(!is_hard);
+        assert!(reason.contains("mechanical"));
+    }
+
+    #[test]
+    fn test_hard_logic_user_prompts() {
+        // Procedural confirmation -> mechanical (stays local)
+        let body_ok = json!({
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "yes"}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_ok);
+        assert!(!is_hard);
+        assert!(reason.contains("procedural"));
+
+        let body_proceed = json!({
+            "messages": [
+                {"role": "user", "content": "proceed"}
+            ]
+        });
+        let (is_hard, _) = Router::is_hard_logic_turn(&body_proceed);
+        assert!(!is_hard);
+
+        // User prompt with cognitive keyword -> hard logic escalation
+        let body_kw = json!({
+            "messages": [
+                {"role": "user", "content": "please conduct a security audit and find any vulnerability in this auth module"}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_kw);
+        assert!(is_hard);
+        assert!(reason.contains("cognitive prompt keyword"));
+
+        // Initial task prompt (> 80 chars) -> hard logic escalation
+        let body_initial = json!({
+            "messages": [
+                {"role": "system", "content": "You are an AI coding assistant."},
+                {"role": "user", "content": "Please implement cognitive task segregation and multi-tier routing in Ferry core keeping mechanical CLI commands on local hardware."}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_initial);
+        assert!(is_hard);
+        assert!(reason.contains("initial task specification"));
     }
 }

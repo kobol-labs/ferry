@@ -24,6 +24,14 @@ api_key = ""
 model = "MiniMax-M3"
 timeout_secs = 300
 
+[routing]
+# Default routing strategy:
+# - "local-preferred": 100% local GPU execution, only spilling over to cloud on queue timeout (45s) or VRAM/context exhaustion.
+# - "local-only": Enforces strict local GPU execution ($0 spend). Returns HTTP 503 if unavailable.
+# - "hybrid": Segregates turns based on cognitive complexity. Mechanical commands stay local; hard logic/diagnostic failures escalate to cloud, then immediately revert to local.
+# - "cloud-only": Bypasses local hardware entirely and routes directly to cloud.
+default_route = "local-preferred"
+
 [affinity]
 enabled = true
 max_slots = 4
