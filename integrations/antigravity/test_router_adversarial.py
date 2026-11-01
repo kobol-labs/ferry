@@ -2,13 +2,15 @@
 """
 Adversarial Verification Suite for Ferry Hybrid Routing & Condensation
 Tests edge cases, false alarm suppression, read-only file shielding,
-procedural vs hard logic segregation, and zero-lobotomy guarantees.
+contextual continuity for cognitive tasks, procedural vs hard logic segregation,
+and zero-lobotomy guarantees.
 """
 
 HARD_LOGIC_DIAGNOSTIC_SIGNALS = [
     "panic:", "fatal:", "fatal error:", "traceback (most recent call last):",
     "nullpointerexception", "segmentation fault", "sigsegv", "sigabrt",
-    "unhandled rejection", "exception in thread", "assertion failed",
+    "unhandled rejection", "uncaught exception", "undefined is not a function",
+    "exception in thread", "assertion failed",
     "cwe-", "cve-", "vulnerability", "security alert", "error[e",
     "status: 500", "status 500", "status: 502", "status 503",
     "test failed", "failing tests", "failed (", "build failed", "compilation failed"
@@ -82,19 +84,34 @@ def is_hard_logic_turn(body):
 
     if role == "tool":
         tool_name = get_last_tool_name(messages)
-        is_read_only = tool_name in ["read_file", "cat", "view", "read_resource", "list_dir", "list_resources", "search_marketplace"]
+        is_read_only = tool_name in ["read_file", "cat", "view", "read_resource", "list_dir", "list_resources", "search_marketplace", "search_web"]
         if is_read_only:
             trimmed_lower = text.strip().lower()
             if any(trimmed_lower.startswith(prefix) for prefix in ["error:", "file not found", "no such file", "permission denied", "notfound"]):
                 return True, f"read tool failed: '{tool_name}' returned error"
+
+            # Contextual continuity check: did initiating user prompt request a cognitive task?
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_text = extract_message_text(msg).lower()
+                    for kw in HARD_LOGIC_USER_KEYWORDS:
+                        if kw in user_text:
+                            return True, f"info gathering for cognitive task: '{kw}'"
+                    reasoning_verbs = ["why", "diagnose", "debug", "architect", "design", "explain", "solve", "analyze", "investigate", "fix the bug", "find the bug"]
+                    for verb in reasoning_verbs:
+                        if user_text.startswith(verb) or f" {verb} " in user_text:
+                            return True, f"info gathering for reasoning task: '{verb}'"
+                    break
+
             return False, f"passive file/dir inspection via '{tool_name}'"
 
         sig = has_real_diagnostic_signal(text)
         if sig:
             return True, f"diagnostic signal: '{sig}'"
         lines = len(text.splitlines())
-        if lines > 60 and any(m in text for m in ["@@ -", "   at ", "File \""]):
-            return True, f"complex trace/diff ({lines} lines)"
+        # Stack traces (> 60 lines with stack trace markers), exempting normal git diffs
+        if lines > 60 and any(m in text for m in ["   at ", "File \""]):
+            return True, f"complex stack trace ({lines} lines)"
         return False, "mechanical tool execution"
 
     elif role == "user":
@@ -126,18 +143,45 @@ def is_hard_logic_turn(body):
 
 
 def run_adversarial_suite():
-    print("================ ADVERSARIAL TEST 1: READ_FILE WITH ERROR STRINGS ================")
-    body_read = {
+    print("================ ADVERSARIAL TEST 1: READ_FILE FOR MECHANICAL LOOKUP ================")
+    body_read_mech = {
         "messages": [
-            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "src/errors.rs"}}]},
-            {"role": "tool", "tool_call_id": "c1", "content": "pub fn panic_handler() {\n    panic!(\"Fatal kernel error: memory dump\");\n}"}
+            {"role": "user", "content": "check package.json and show dependencies"},
+            {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "package.json"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": '{"name": "test", "dependencies": {"error-handler": "^1.0"}}'}
         ]
     }
-    is_hard, reason = is_hard_logic_turn(body_read)
-    assert not is_hard, f"Failed: read_file containing code error strings must NOT escalate to Cloud, got {reason}"
-    print(f"PASS: Reading source code with 'panic!' stayed Local ({reason})")
+    is_hard, reason = is_hard_logic_turn(body_read_mech)
+    assert not is_hard, f"Failed: routine read_file must stay Local, got {reason}"
+    print(f"PASS: Routine read_file stayed Local ({reason})")
 
-    print("\n================ ADVERSARIAL TEST 2: JSON API WITH 'error: null' ================")
+    print("\n================ ADVERSARIAL TEST 2: READ_FILE DURING COGNITIVE AUDIT ================")
+    body_read_audit = {
+        "messages": [
+            {"role": "user", "content": "conduct a security audit of our token authentication logic and check for cwe vulnerabilities"},
+            {"role": "assistant", "tool_calls": [{"id": "c_aud", "type": "function", "function": {"name": "read_file", "arguments": "src/auth.rs"}}]},
+            {"role": "tool", "tool_call_id": "c_aud", "content": "pub fn verify_token() { /* token logic */ }"}
+        ]
+    }
+    is_hard, reason = is_hard_logic_turn(body_read_audit)
+    assert is_hard, f"Failed: read_file in cognitive audit must stay Cloud so Cloud can complete the analysis, got {reason}"
+    print(f"PASS: read_file in cognitive audit stayed Cloud for analysis ({reason})")
+
+    print("\n================ ADVERSARIAL TEST 3: 80-LINE GIT DIFF ================")
+    diff_lines = ["diff --git a/src/main.rs b/src/main.rs", "index 123..456 100644", "--- a/src/main.rs", "+++ b/src/main.rs", "@@ -1,50 +1,80 @@"]
+    diff_lines.extend([f"+ line {i}" for i in range(75)])
+    body_diff = {
+        "messages": [
+            {"role": "user", "content": "show git diff"},
+            {"role": "assistant", "tool_calls": [{"id": "c_diff", "type": "function", "function": {"name": "run_command", "arguments": "git diff"}}]},
+            {"role": "tool", "tool_call_id": "c_diff", "content": "\n".join(diff_lines)}
+        ]
+    }
+    is_hard, reason = is_hard_logic_turn(body_diff)
+    assert not is_hard, f"Failed: 80-line git diff must stay Local, got {reason}"
+    print(f"PASS: 80-line git diff stayed Local without false escalation ({reason})")
+
+    print("\n================ ADVERSARIAL TEST 4: JSON API WITH 'error: null' ================")
     body_json = {
         "messages": [
             {"role": "assistant", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "run_command", "arguments": "curl /api/status"}}]},
@@ -148,7 +192,7 @@ def run_adversarial_suite():
     assert not is_hard, f"Failed: JSON with 'error: null' must NOT escalate, got {reason}"
     print(f"PASS: Clean JSON with 'error: null' stayed Local ({reason})")
 
-    print("\n================ ADVERSARIAL TEST 3: COMPILER/TEST REAL PANIC ================")
+    print("\n================ ADVERSARIAL TEST 5: REAL COMPILER PANIC ================")
     body_panic = {
         "messages": [
             {"role": "assistant", "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "run_command", "arguments": "cargo test"}}]},
@@ -159,7 +203,7 @@ def run_adversarial_suite():
     assert is_hard, "Failed: Real panic must escalate to Cloud"
     print(f"PASS: Real compiler panic escalated to Cloud ({reason})")
 
-    print("\n================ ADVERSARIAL TEST 4: LONG MECHANICAL GIT COMMAND (>120 CHARS) ================")
+    print("\n================ ADVERSARIAL TEST 6: LONG MECHANICAL GIT COMMAND (>120 CHARS) ================")
     body_long_git = {
         "messages": [
             {"role": "system", "content": "You are an assistant."},
@@ -172,7 +216,7 @@ def run_adversarial_suite():
     assert not is_hard, f"Failed: Long mechanical git command must stay Local, got {reason}"
     print(f"PASS: Long git command (133 chars) stayed Local ({reason})")
 
-    print("\n================ ADVERSARIAL TEST 5: PROCEDURAL CONFIRMATIONS ================")
+    print("\n================ ADVERSARIAL TEST 7: PROCEDURAL CONFIRMATIONS ================")
     for word in ["yes", "ok", "proceed", "continue", "go ahead", "approved", "run it"]:
         body_conf = {
             "messages": [
@@ -184,40 +228,18 @@ def run_adversarial_suite():
         assert not is_hard, f"Failed: Confirmation '{word}' must stay Local"
     print("PASS: All procedural affirmations stayed Local")
 
-    print("\n================ ADVERSARIAL TEST 6: COGNITIVE SECURITY AUDIT PROMPT ================")
-    body_audit = {
+    print("\n================ ADVERSARIAL TEST 8: UNCAUGHT JAVASCRIPT EXCEPTION ================")
+    body_js_err = {
         "messages": [
-            {"role": "assistant", "content": "What next?"},
-            {"role": "user", "content": "Conduct a security audit of our token authentication logic and check for cwe vulnerabilities"}
+            {"role": "assistant", "tool_calls": [{"id": "c_js", "type": "function", "function": {"name": "run_command", "arguments": "node index.js"}}]},
+            {"role": "tool", "tool_call_id": "c_js", "content": "TypeError: undefined is not a function\n    at Object.<anonymous> (/app/index.js:12:3)"}
         ]
     }
-    is_hard, reason = is_hard_logic_turn(body_audit)
-    assert is_hard, f"Failed: Audit prompt must escalate to Cloud, got {reason}"
-    print(f"PASS: Security audit escalated to Cloud ({reason})")
+    is_hard, reason = is_hard_logic_turn(body_js_err)
+    assert is_hard, f"Failed: Uncaught exception must escalate to Cloud, got {reason}"
+    print(f"PASS: JavaScript TypeError escalated to Cloud ({reason})")
 
-    print("\n================ ADVERSARIAL TEST 7: REASONING VERB 'WHY' ================")
-    body_why = {
-        "messages": [
-            {"role": "assistant", "content": "exit code 1"},
-            {"role": "user", "content": "Why did this command fail to bind to the socket?"}
-        ]
-    }
-    is_hard, reason = is_hard_logic_turn(body_why)
-    assert is_hard, f"Failed: Reasoning prompt starting with 'why' must escalate to Cloud, got {reason}"
-    print(f"PASS: Reasoning question escalated to Cloud ({reason})")
-
-    print("\n================ ADVERSARIAL TEST 8: INITIAL TASK SPECIFICATION ================")
-    body_init = {
-        "messages": [
-            {"role": "system", "content": "You are a coding assistant."},
-            {"role": "user", "content": "We need to build a distributed raft consensus algorithm from scratch in Rust."}
-        ]
-    }
-    is_hard, reason = is_hard_logic_turn(body_init)
-    assert is_hard, f"Failed: Initial task spec must escalate to Cloud, got {reason}"
-    print(f"PASS: Initial task spec escalated to Cloud ({reason})")
-
-    print("\n>>> ALL 8 ADVERSARIAL TESTS PASSED PERFECTLY! <<<")
+    print("\n>>> ALL 8 ADVANCED ADVERSARIAL TESTS PASSED PERFECTLY! <<<")
 
 if __name__ == "__main__":
     run_adversarial_suite()

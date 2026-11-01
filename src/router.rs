@@ -42,6 +42,8 @@ pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
     "sigsegv",
     "sigabrt",
     "unhandled rejection",
+    "uncaught exception",
+    "undefined is not a function",
     "exception in thread",
     "assertion failed",
     "cwe-",
@@ -443,10 +445,10 @@ impl Router {
                 let tool_name = Self::get_last_tool_name(messages).unwrap_or_default();
                 let is_read_only = matches!(
                     tool_name.as_str(),
-                    "read_file" | "cat" | "view" | "read_resource" | "list_dir" | "list_resources" | "search_marketplace"
+                    "read_file" | "cat" | "view" | "read_resource" | "list_dir" | "list_resources" | "search_marketplace" | "search_web"
                 );
 
-                // For passive file read tools, code content mentioning errors or cwes does NOT mean a failure occurred
+                // For passive file/info read tools:
                 if is_read_only {
                     let trimmed = text.trim();
                     let trimmed_lower = trimmed.to_lowercase();
@@ -458,6 +460,29 @@ impl Router {
                     {
                         return (true, format!("read tool failed: '{tool_name}' returned error"));
                     }
+
+                    // Contextual continuity: if the user prompt initiating this turn sequence
+                    // requested a cognitive reasoning task (audit, architecture, root cause analysis),
+                    // the model is gathering info to answer that request. Retain Cloud execution!
+                    if let Some(user_msg) = messages.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")) {
+                        let user_text = Self::extract_message_text(user_msg);
+                        let user_lower = user_text.to_lowercase();
+                        for kw in HARD_LOGIC_USER_KEYWORDS {
+                            if user_lower.contains(kw) {
+                                return (true, format!("info gathering for cognitive task: '{kw}'"));
+                            }
+                        }
+                        let reasoning_verbs = [
+                            "why", "diagnose", "debug", "architect", "design", "explain",
+                            "solve", "analyze", "investigate", "fix the bug", "find the bug"
+                        ];
+                        for verb in reasoning_verbs {
+                            if user_lower.starts_with(verb) || user_lower.contains(&format!(" {verb} ")) {
+                                return (true, format!("info gathering for reasoning task: '{verb}'"));
+                            }
+                        }
+                    }
+
                     return (false, format!("passive file/dir inspection via '{tool_name}'"));
                 }
 
@@ -466,10 +491,10 @@ impl Router {
                     return (true, format!("diagnostic signal detected in tool output: '{sig}'"));
                 }
 
-                // Check for complex trace or diff (> 60 lines with trace/diff markers)
+                // Check for deep stack traces (> 60 lines with stack trace markers, exempting normal git diffs)
                 let lines = text.lines().count();
-                if lines > 60 && (text.contains("@@ -") || text.contains("   at ") || text.contains("File \"")) {
-                    return (true, format!("complex trace/diff output ({lines} lines) in tool output"));
+                if lines > 60 && (text.contains("   at ") || text.contains("File \"")) {
+                    return (true, format!("complex stack trace ({lines} lines) in tool output"));
                 }
 
                 (false, "mechanical tool execution".to_string())
