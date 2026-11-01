@@ -169,10 +169,20 @@ def collapse_excess_whitespace(text: str) -> str:
 
 
 def deduplicate_consecutive_lines(text: str) -> str:
-    """Folds consecutive identical lines into a single line with repetition count."""
+    """Folds consecutive identical lines into a single line with repetition count.
+    
+    Safety Invariants:
+    1. Line must be >= 12 characters and contain alphanumeric content.
+       Never deduplicate closing braces: }, ];, );, ***, ---, etc.
+    2. Only deduplicate if repeat_count >= 3.
+    """
     lines = text.splitlines()
     if len(lines) < 3:
         return text
+
+    def can_dedup(line: str) -> bool:
+        trimmed = line.strip()
+        return len(trimmed) >= 12 and any(c.isalnum() for c in trimmed)
 
     out: List[str] = []
     repeat_count = 1
@@ -183,19 +193,19 @@ def deduplicate_consecutive_lines(text: str) -> str:
             repeat_count += 1
         else:
             if repeat_count > 1:
-                if repeat_count >= 3:
+                if repeat_count >= 3 and can_dedup(prev_line):
                     out.append(f"[... Repeated {repeat_count - 1} more times: {prev_line.strip()} ...]")
                 else:
-                    out.append(prev_line)
+                    out.extend([prev_line] * (repeat_count - 1))
                 repeat_count = 1
             out.append(line)
             prev_line = line
 
     if repeat_count > 1:
-        if repeat_count >= 3:
+        if repeat_count >= 3 and can_dedup(prev_line):
             out.append(f"[... Repeated {repeat_count - 1} more times: {prev_line.strip()} ...]")
         else:
-            out.append(prev_line)
+            out.extend([prev_line] * (repeat_count - 1))
 
     return '\n'.join(out)
 
@@ -329,9 +339,11 @@ def shield_directory_traversals(text: str) -> str:
 
 
 def try_minify_json(text: str) -> str:
-    """Attempts to minify pretty-printed JSON if the whole string is JSON."""
+    """Attempts to minify large pretty-printed JSON (>3000 chars).
+    Preserves clean indentation on small configs and schemas (like package.json).
+    """
     trimmed = text.strip()
-    if (trimmed.startswith('{') and trimmed.endswith('}')) or (trimmed.startswith('[') and trimmed.endswith(']')):
+    if len(trimmed) >= 3000 and ((trimmed.startswith('{') and trimmed.endswith('}')) or (trimmed.startswith('[') and trimmed.endswith(']'))):
         try:
             parsed = json.loads(trimmed)
             minified = json.dumps(parsed, separators=(',', ':'), ensure_ascii=False)
@@ -473,6 +485,7 @@ def run_command_wrapped(command_str: str) -> int:
     proc = subprocess.Popen(
         command_str,
         shell=True,
+        stdin=sys.stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -501,6 +514,11 @@ def handle_hook():
         tool_name = tool_call.get("name")
         args = tool_call.get("args", {})
         cmd = args.get("CommandLine", "")
+
+        # Escape hatch: Allow user or agent to request uncleaned output with NO_FERRY=1 or FERRY_BYPASS=1
+        if "NO_FERRY=1" in cmd or "FERRY_BYPASS=1" in cmd or os.environ.get("NO_FERRY") == "1":
+            sys.stdout.write(json.dumps({"decision": "allow"}))
+            return
 
         this_script = os.path.abspath(__file__)
 

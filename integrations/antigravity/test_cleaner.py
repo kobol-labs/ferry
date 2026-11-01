@@ -163,4 +163,45 @@ jwt_output, _ = p.communicate(f"Authorization: Bearer {jwt_token}\nResponse 200 
 print("JWT preserved verbatim:", jwt_token in jwt_output)
 assert jwt_token in jwt_output, "BUG: JWT token was suppressed as a base64 blob!"
 
-print("\n>>> ALL 13 TESTS PASSED WITH ZERO BUGS! <<<")
+print("\n================ TEST 14: SAFETY - NEVER MANGLE CLOSING BRACES IN CODE ================")
+code_with_braces = """function test() {
+    if (a) {
+        if (b) {
+            return 1;
+        }
+    }
+}"""
+p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+code_res, _ = p.communicate(code_with_braces)
+print("Code braces preserved verbatim:", "Repeated" not in code_res)
+assert "Repeated" not in code_res, "BUG: Code closing braces were deduplicated!"
+
+print("\n================ TEST 15: USABILITY - PRESERVE SMALL PRETTY JSON (<3000 CHARS) ================")
+small_json = """{
+  "name": "super-power-school",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}"""
+p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+json_res, _ = p.communicate(small_json)
+print("Small JSON indentation preserved:", "\n  \"name\"" in json_res)
+assert "\n  \"name\"" in json_res, "BUG: Small JSON was minified into a single line!"
+
+print("\n================ TEST 16: CONTROL - NO_FERRY=1 BYPASS ESCAPE HATCH ================")
+p = subprocess.Popen([FERRY, "--hook"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+hook_input = {
+    "toolCall": {
+        "name": "run_command",
+        "args": {
+            "CommandLine": "NO_FERRY=1 echo 'raw output here'"
+        }
+    }
+}
+hook_output, _ = p.communicate(json.dumps(hook_input))
+hook_resp = json.loads(hook_output)
+print("NO_FERRY allows raw execution without rewrite:", "overwrite" not in hook_resp)
+assert "overwrite" not in hook_resp, "BUG: NO_FERRY=1 was not respected!"
+
+print("\n>>> ALL 16 TESTS PASSED WITH ZERO BUGS! <<<")
