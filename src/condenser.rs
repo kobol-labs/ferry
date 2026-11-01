@@ -627,7 +627,7 @@ pub fn collect_discovered_entities(
         }
 
         // 2. Auth artifacts: tokens, cookies, headers
-        if (clean.starts_with("sps_session") || clean.starts_with("token_version") || clean.starts_with("eyJ") || upper.starts_with("BEARER")) && clean.len() < 80 {
+        if (clean.starts_with("sps_session") || clean.starts_with("token_version") || clean.starts_with("eyJ") || upper.starts_with("BEARER")) && clean.len() <= 500 {
             auth.insert(clean.to_string());
             if auth.len() > 10 {
                 let first = auth.iter().next().cloned().unwrap();
@@ -807,7 +807,7 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
             continue;
         }
 
-        // 3. File paths with directories
+        // 3. File paths with directories and API endpoints
         if (clean.starts_with('/') && clean.contains('/'))
             || ((clean.contains('/') || clean.contains('\\'))
                 && (clean.ends_with(".go")
@@ -820,7 +820,10 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
                     || clean.ends_with(".yaml")
                     || clean.ends_with(".yml")
                     || clean.ends_with(".sql")
-                    || clean.ends_with(".sh")))
+                    || clean.ends_with(".sh")
+                    || clean.starts_with("api/")
+                    || clean.starts_with("v1/")
+                    || clean.starts_with("v2/")))
         {
             anchors.push(clean.to_string());
             continue;
@@ -952,9 +955,14 @@ pub const DIAGNOSTIC_SIGNALS: &[&str] = &[
     "status 502",
     "status 503",
     "status 504",
+    "status 400",
     "status 401",
     "status 403",
+    "status 404",
+    "status 422",
     "status 429",
+    "bad request",
+    "not found",
     "internal server error",
     "bad gateway",
     "service unavailable",
@@ -966,6 +974,19 @@ pub const DIAGNOSTIC_SIGNALS: &[&str] = &[
     "connection refused",
     "timed out",
     "timeout",
+    "no such file",
+    "command not found",
+    "cannot find module",
+    "module not found",
+    "invalid",
+    "unrecognized",
+    "malformed",
+    "corrupt",
+    "warning:",
+    "warn:",
+    "critical:",
+    "rejected",
+    "expired",
     "sigsegv",
     "segmentation fault",
     "sql syntax",
@@ -1062,8 +1083,8 @@ pub fn truncate_tool_content_smart(
     if lines.len() <= head_lines + tail_lines {
         // Line count is small, do byte/char boundary truncation safely on UTF-8 boundaries.
         // First check if the middle portion contains diagnostic/security signals before blind truncation!
-        let head_target = 300.min(text.len() / 4);
-        let tail_target = 300.min(text.len() / 4);
+        let head_target = (head_lines * 80).clamp(600, 1800).min(text.len() / 3);
+        let tail_target = (tail_lines * 80).clamp(600, 1800).min(text.len() / 3);
         let head_idx = safe_floor_char_boundary(text, head_target);
         let tail_start = text.len().saturating_sub(tail_target);
         let tail_idx = safe_ceil_char_boundary(text, tail_start);
@@ -1327,6 +1348,16 @@ const COMMON_CODE_EXTS: &[&str] = &[
 
 fn is_base64_or_hex_payload(token: &str) -> bool {
     if token.len() < 120 {
+        return false;
+    }
+    // Never suppress JWT tokens, API keys, or authentication headers
+    if token.starts_with("eyJ")
+        || token.starts_with("sk-")
+        || token.starts_with("ghp_")
+        || token.starts_with("gho_")
+        || token.starts_with("glpat-")
+        || token.starts_with("xoxb-")
+    {
         return false;
     }
     if token.starts_with('/') || token.starts_with("./") || token.starts_with("../") || token.starts_with("http://") || token.starts_with("https://") {

@@ -222,7 +222,7 @@ pub struct CondenserConfig {
 fn default_condensation_enabled() -> bool { true }
 fn default_drop_historical_reasoning() -> bool { true }
 fn default_truncate_tool_outputs() -> bool { true }
-fn default_keep_recent_turns() -> usize { 1 }
+fn default_keep_recent_turns() -> usize { 4 }
 fn default_max_tool_chars() -> usize { 2000 }
 fn default_recent_max_tool_chars() -> usize { 60000 }
 fn default_head_lines() -> usize { 15 }

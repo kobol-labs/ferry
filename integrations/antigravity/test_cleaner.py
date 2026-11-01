@@ -156,4 +156,11 @@ print("Binary execution exit code:", res.returncode)
 assert res.returncode == 0, "BUG: Process crashed on non-UTF8 bytes!"
 print("Binary output handled safely without crash!")
 
-print("\n>>> ALL 12 TESTS PASSED WITH ZERO BUGS! <<<")
+print("\n================ TEST 13: SAFETY - NEVER SUPPRESS JWT TOKENS AS BASE64 ================")
+jwt_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMiwiZXhwIjoxNTE2MjQyNjIyLCJyb2xlIjoic3VwZXJfYWRtaW4iLCJhY2NvdW50X2lkIjoiYWNjX3ByaW1hcnkiLCJlbWFpbCI6ImFkbWluQGV4YW1wbGUuY29tIn0.some_test_signature_here_that_is_long"
+p = subprocess.Popen([FERRY], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+jwt_output, _ = p.communicate(f"Authorization: Bearer {jwt_token}\nResponse 200 OK")
+print("JWT preserved verbatim:", jwt_token in jwt_output)
+assert jwt_token in jwt_output, "BUG: JWT token was suppressed as a base64 blob!"
+
+print("\n>>> ALL 13 TESTS PASSED WITH ZERO BUGS! <<<")

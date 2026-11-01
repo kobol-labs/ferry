@@ -45,9 +45,14 @@ DIAGNOSTIC_SIGNALS = [
     "status 502",
     "status 503",
     "status 504",
+    "status 400",
     "status 401",
     "status 403",
+    "status 404",
+    "status 422",
     "status 429",
+    "bad request",
+    "not found",
     "internal server error",
     "bad gateway",
     "service unavailable",
@@ -59,6 +64,19 @@ DIAGNOSTIC_SIGNALS = [
     "connection refused",
     "timed out",
     "timeout",
+    "no such file",
+    "command not found",
+    "cannot find module",
+    "module not found",
+    "invalid",
+    "unrecognized",
+    "malformed",
+    "corrupt",
+    "warning:",
+    "warn:",
+    "critical:",
+    "rejected",
+    "expired",
     "sigsegv",
     "segmentation fault",
     "sql syntax",
@@ -82,9 +100,9 @@ DIAGNOSTIC_SIGNALS = [
 ]
 
 # Tuning constants
-DEFAULT_MAX_CHARS = 3000
-DEFAULT_HEAD_LINES = 20
-DEFAULT_TAIL_LINES = 15
+DEFAULT_MAX_CHARS = 12000
+DEFAULT_HEAD_LINES = 40
+DEFAULT_TAIL_LINES = 30
 
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
 
@@ -191,6 +209,9 @@ COMMON_CODE_EXTENSIONS = (
 def is_base64_or_hex_payload(token: str) -> bool:
     """Verifies a token is truly a base64/hex payload and NOT a file path, URL, or code token."""
     if len(token) < 120:
+        return False
+    # Never suppress JWT tokens, API keys, or authentication headers
+    if token.startswith(('eyJ', 'sk-', 'ghp_', 'gho_', 'glpat-', 'xoxb-')):
         return False
     # Never suppress file paths, URLs, or command flags
     if token.startswith('/') or token.startswith('./') or token.startswith('../') or token.startswith('http://') or token.startswith('https://'):
