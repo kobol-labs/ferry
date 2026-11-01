@@ -438,7 +438,6 @@ impl Router {
 
         let role = last_msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let text = Self::extract_message_text(last_msg);
-        let text_lower = text.to_lowercase();
 
         match role {
             "tool" => {

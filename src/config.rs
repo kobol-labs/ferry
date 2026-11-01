@@ -315,6 +315,7 @@ impl Config {
             condensation: CondenserConfig::default(),
             cache: CacheConfig::default(),
             affinity: AffinityConfig::default(),
+            routing: RoutingConfig::default(),
             telemetry: TelemetryConfig::default(),
         }
     }
