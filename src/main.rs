@@ -492,36 +492,63 @@ async fn chat_completions_handler(
 
     let mut total_chars_saved = cond_stats.chars_saved;
 
-    // 3. Rolling context compaction: compacts long conversation histories into an executive checkpoint
-    if let Some(compact_stats) = state.condenser.rolling_compact(&mut body) {
-        total_chars_saved += compact_stats.chars_saved;
-        state.metrics.record_rolling_compaction(compact_stats.chars_saved);
-        tracing::info!(
-            session = %session_id,
-            turns_compacted = compact_stats.turns_compacted,
-            chars_saved = compact_stats.chars_saved,
-            "Rolling context compaction pruned historical turns to fit within context threshold"
-        );
-    }
+    // 3. Determine if request is targeting Cloud or Local:
+    // If targeting Cloud (cloud-only, hybrid cognitive escalation, or explicit cloud model requested),
+    // we EXEMPT it from aggressive local hardware squeezing and rolling compaction.
+    // This guarantees Cloud turns receive FULL high-fidelity context without being lobotomized.
+    let route_override = headers.get("x-ferry-route").and_then(|h| h.to_str().ok());
+    let explicit_wait = headers
+        .get("x-ferry-queue-timeout-ms")
+        .or_else(|| headers.get("x-ferry-wait-ms"))
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
 
-    let max_context = state.config.local.max_context_tokens as u64;
-    let squeeze_ratio = state.config.local.adaptive_squeeze_ratio;
+    let effective_mode = route_override
+        .and_then(ferry::router::RoutingMode::parse)
+        .or_else(|| ferry::router::RoutingMode::parse(&state.config.routing.default_route))
+        .unwrap_or(ferry::router::RoutingMode::LocalPreferred);
 
-    if state.config.local.adaptive_squeezing {
-        let est_tokens = ferry::router::Router::estimate_tokens(&body);
-        if est_tokens > max_context && est_tokens <= (max_context as f64 * squeeze_ratio) as u64 {
-            if let Some(extra_saved) = state.condenser.adaptive_squeeze(&mut body, max_context) {
-                total_chars_saved += extra_saved;
-                let new_tokens = ferry::router::Router::estimate_tokens(&body);
-                if new_tokens <= max_context {
-                    state.metrics.adaptive_squeezed_count.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(
-                        before = est_tokens,
-                        after = new_tokens,
-                        max = max_context,
-                        extra_saved,
-                        "Adaptive squeezing successfully fit prompt into local context"
-                    );
+    let requested_cloud_model = body.get("model").and_then(|m| m.as_str())
+        .map(|m| m == state.config.cloud.model || m == "cloud")
+        .unwrap_or(false);
+
+    let is_cloud_target = effective_mode == ferry::router::RoutingMode::CloudOnly
+        || requested_cloud_model
+        || (effective_mode == ferry::router::RoutingMode::Hybrid && ferry::router::Router::is_hard_logic_turn(&body).0);
+
+    // Apply hardware-specific local compaction & squeezing ONLY for local targets:
+    if !is_cloud_target {
+        // Rolling context compaction for local slots:
+        if let Some(compact_stats) = state.condenser.rolling_compact(&mut body) {
+            total_chars_saved += compact_stats.chars_saved;
+            state.metrics.record_rolling_compaction(compact_stats.chars_saved);
+            tracing::info!(
+                session = %session_id,
+                turns_compacted = compact_stats.turns_compacted,
+                chars_saved = compact_stats.chars_saved,
+                "Rolling context compaction pruned historical turns for local GPU"
+            );
+        }
+
+        // Adaptive squeezing to fit local context limit:
+        let max_context = state.config.local.max_context_tokens as u64;
+        let squeeze_ratio = state.config.local.adaptive_squeeze_ratio;
+        if state.config.local.adaptive_squeezing {
+            let est_tokens = ferry::router::Router::estimate_tokens(&body);
+            if est_tokens > max_context && est_tokens <= (max_context as f64 * squeeze_ratio) as u64 {
+                if let Some(extra_saved) = state.condenser.adaptive_squeeze(&mut body, max_context) {
+                    total_chars_saved += extra_saved;
+                    let new_tokens = ferry::router::Router::estimate_tokens(&body);
+                    if new_tokens <= max_context {
+                        state.metrics.adaptive_squeezed_count.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            before = est_tokens,
+                            after = new_tokens,
+                            max = max_context,
+                            extra_saved,
+                            "Adaptive squeezing successfully fit prompt into local context"
+                        );
+                    }
                 }
             }
         }
@@ -532,14 +559,6 @@ async fn chat_completions_handler(
     } else {
         0.0
     };
-
-    // 4. Client header controls: X-Ferry-Route override and explicit queue wait
-    let route_override = headers.get("x-ferry-route").and_then(|h| h.to_str().ok());
-    let explicit_wait = headers
-        .get("x-ferry-queue-timeout-ms")
-        .or_else(|| headers.get("x-ferry-wait-ms"))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
 
     let decision = state.router.decide_for_session(&body, route_override, explicit_wait, &session_id).await;
 

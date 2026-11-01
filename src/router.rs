@@ -306,6 +306,123 @@ impl Router {
         String::new()
     }
 
+    pub fn get_last_tool_name(messages: &[Value]) -> Option<String> {
+        if messages.is_empty() {
+            return None;
+        }
+        if let Some(name) = messages.last().and_then(|m| m.get("name")).and_then(|n| n.as_str()) {
+            return Some(name.to_lowercase());
+        }
+        for msg in messages.iter().rev().skip(1) {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "assistant" {
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    if let Some(last_tc) = tool_calls.last() {
+                        if let Some(func) = last_tc.get("function") {
+                            if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                return Some(name.to_lowercase());
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn is_mechanical_user_command(lower: &str) -> bool {
+        let trimmed = lower.trim();
+        // Git operations
+        if trimmed.starts_with("git ")
+            || trimmed.contains("git status")
+            || trimmed.contains("git diff")
+            || trimmed.contains("git log")
+            || trimmed.contains("git add")
+            || trimmed.contains("git commit")
+            || trimmed.contains("git push")
+            || trimmed.contains("git pull")
+            || trimmed.contains("git branch")
+            || trimmed.contains("git checkout")
+        {
+            return true;
+        }
+        // Direct shell commands
+        if trimmed.starts_with("run ")
+            || trimmed.starts_with("execute ")
+            || trimmed.starts_with("exec ")
+            || trimmed.starts_with("stop ")
+            || trimmed.starts_with("start ")
+            || trimmed.starts_with("restart ")
+            || trimmed.starts_with("kill ")
+            || trimmed.starts_with("cat ")
+            || trimmed.starts_with("ls ")
+            || trimmed.starts_with("docker ")
+            || trimmed.starts_with("cargo ")
+            || trimmed.starts_with("npm ")
+            || trimmed.starts_with("pnpm ")
+            || trimmed.starts_with("python ")
+            || trimmed.starts_with("python3 ")
+        {
+            return true;
+        }
+        // Routine inspection questions
+        if trimmed.starts_with("show me ") || trimmed.starts_with("check ") || trimmed.starts_with("list ") {
+            if trimmed.contains("status")
+                || trimmed.contains("diff")
+                || trimmed.contains("files")
+                || trimmed.contains("logs")
+                || trimmed.contains("dir")
+                || trimmed.contains("container")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn has_real_diagnostic_signal(text: &str) -> Option<&'static str> {
+        let text_lower = text.to_lowercase();
+
+        // Check each high-confidence signal
+        for &signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
+            if text_lower.contains(signal) {
+                return Some(signal);
+            }
+        }
+
+        // Check for error markers while filtering false alarms like "error": null, 0 errors, error: none
+        if let Some(pos) = text_lower.find("error:") {
+            let tail = text_lower[pos + 6..].trim_start();
+            if !tail.starts_with("null")
+                && !tail.starts_with("\"\"")
+                && !tail.starts_with("false")
+                && !tail.starts_with("none")
+                && !tail.starts_with('0')
+            {
+                return Some("error:");
+            }
+        }
+
+        if let Some(pos) = text_lower.find("\"error\":") {
+            let tail = text_lower[pos + 8..].trim_start();
+            if !tail.starts_with("null")
+                && !tail.starts_with("\"\"")
+                && !tail.starts_with("false")
+                && !tail.starts_with("none")
+                && !tail.starts_with('0')
+            {
+                return Some("\"error\":");
+            }
+        }
+
+        if text_lower.contains("[error]") || text_lower.contains("err:") {
+            return Some("error signal");
+        }
+
+        None
+    }
+
     pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
         let messages = match body.get("messages").and_then(|m| m.as_array()) {
             Some(m) if !m.is_empty() => m,
@@ -323,56 +440,87 @@ impl Router {
 
         match role {
             "tool" => {
-                // Check for diagnostic failure signals, panics, or security alerts
-                for signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
-                    if text_lower.contains(signal) {
-                        return (true, format!("diagnostic signal detected in tool output: '{signal}'"));
+                let tool_name = Self::get_last_tool_name(messages).unwrap_or_default();
+                let is_read_only = matches!(
+                    tool_name.as_str(),
+                    "read_file" | "cat" | "view" | "read_resource" | "list_dir" | "list_resources" | "search_marketplace"
+                );
+
+                // For passive file read tools, code content mentioning errors or cwes does NOT mean a failure occurred
+                if is_read_only {
+                    let trimmed = text.trim();
+                    let trimmed_lower = trimmed.to_lowercase();
+                    if trimmed_lower.starts_with("error:")
+                        || trimmed_lower.starts_with("file not found")
+                        || trimmed_lower.starts_with("no such file")
+                        || trimmed_lower.starts_with("permission denied")
+                        || trimmed_lower.starts_with("notfound")
+                    {
+                        return (true, format!("read tool failed: '{tool_name}' returned error"));
                     }
+                    return (false, format!("passive file/dir inspection via '{tool_name}'"));
                 }
-                if text_lower.contains("error:") || text_lower.contains("[error]") || text_lower.contains("err:") {
-                    return (true, "error signal detected in tool output".to_string());
+
+                // For active execution tools (run_command, test runners, etc.):
+                if let Some(sig) = Self::has_real_diagnostic_signal(&text) {
+                    return (true, format!("diagnostic signal detected in tool output: '{sig}'"));
                 }
+
                 // Check for complex trace or diff (> 60 lines with trace/diff markers)
                 let lines = text.lines().count();
                 if lines > 60 && (text.contains("@@ -") || text.contains("   at ") || text.contains("File \"")) {
                     return (true, format!("complex trace/diff output ({lines} lines) in tool output"));
                 }
+
                 (false, "mechanical tool execution".to_string())
             }
             "user" => {
                 let trimmed = text.trim();
                 let trimmed_lower = trimmed.to_lowercase();
 
-                // Procedural affirmations stay local
+                // 1. Procedural affirmations stay local
                 let procedural_words = [
                     "yes", "no", "y", "n", "ok", "okay", "proceed", "continue",
-                    "go ahead", "approved", "run it", "sure", "next", "done", "cancel"
+                    "go ahead", "approved", "run it", "sure", "next", "done", "cancel", "thanks", "thank you"
                 ];
                 if procedural_words.contains(&trimmed_lower.as_str()) {
                     return (false, format!("procedural confirmation: '{trimmed}'"));
                 }
 
-                // Check for high-cognitive keywords
+                // 2. High-cognitive keywords -> escalate to Cloud
                 for kw in HARD_LOGIC_USER_KEYWORDS {
-                    if text_lower.contains(kw) {
+                    if trimmed_lower.contains(kw) {
                         return (true, format!("cognitive prompt keyword: '{kw}'"));
                     }
                 }
 
-                // Initial prompt framing escalation
+                // 3. Mechanical action requests -> stay local ($0)
+                if Self::is_mechanical_user_command(&trimmed_lower) {
+                    return (false, format!("mechanical action request: '{trimmed}'"));
+                }
+
+                // 4. Initial prompt framing escalation
                 let non_system_count = messages.iter().filter(|m| {
                     m.get("role").and_then(|r| r.as_str()) != Some("system")
                 }).count();
 
-                if non_system_count <= 1 && trimmed.len() >= 80 {
+                if non_system_count <= 1 && trimmed.len() >= 60 {
                     return (true, "initial task specification / prompt framing".to_string());
                 }
 
-                if trimmed.len() < 120 {
-                    return (false, "procedural user prompt".to_string());
+                // 5. Reasoning / architectural / debugging intent verbs -> Cloud
+                let reasoning_verbs = [
+                    "why", "diagnose", "debug", "architect", "design", "explain",
+                    "solve", "analyze", "investigate", "fix the bug", "find the bug"
+                ];
+                for verb in reasoning_verbs {
+                    if trimmed_lower.starts_with(verb) || trimmed_lower.contains(&format!(" {verb} ")) {
+                        return (true, format!("reasoning intent verb: '{verb}'"));
+                    }
                 }
 
-                (true, format!("substantive mid-session user prompt ({} chars)", trimmed.len()))
+                // Standard mid-session prompt stays local ($0)
+                (false, "procedural or standard execution turn".to_string())
             }
             _ => {
                 // For assistant or other roles, inspect preceding message if available
@@ -381,11 +529,8 @@ impl Router {
                     let prev_role = prev_msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
                     if prev_role == "tool" {
                         let prev_text = Self::extract_message_text(prev_msg);
-                        let prev_lower = prev_text.to_lowercase();
-                        for signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
-                            if prev_lower.contains(signal) {
-                                return (true, format!("diagnostic signal in prior tool output: '{signal}'"));
-                            }
+                        if let Some(sig) = Self::has_real_diagnostic_signal(&prev_text) {
+                            return (true, format!("diagnostic signal in prior tool output: '{sig}'"));
                         }
                     }
                 }
@@ -755,6 +900,42 @@ mod tests {
         let (is_hard, reason) = Router::is_hard_logic_turn(&body_clean);
         assert!(!is_hard);
         assert!(reason.contains("mechanical"));
+
+        // JSON tool response with "error": null -> MUST NOT escalate (false alarm filter)
+        let body_json = json!({
+            "messages": [
+                {"role": "tool", "content": "{\"status\": \"ok\", \"error\": null, \"data\": {\"count\": 42}}"}
+            ]
+        });
+        let (is_hard, _) = Router::is_hard_logic_turn(&body_json);
+        assert!(!is_hard, "JSON with error: null should not be classified as hard logic");
+
+        // Passive read_file tool inspecting code that contains 'panic!' or 'error' -> MUST NOT escalate
+        let body_read = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_read_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\": \"src/condenser.rs\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_read_1",
+                    "content": "pub fn handle_error() {\n    panic!(\"something failed\");\n}"
+                }
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_read);
+        assert!(!is_hard, "read_file output containing code should stay local, got: {}", reason);
+        assert!(reason.contains("passive file/dir inspection"));
     }
 
     #[test]
@@ -778,6 +959,19 @@ mod tests {
         let (is_hard, _) = Router::is_hard_logic_turn(&body_proceed);
         assert!(!is_hard);
 
+        // Mechanical user command (even if > 120 chars) -> MUST STAY LOCAL
+        let body_git = json!({
+            "messages": [
+                {"role": "system", "content": "Assistant"},
+                {"role": "user", "content": "setup"},
+                {"role": "assistant", "content": "ready"},
+                {"role": "user", "content": "Please run git status and git diff to see all the modified files in the repository before making any new commits to main"}
+            ]
+        });
+        let (is_hard, reason) = Router::is_hard_logic_turn(&body_git);
+        assert!(!is_hard, "Mechanical git prompt should stay local, got: {}", reason);
+        assert!(reason.contains("mechanical action request"));
+
         // User prompt with cognitive keyword -> hard logic escalation
         let body_kw = json!({
             "messages": [
@@ -788,7 +982,7 @@ mod tests {
         assert!(is_hard);
         assert!(reason.contains("cognitive prompt keyword"));
 
-        // Initial task prompt (> 80 chars) -> hard logic escalation
+        // Initial task prompt (> 60 chars) -> hard logic escalation
         let body_initial = json!({
             "messages": [
                 {"role": "system", "content": "You are an AI coding assistant."},
