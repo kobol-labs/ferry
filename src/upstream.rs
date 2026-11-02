@@ -380,6 +380,13 @@ impl UpstreamClient {
                 let status = resp.status();
                 let duration = start.elapsed();
                 self.metrics.record_cloud_completion(duration.as_millis());
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    warn!(
+                        req_id = req_id,
+                        "Cloud provider returned HTTP 429 (Rate Limit / Quota Exceeded). Activating 60-second local fallback guard."
+                    );
+                    self.metrics.record_cloud_rate_limit(60);
+                }
                 info!(
                     req_id = req_id,
                     target = "cloud",

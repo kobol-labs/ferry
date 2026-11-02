@@ -45,6 +45,7 @@ pub struct MetricsTracker {
     pub circuit_open: AtomicBool,
     pub consecutive_local_failures: AtomicU32,
     pub circuit_trips_total: AtomicU64,
+    pub cloud_rate_limited_until: AtomicU64,
 
     // Affinity & Rolling Compaction metrics
     pub affinity_hits: AtomicU64,
@@ -109,6 +110,7 @@ impl Default for MetricsTracker {
             circuit_open: AtomicBool::new(false),
             consecutive_local_failures: AtomicU32::new(0),
             circuit_trips_total: AtomicU64::new(0),
+            cloud_rate_limited_until: AtomicU64::new(0),
 
             affinity_hits: AtomicU64::new(0),
             affinity_misses: AtomicU64::new(0),
@@ -172,6 +174,7 @@ pub struct StatsSnapshot {
     pub circuit_open: bool,
     pub consecutive_local_failures: u32,
     pub circuit_trips_total: u64,
+    pub cloud_rate_limited: bool,
 
     pub affinity_hits: u64,
     pub affinity_misses: u64,
@@ -328,6 +331,30 @@ impl MetricsTracker {
         self.circuit_open.load(Ordering::Relaxed)
     }
 
+    pub fn is_strata_online(&self) -> bool {
+        self.strata_online.load(Ordering::Relaxed)
+    }
+
+    pub fn record_cloud_rate_limit(&self, backoff_secs: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.cloud_rate_limited_until.store(now + backoff_secs, Ordering::Relaxed);
+    }
+
+    pub fn is_cloud_rate_limited(&self) -> bool {
+        let until = self.cloud_rate_limited_until.load(Ordering::Relaxed);
+        if until == 0 {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now < until
+    }
+
     pub fn record_condensation(
         &self,
         orig_tokens: u64,
@@ -455,6 +482,7 @@ impl MetricsTracker {
             circuit_open: self.circuit_open.load(Ordering::Relaxed),
             consecutive_local_failures: self.consecutive_local_failures.load(Ordering::Relaxed),
             circuit_trips_total: self.circuit_trips_total.load(Ordering::Relaxed),
+            cloud_rate_limited: self.is_cloud_rate_limited(),
 
             affinity_hits: self.affinity_hits.load(Ordering::Relaxed),
             affinity_misses: self.affinity_misses.load(Ordering::Relaxed),

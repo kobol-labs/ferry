@@ -713,18 +713,26 @@ impl Router {
         if effective_mode == RoutingMode::Hybrid {
             let (is_hard, reason) = Self::is_hard_logic_turn(body);
             if is_hard {
-                return RouteDecision {
-                    target: TargetProvider::Cloud,
-                    est_tokens,
-                    is_spillover: false,
-                    reason: format!("hybrid cognitive escalation: {reason}"),
-                    local_only: false,
-                    slot_guard: None,
-                    slot_id: None,
-                    is_affinity_hit: false,
-                    affinity_type: AffinityType::NewSlot,
-                    session_id: session_id.to_string(),
-                };
+                if self.metrics.is_cloud_rate_limited() && self.metrics.is_strata_online() {
+                    tracing::warn!(
+                        session = %session_id,
+                        reason = %reason,
+                        "Cognitive escalation flagged ({reason}), but Cloud provider is currently rate-limited (429 backoff). Retaining request on local Strata."
+                    );
+                } else {
+                    return RouteDecision {
+                        target: TargetProvider::Cloud,
+                        est_tokens,
+                        is_spillover: false,
+                        reason: format!("hybrid cognitive escalation: {reason}"),
+                        local_only: false,
+                        slot_guard: None,
+                        slot_id: None,
+                        is_affinity_hit: false,
+                        affinity_type: AffinityType::NewSlot,
+                        session_id: session_id.to_string(),
+                    };
+                }
             }
         }
 
@@ -795,10 +803,10 @@ impl Router {
             500
         } else if local_only {
             60000
-        } else if is_orchestrator {
-            15000 // 15s fast-spillover for orchestrators so swarm is never blocked
         } else if queue_timeout_ms == 0 {
             0
+        } else if is_orchestrator {
+            30000 // 30s queue wait for orchestrators: balances swarm responsiveness with local GPU utilization
         } else if local_prefer || effective_mode == RoutingMode::Hybrid {
             queue_timeout_ms
         } else if est_tokens <= max_context {
@@ -879,6 +887,36 @@ impl Router {
 
         if is_orchestrator {
             self.metrics.orchestrator_spillover.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if self.metrics.is_cloud_rate_limited() && self.metrics.is_strata_online() {
+            tracing::warn!(
+                session = %session_id,
+                "Queue wait expired ({effective_wait_ms}ms), but Cloud is currently rate-limited (429 backoff). Attempting emergency slot eviction..."
+            );
+            if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, true) {
+                if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
+                    self.metrics.record_affinity(aff_type.is_hit());
+                    let slot_guard = LocalSlotGuard::new(
+                        self.metrics.clone(),
+                        Some(self.affinity_tracker.clone()),
+                        Some(slot_id),
+                        est_tokens,
+                    );
+                    return RouteDecision {
+                        target: TargetProvider::Local,
+                        est_tokens,
+                        is_spillover: false,
+                        reason: format!("rescued from cloud 429: acquired slot {slot_id} via emergency eviction"),
+                        local_only: false,
+                        slot_guard: Some(slot_guard),
+                        slot_id: Some(slot_id),
+                        is_affinity_hit: aff_type.is_hit(),
+                        affinity_type: aff_type,
+                        session_id: session_id.to_string(),
+                    };
+                }
+            }
         }
 
         let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
@@ -1154,5 +1192,35 @@ mod tests {
             Router::detect_orchestrator(&dispatch_body, "session-generic-1", None),
             "Coordinator tool calls must be tagged as orchestrator"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cloud_rate_limit_backoff_keeps_turns_local() {
+        let mut config = Config::default();
+        config.routing.default_route = "hybrid".to_string();
+        config.local.max_slots = 4;
+        let config = Arc::new(config);
+        let metrics = Arc::new(MetricsTracker::default());
+        let router = Router::new(config, metrics.clone());
+
+        let hard_body = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Verify if the SQL injection flaw can be bypassed using hex encoding."
+                }
+            ]
+        });
+
+        // 1. Without cloud rate limit, hard logic escalates to Cloud
+        let dec1 = router.decide_with_session(&hard_body, None, None, "test-sess-1").await;
+        assert_eq!(dec1.target, TargetProvider::Cloud);
+
+        // 2. When Cloud is marked 429 rate limited, turn stays local on Strata
+        metrics.record_cloud_rate_limit(60);
+        assert!(metrics.is_cloud_rate_limited());
+        let dec2 = router.decide_with_session(&hard_body, None, None, "test-sess-2").await;
+        assert_eq!(dec2.target, TargetProvider::Local);
+        assert!(dec2.slot_guard.is_some());
     }
 }
