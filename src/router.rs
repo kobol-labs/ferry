@@ -227,38 +227,80 @@ impl Router {
             }
         }
 
-        if session_id.to_lowercase().contains("root") || session_id.to_lowercase().contains("orchestrat") {
-            return true;
-        }
-
-        if let Some(user) = body.get("user").and_then(|u| u.as_str()) {
-            let u_lower = user.to_lowercase();
-            if u_lower.contains("root") || u_lower.contains("orchestrat") {
-                return true;
-            }
-        }
-
+        // 1. Inspect metadata: if explicitly named as a specialist/worker, it is NOT an orchestrator
         if let Some(meta) = body.get("metadata").and_then(|m| m.as_object()) {
-            for key in &["agent_id", "agent_name", "role", "agent"] {
+            for key in &["agent_name", "role", "agent"] {
                 if let Some(val) = meta.get(*key).and_then(|v| v.as_str()) {
                     let v_lower = val.to_lowercase();
-                    if v_lower.contains("root") || v_lower.contains("orchestrat") {
+                    if v_lower.contains("specialist")
+                        || v_lower.contains("hunter")
+                        || v_lower.contains("validator")
+                        || v_lower.contains("scanner")
+                        || v_lower.contains("worker")
+                        || v_lower.contains("triage")
+                        || v_lower.contains("recon")
+                    {
+                        return false;
+                    }
+                    if v_lower == "root agent"
+                        || v_lower == "root"
+                        || v_lower.contains("orchestrat")
+                        || v_lower.contains("coordinator")
+                    {
                         return true;
                     }
                 }
             }
         }
 
-        // Inspect messages for orchestrator signatures (Root Agent / coordination skills)
+        // 2. Inspect session ID: only match if it explicitly indicates root/orchestrator
+        let sess_lower = session_id.to_lowercase();
+        if (sess_lower.contains("root") || sess_lower.contains("orchestrat"))
+            && !sess_lower.contains("specialist")
+            && !sess_lower.contains("hunter")
+            && !sess_lower.contains("validator")
+            && !sess_lower.contains("triage")
+            && !sess_lower.contains("recon")
+        {
+            return true;
+        }
+
+        if let Some(user) = body.get("user").and_then(|u| u.as_str()) {
+            let u_lower = user.to_lowercase();
+            if (u_lower.contains("root") || u_lower.contains("orchestrat"))
+                && !u_lower.contains("specialist")
+                && !u_lower.contains("hunter")
+            {
+                return true;
+            }
+        }
+
+        // 3. Inspect messages for orchestrator signatures vs specialist signatures
         if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
             for msg in messages {
                 if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
                     if role == "system" {
                         if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                             let c_lower = content.to_lowercase();
-                            if c_lower.contains("root agent")
-                                || c_lower.contains("root=true")
+                            // If this system prompt defines a specialist subagent, do NOT mark as root orchestrator
+                            if c_lower.contains("current_agent=auth")
+                                || c_lower.contains("current_agent=sql")
+                                || c_lower.contains("current_agent=ssrf")
+                                || c_lower.contains("current_agent=tenant")
+                                || c_lower.contains("current_agent=scraper")
+                                || c_lower.contains("current_agent=static")
+                                || c_lower.contains("current_agent=live")
+                                || c_lower.contains("you are a specialist")
+                                || c_lower.contains("you are an automated security hunter")
+                            {
+                                return false;
+                            }
+                            if c_lower.starts_with("you are the root agent")
+                                || c_lower.starts_with("you are a root agent")
+                                || c_lower.contains("current_agent=root agent")
+                                || c_lower.contains("role: root_agent")
                                 || c_lower.contains("coordination/root_agent")
+                                || c_lower.contains("root=true")
                             {
                                 return true;
                             }
@@ -269,7 +311,7 @@ impl Router {
                     let c_lower = content.to_lowercase();
                     if c_lower.contains("as the root agent")
                         || c_lower.contains("wait_for_agents")
-                        || c_lower.contains("list_coverage")
+                        || c_lower.contains("dispatch_agent")
                     {
                         return true;
                     }
@@ -278,7 +320,7 @@ impl Router {
                     for tc in tool_calls {
                         if let Some(func) = tc.get("function") {
                             if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                if matches!(name, "wait_for_agents" | "list_coverage" | "list_reports" | "assign_task") {
+                                if matches!(name, "wait_for_agents" | "assign_task" | "dispatch_agent" | "spawn_agent") {
                                     return true;
                                 }
                             }
@@ -753,7 +795,7 @@ impl Router {
         } else if is_orchestrator {
             15000 // 15s fast-spillover for orchestrators so swarm is never blocked
         } else if local_prefer || effective_mode == RoutingMode::Hybrid {
-            45000
+            queue_timeout_ms.max(45000)
         } else if queue_timeout_ms == 0 {
             0
         } else if est_tokens <= max_context {
@@ -1016,5 +1058,67 @@ mod tests {
         let (is_hard, reason) = Router::is_hard_logic_turn(&body_initial);
         assert!(is_hard);
         assert!(reason.contains("initial task specification"));
+    }
+
+    #[test]
+    fn test_detect_orchestrator_disambiguation() {
+        // 1. Specialist subagent with "root agent" mentioned in prompt -> MUST NOT be an orchestrator
+        let specialist_body = json!({
+            "metadata": {
+                "agent_name": "Auth & JWT Specialist",
+                "role": "specialist"
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an automated security hunter specializing in JWT analysis. Report all findings back to the Root Agent once completed."
+                },
+                {"role": "user", "content": "Analyze /api/login.js"}
+            ]
+        });
+        assert!(
+            !Router::detect_orchestrator(&specialist_body, "session-specialist-1", None),
+            "Specialist mentioning Root Agent must NOT be tagged as orchestrator"
+        );
+
+        // 2. True Root Agent coordinator -> MUST be tagged as orchestrator
+        let root_body = json!({
+            "metadata": {
+                "agent_name": "Root Agent",
+                "role": "coordinator"
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are the Root Agent coordinating the security assessment. Dispatch specialists as needed."
+                },
+                {"role": "user", "content": "Begin audit"}
+            ]
+        });
+        assert!(
+            Router::detect_orchestrator(&root_body, "session-root-1", None),
+            "True Root Agent coordinator must be tagged as orchestrator"
+        );
+
+        // 3. Coordinator tool call (wait_for_agents / dispatch_agent) -> orchestrator
+        let dispatch_body = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "wait_for_agents", "arguments": "{}"}
+                        }
+                    ]
+                }
+            ]
+        });
+        assert!(
+            Router::detect_orchestrator(&dispatch_body, "session-generic-1", None),
+            "Coordinator tool calls must be tagged as orchestrator"
+        );
     }
 }
