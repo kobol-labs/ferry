@@ -15,7 +15,7 @@ timeout_secs = 240
 connect_timeout_secs = 10
 circuit_breaker_threshold = 3
 probe_interval_secs = 5
-queue_timeout_ms = 45000
+queue_timeout_ms = 60000
 
 [cloud]
 name = "minimax"

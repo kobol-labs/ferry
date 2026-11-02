@@ -502,24 +502,27 @@ impl Router {
                         return (true, format!("read tool failed: '{tool_name}' returned error"));
                     }
 
-                    // Contextual continuity: if the user prompt initiating this turn sequence
-                    // requested a cognitive reasoning task (audit, architecture, root cause analysis),
-                    // the model is gathering info to answer that request. Retain Cloud execution!
-                    if let Some(user_msg) = messages.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")) {
-                        let user_text = Self::extract_message_text(user_msg);
-                        let user_lower = user_text.to_lowercase();
-                        for kw in HARD_LOGIC_USER_KEYWORDS {
-                            if user_lower.contains(kw) {
-                                return (true, format!("info gathering for cognitive task: '{kw}'"));
-                            }
-                        }
-                        let reasoning_verbs = [
-                            "why", "diagnose", "debug", "architect", "design", "explain",
-                            "solve", "analyze", "investigate", "fix the bug", "find the bug"
-                        ];
-                        for verb in reasoning_verbs {
-                            if user_lower.starts_with(verb) || user_lower.contains(&format!(" {verb} ")) {
-                                return (true, format!("info gathering for reasoning task: '{verb}'"));
+                    // Check for active diagnostic failure signals in the read content
+                    if let Some(sig) = Self::has_real_diagnostic_signal(&text) {
+                        return (true, format!("diagnostic signal in read output: '{sig}'"));
+                    }
+
+                    // Contextual continuity: only escalate passive file reads if the IMMEDIATE
+                    // preceding message was an explicit interactive reasoning/debugging prompt from the user.
+                    // Routine agent loops running in an audit/benchmark session must keep file inspection local ($0).
+                    if messages.len() >= 2 {
+                        let prev_msg = &messages[messages.len() - 2];
+                        if prev_msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                            let user_text = Self::extract_message_text(prev_msg);
+                            let user_lower = user_text.to_lowercase();
+                            let reasoning_verbs = [
+                                "why", "diagnose", "debug", "architect", "design", "explain",
+                                "solve", "analyze", "investigate", "fix the bug", "find the bug"
+                            ];
+                            for verb in reasoning_verbs {
+                                if user_lower.starts_with(verb) || user_lower.contains(&format!(" {verb} ")) {
+                                    return (true, format!("info gathering for immediate user reasoning task: '{verb}'"));
+                                }
                             }
                         }
                     }
@@ -794,10 +797,10 @@ impl Router {
             60000
         } else if is_orchestrator {
             15000 // 15s fast-spillover for orchestrators so swarm is never blocked
-        } else if local_prefer || effective_mode == RoutingMode::Hybrid {
-            queue_timeout_ms.max(45000)
         } else if queue_timeout_ms == 0 {
             0
+        } else if local_prefer || effective_mode == RoutingMode::Hybrid {
+            queue_timeout_ms
         } else if est_tokens <= max_context {
             queue_timeout_ms.clamp(5000, 120000)
         } else {
@@ -1002,6 +1005,37 @@ mod tests {
         let (is_hard, reason) = Router::is_hard_logic_turn(&body_read);
         assert!(!is_hard, "read_file output containing code should stay local, got: {}", reason);
         assert!(reason.contains("passive file/dir inspection"));
+
+        // In a security audit session, ambient 'audit' keywords in the initial user message must NOT force read_file to cloud
+        let body_audit_read = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Perform a comprehensive security audit and vulnerability assessment on the target."
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_inspect_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\": \"public/login.html\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_inspect_1",
+                    "content": "<html><body><form id=\"login-form\">...</form></body></html>"
+                }
+            ]
+        });
+        let (is_hard_audit, reason_audit) = Router::is_hard_logic_turn(&body_audit_read);
+        assert!(!is_hard_audit, "read_file in security audit must stay local ($0), got reason: {}", reason_audit);
+        assert!(reason_audit.contains("passive file/dir inspection"));
     }
 
     #[test]

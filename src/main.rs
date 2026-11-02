@@ -516,9 +516,8 @@ async fn chat_completions_handler(
         || requested_cloud_model
         || (effective_mode == ferry::router::RoutingMode::Hybrid && ferry::router::Router::is_hard_logic_turn(&body).0);
 
-    // Apply hardware-specific local compaction & squeezing ONLY for local targets:
-    if !is_cloud_target {
-        // Rolling context compaction for local slots:
+    // Rolling context compaction when context exceeds compact_threshold_tokens (prunes historical turns for local & cloud):
+    if state.config.condensation.rolling_compaction {
         if let Some(compact_stats) = state.condenser.rolling_compact(&mut body) {
             total_chars_saved += compact_stats.chars_saved;
             state.metrics.record_rolling_compaction(compact_stats.chars_saved);
@@ -526,9 +525,14 @@ async fn chat_completions_handler(
                 session = %session_id,
                 turns_compacted = compact_stats.turns_compacted,
                 chars_saved = compact_stats.chars_saved,
-                "Rolling context compaction pruned historical turns for local GPU"
+                target = if is_cloud_target { "cloud" } else { "local" },
+                "Rolling context compaction pruned historical turns"
             );
         }
+    }
+
+    // Apply hardware-specific adaptive squeezing ONLY for local targets:
+    if !is_cloud_target {
 
         // Adaptive squeezing to fit local context limit:
         let max_context = state.config.local.max_context_tokens as u64;
