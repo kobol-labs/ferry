@@ -58,10 +58,10 @@ bind = "0.0.0.0:4000"
 [local]
 api_base = "http://192.168.9.99:8080/v1"
 api_key = "sk-strata-stevegaming"
-model = "qwen3.8-flash-next-iq2_xs"
-max_slots = 2
-max_context_tokens = 128000
-total_kv_token_budget = 260000
+model = "qwen3.8-flash-next-unsloth-ud-iq4_xs"
+max_slots = 4
+max_context_tokens = 256000
+total_kv_token_budget = 1024000
 adaptive_squeezing = true
 adaptive_squeeze_ratio = 1.35
 timeout_secs = 90
@@ -150,7 +150,7 @@ Every response includes detailed routing metrics and CORS exposure headers:
 ```http
 HTTP/1.1 200 OK
 x-ferry-provider: local
-x-ferry-model: qwen3.8-flash-next-iq2_xs
+x-ferry-model: qwen3.8-flash-next-unsloth-ud-iq4_xs
 x-ferry-est-tokens: 24
 x-ferry-chars-saved: 138
 x-ferry-savings-percent: 34.94%
@@ -170,7 +170,7 @@ Ferry supports full zero-config deployment by overriding any setting via environ
 | `FERRY_BIND` | `0.0.0.0:4000` | Address and port to bind inside container |
 | `FERRY_LOCAL_API_BASE` | `http://192.168.9.99:8080/v1` | Local inference engine base URL |
 | `FERRY_LOCAL_API_KEY` | `sk-strata-stevegaming` | Local engine API key |
-| `FERRY_LOCAL_MODEL` | `qwen3.8-flash-next-iq2_xs` | Local model name |
+| `FERRY_LOCAL_MODEL` | `qwen3.8-flash-next-unsloth-ud-iq4_xs` | Local model name |
 | `FERRY_LOCAL_MAX_SLOTS` | `3` | Maximum concurrent hardware slots |
 | `FERRY_LOCAL_MAX_CONTEXT` | `65000` | Context watermark threshold in tokens |
 | `FERRY_LOCAL_TIMEOUT_SECS` | `90` | Request timeout for local engine |

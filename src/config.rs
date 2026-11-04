@@ -116,10 +116,10 @@ pub struct LocalConfig {
 
 fn default_local_base() -> String { "http://192.168.9.99:8080/v1".to_string() }
 fn default_local_key() -> String { "sk-strata-stevegaming".to_string() }
-fn default_local_model() -> String { "qwen3.8-flash-next-iq2_xs".to_string() }
+fn default_local_model() -> String { "qwen3.8-flash-next-unsloth-ud-iq4_xs".to_string() }
 fn default_max_slots() -> usize { 4 }
-fn default_max_context_tokens() -> usize { 128000 }
-fn default_total_kv_token_budget() -> usize { 390000 }
+fn default_max_context_tokens() -> usize { 256000 }
+fn default_total_kv_token_budget() -> usize { 1024000 }
 fn default_adaptive_squeezing() -> bool { true }
 fn default_adaptive_squeeze_ratio() -> f64 { 1.35 }
 fn default_timeout_secs() -> u64 { 90 }
