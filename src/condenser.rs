@@ -116,8 +116,8 @@ impl ContextCondenser {
                                     if *seen_so_far > 1 {
                                         if let Some(obj) = msg.as_object_mut() {
                                             let folded = format!(
-                                                "[... Ferry Proxy: Repeated identical tool failure suppressed (attempt {} of {}); see earlier turn for output ...]",
-                                                *seen_so_far, total_count
+                                                "[... Ferry Proxy: Repeated identical tool failure suppressed (attempt #{}); see earlier turn for output ...]",
+                                                *seen_so_far
                                             );
                                             if obj.contains_key("content") {
                                                 obj.insert("content".to_string(), Value::String(folded));
@@ -435,6 +435,16 @@ impl ContextCondenser {
         let mut split_idx = total_msgs.saturating_sub(keep_recent);
         if split_idx <= start_idx {
             return None;
+        }
+
+        // Prefix-cache stability: Quantize compaction boundary to fixed 16-message epochs
+        // from `start_idx` so that in stateless proxy requests, `messages[1]` (the checkpoint
+        // summary) remains 100% byte-for-byte immutable across 8 consecutive turns instead of
+        // mutating on every single turn and invalidating the local GPU KV cache.
+        let raw_compacted = split_idx - start_idx;
+        if raw_compacted >= 16 {
+            let quantized = (raw_compacted / 16) * 16;
+            split_idx = start_idx + quantized;
         }
 
         // Safety: ensure we do not split an assistant tool_call from its tool responses

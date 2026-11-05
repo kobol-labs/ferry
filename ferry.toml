@@ -42,11 +42,11 @@ idle_reclaim_secs = 60
 enabled = true
 drop_historical_reasoning = true
 truncate_tool_outputs = true
-keep_recent_turns = 4
-max_tool_chars = 2000
+keep_recent_turns = 1
+max_tool_chars = 12000
 recent_max_tool_chars = 24000
-head_lines = 12
-tail_lines = 8
+head_lines = 15
+tail_lines = 10
 strip_ansi_escapes = true
 strip_progress_bars = true
 collapse_whitespace = true
@@ -60,7 +60,7 @@ enable_constraint_ledger = true
 protect_static_prefix = true
 fold_repeated_tool_failures = true
 rolling_compaction = true
-compact_threshold_tokens = 16000
+compact_threshold_tokens = 36000
 compact_keep_recent_turns = 4
 
 [telemetry]

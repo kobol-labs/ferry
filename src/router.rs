@@ -370,6 +370,100 @@ impl Router {
         None
     }
 
+    pub fn get_last_tool_args(messages: &[Value]) -> Option<String> {
+        for msg in messages.iter().rev().skip(1) {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "assistant" {
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    if let Some(last_tc) = tool_calls.last() {
+                        if let Some(func) = last_tc.get("function") {
+                            if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                return Some(args.to_string());
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn is_passive_read_tool_call(messages: &[Value], tool_name: &str) -> bool {
+        if matches!(
+            tool_name,
+            "read_file"
+                | "cat"
+                | "view"
+                | "read_resource"
+                | "list_dir"
+                | "list_resources"
+                | "search_marketplace"
+                | "search_web"
+                | "grep"
+                | "find_by_name"
+                | "grep_search"
+        ) {
+            return true;
+        }
+
+        if matches!(
+            tool_name,
+            "execute_bash" | "bash" | "run_command" | "shell" | "terminal"
+        ) {
+            if let Some(args_str) = Self::get_last_tool_args(messages) {
+                let cmd_opt = serde_json::from_str::<Value>(&args_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("command")
+                            .or_else(|| v.get("cmd"))
+                            .or_else(|| v.get("CommandLine"))
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or(args_str);
+
+                let mut cmd_lower = cmd_opt.trim().to_lowercase();
+                // Strip leading `cd ... &&`
+                if let Some(idx) = cmd_lower.find("&&") {
+                    if cmd_lower[..idx].trim().starts_with("cd ") {
+                        cmd_lower = cmd_lower[idx + 2..].trim().to_string();
+                    }
+                }
+
+                let is_passive_cmd = cmd_lower.starts_with("cat ")
+                    || cmd_lower.starts_with("head ")
+                    || cmd_lower.starts_with("tail ")
+                    || cmd_lower.starts_with("sed ")
+                    || cmd_lower.starts_with("nl ")
+                    || cmd_lower.starts_with("grep ")
+                    || cmd_lower.starts_with("rg ")
+                    || cmd_lower.starts_with("find ")
+                    || cmd_lower.starts_with("ls ")
+                    || cmd_lower.starts_with("wc ")
+                    || cmd_lower.starts_with("stat ")
+                    || cmd_lower.starts_with("file ")
+                    || cmd_lower.starts_with("git status")
+                    || cmd_lower.starts_with("git log")
+                    || cmd_lower.starts_with("git diff")
+                    || cmd_lower.starts_with("git show");
+
+                let has_active_exec = cmd_lower.contains("curl ")
+                    || cmd_lower.contains("python")
+                    || cmd_lower.contains("node ")
+                    || cmd_lower.contains("npm ")
+                    || cmd_lower.contains("cargo ")
+                    || cmd_lower.contains("pytest");
+
+                if is_passive_cmd && !has_active_exec {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     pub fn is_mechanical_user_command(lower: &str) -> bool {
         let trimmed = lower.trim();
         // Git operations
@@ -425,43 +519,157 @@ impl Router {
         false
     }
 
+    pub fn is_source_code_or_comment_line(line_lower: &str) -> bool {
+        let mut l = line_lower.trim_start();
+
+        // Strip optional line-number or file:line: prefixes from `nl`, `cat -n`, or `grep -n`
+        if let Some(colon_idx) = l.find(':') {
+            let prefix = &l[..colon_idx];
+            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+                l = l[colon_idx + 1..].trim_start();
+            } else if (prefix.ends_with(".ts")
+                || prefix.ends_with(".tsx")
+                || prefix.ends_with(".js")
+                || prefix.ends_with(".jsx")
+                || prefix.ends_with(".py")
+                || prefix.ends_with(".rs")
+                || prefix.ends_with(".go"))
+                && !prefix.contains(' ')
+            {
+                let after_file = &l[colon_idx + 1..];
+                if let Some(second_colon) = after_file.find(':') {
+                    if !after_file[..second_colon].is_empty()
+                        && after_file[..second_colon].chars().all(|c| c.is_ascii_digit())
+                    {
+                        l = after_file[second_colon + 1..].trim_start();
+                    } else {
+                        l = after_file.trim_start();
+                    }
+                } else {
+                    l = after_file.trim_start();
+                }
+            }
+        } else if let Some(tab_idx) = l.find('\t') {
+            let prefix = l[..tab_idx].trim();
+            if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+                l = l[tab_idx + 1..].trim_start();
+            }
+        }
+
+        if l.starts_with("//")
+            || l.starts_with("/*")
+            || l.starts_with("* ")
+            || l.starts_with("import ")
+            || l.starts_with("export ")
+            || l.starts_with("return ")
+            || l.starts_with("const ")
+            || l.starts_with("let ")
+            || l.starts_with("var ")
+            || l.starts_with("function ")
+            || l.starts_with("async ")
+            || l.starts_with("pub fn ")
+            || l.starts_with("fn ")
+            || l.starts_with("def ")
+            || l.starts_with("try {")
+            || l.starts_with("} catch")
+            || l.starts_with("catch (")
+            || l.starts_with("catch {")
+        {
+            return true;
+        }
+
+        if l.contains("nextresponse.json")
+            || l.contains("response.json(")
+            || l.contains("new response(")
+            || l.contains("res.status(")
+            || l.contains("res.json(")
+            || l.contains("console.error(")
+            || l.contains("console.warn(")
+            || l.contains("logger.error(")
+            || l.contains("{ status: 500")
+            || l.contains("{status: 500")
+            || l.contains(", status: 500")
+            || l.contains("{ status: 502")
+            || l.contains("{ status: 503")
+            || l.contains("{ error:")
+            || l.contains("{error:")
+            || l.contains(", error:")
+            || l.contains("error: any")
+            || l.contains("error: unknown")
+            || l.contains("error: string")
+            || l.contains("error?:")
+            || l.contains("throw new error(")
+        {
+            return true;
+        }
+
+        false
+    }
+
     pub fn has_real_diagnostic_signal(text: &str) -> Option<&'static str> {
-        let text_lower = text.to_lowercase();
-
-        // Check each high-confidence signal
-        for &signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
-            if text_lower.contains(signal) {
-                return Some(signal);
+        for raw_line in text.lines() {
+            let line_lower = raw_line.to_lowercase();
+            if Self::is_source_code_or_comment_line(&line_lower) {
+                continue;
             }
-        }
 
-        // Check for error markers while filtering false alarms like "error": null, 0 errors, error: none
-        if let Some(pos) = text_lower.find("error:") {
-            let tail = text_lower[pos + 6..].trim_start();
-            if !tail.starts_with("null")
-                && !tail.starts_with("\"\"")
-                && !tail.starts_with("false")
-                && !tail.starts_with("none")
-                && !tail.starts_with('0')
-            {
-                return Some("error:");
+            // Check each high-confidence signal on non-source-code lines
+            for &signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
+                if line_lower.contains(signal) {
+                    return Some(signal);
+                }
             }
-        }
 
-        if let Some(pos) = text_lower.find("\"error\":") {
-            let tail = text_lower[pos + 8..].trim_start();
-            if !tail.starts_with("null")
-                && !tail.starts_with("\"\"")
-                && !tail.starts_with("false")
-                && !tail.starts_with("none")
-                && !tail.starts_with('0')
-            {
-                return Some("\"error\":");
+            // Check for error markers while filtering false alarms like "error": null, 0 errors, error: none
+            if let Some(pos) = line_lower.find("error:") {
+                let prefix = line_lower[..pos].trim_end();
+                let is_object_key = prefix.ends_with('{') || prefix.ends_with(',');
+                let tail = line_lower[pos + 6..].trim_start();
+                if !is_object_key
+                    && !tail.starts_with("null")
+                    && !tail.starts_with("\"\"")
+                    && !tail.starts_with("''")
+                    && !tail.starts_with('\'')
+                    && !tail.starts_with("false")
+                    && !tail.starts_with("none")
+                    && !tail.starts_with('0')
+                    && !tail.starts_with("any")
+                    && !tail.starts_with("unknown")
+                    && !tail.starts_with("string")
+                {
+                    return Some("error:");
+                }
             }
-        }
 
-        if text_lower.contains("[error]") || text_lower.contains("err:") {
-            return Some("error signal");
+            if let Some(pos) = line_lower.find("\"error\":") {
+                let tail = line_lower[pos + 8..].trim_start();
+                let tail_unquoted = tail.trim_start_matches('"');
+                let is_routine_4xx = tail_unquoted.starts_with("unauthorized")
+                    || tail_unquoted.starts_with("forbidden")
+                    || tail_unquoted.starts_with("not found")
+                    || tail_unquoted.starts_with("invalid")
+                    || tail_unquoted.starts_with("missing")
+                    || tail_unquoted.starts_with("bad request")
+                    || tail_unquoted.starts_with("method not allowed")
+                    || tail_unquoted.starts_with("unauthenticated")
+                    || tail_unquoted.starts_with("no token")
+                    || tail_unquoted.starts_with("rate limit")
+                    || tail_unquoted.starts_with("too many requests");
+
+                if !tail.starts_with("null")
+                    && !tail.starts_with("\"\"")
+                    && !tail.starts_with("false")
+                    && !tail.starts_with("none")
+                    && !tail.starts_with('0')
+                    && !is_routine_4xx
+                {
+                    return Some("\"error\":");
+                }
+            }
+
+            if line_lower.contains("[error]") || line_lower.contains("err:") {
+                return Some("error signal");
+            }
         }
 
         None
@@ -484,10 +692,7 @@ impl Router {
         match role {
             "tool" => {
                 let tool_name = Self::get_last_tool_name(messages).unwrap_or_default();
-                let is_read_only = matches!(
-                    tool_name.as_str(),
-                    "read_file" | "cat" | "view" | "read_resource" | "list_dir" | "list_resources" | "search_marketplace" | "search_web"
-                );
+                let is_read_only = Self::is_passive_read_tool_call(messages, &tool_name);
 
                 // For passive file/info read tools:
                 if is_read_only {
@@ -500,11 +705,6 @@ impl Router {
                         || trimmed_lower.starts_with("notfound")
                     {
                         return (true, format!("read tool failed: '{tool_name}' returned error"));
-                    }
-
-                    // Check for active diagnostic failure signals in the read content
-                    if let Some(sig) = Self::has_real_diagnostic_signal(&text) {
-                        return (true, format!("diagnostic signal in read output: '{sig}'"));
                     }
 
                     // Contextual continuity: only escalate passive file reads if the IMMEDIATE
@@ -1074,6 +1274,34 @@ mod tests {
         let (is_hard_audit, reason_audit) = Router::is_hard_logic_turn(&body_audit_read);
         assert!(!is_hard_audit, "read_file in security audit must stay local ($0), got reason: {}", reason_audit);
         assert!(reason_audit.contains("passive file/dir inspection"));
+
+        // Next.js route source code containing `NextResponse.json({ error: ... }, { status: 500 })` -> MUST NOT escalate
+        let body_nextjs_src = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_bash_1",
+                            "type": "function",
+                            "function": {
+                                "name": "execute_bash",
+                                "arguments": "{\"command\": \"cat src/app/api/cards/route.ts\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_bash_1",
+                    "content": "export async function POST(req: Request) {\n  try {\n    return NextResponse.json({ ok: true });\n  } catch (error: unknown) {\n    console.error('Error:', error);\n    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });\n  }\n}"
+                }
+            ]
+        });
+        let (is_hard_nextjs, reason_nextjs) = Router::is_hard_logic_turn(&body_nextjs_src);
+        assert!(!is_hard_nextjs, "Next.js source code inspection must stay local, got: {}", reason_nextjs);
+        assert!(Router::has_real_diagnostic_signal("return NextResponse.json({ error: 'Failed' }, { status: 500 });").is_none());
+        assert!(Router::has_real_diagnostic_signal("{\"error\":\"Unauthorized\"}").is_none());
     }
 
     #[test]

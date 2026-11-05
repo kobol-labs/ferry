@@ -242,9 +242,9 @@ pub struct CondenserConfig {
 fn default_condensation_enabled() -> bool { true }
 fn default_drop_historical_reasoning() -> bool { true }
 fn default_truncate_tool_outputs() -> bool { true }
-fn default_keep_recent_turns() -> usize { 4 }
-fn default_max_tool_chars() -> usize { 2000 }
-fn default_recent_max_tool_chars() -> usize { 60000 }
+fn default_keep_recent_turns() -> usize { 1 }
+fn default_max_tool_chars() -> usize { 12000 }
+fn default_recent_max_tool_chars() -> usize { 24000 }
 fn default_head_lines() -> usize { 15 }
 fn default_tail_lines() -> usize { 10 }
 fn default_strip_terminal_noise() -> bool { true }
@@ -255,7 +255,7 @@ fn default_suppress_base64_blobs() -> bool { true }
 fn default_shield_dir_traversals() -> bool { true }
 fn default_fold_repeated_tool_failures() -> bool { true }
 fn default_rolling_compaction() -> bool { true }
-fn default_compact_threshold_tokens() -> u64 { 64000 }
+fn default_compact_threshold_tokens() -> u64 { 36000 }
 fn default_compact_keep_recent_turns() -> usize { 4 }
 
 impl Default for CondenserConfig {
