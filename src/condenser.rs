@@ -136,7 +136,8 @@ impl ContextCondenser {
         }
 
         // 2. Iterate through all messages
-        for idx in 0..messages.len() {
+        let msg_count = messages.len();
+        for idx in 0..msg_count {
             let msg = &mut messages[idx];
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default().to_string();
             let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
@@ -149,9 +150,13 @@ impl ContextCondenser {
             }
 
             let is_historical = idx < cutoff_index;
+            // Any assistant/reasoning message that is already followed by a tool result or user reply
+            // is a completed past turn. Stripping its internal reasoning immediately ensures the prefix
+            // bytes never mutate on the Turn T -> Turn T+1 transition.
+            let is_completed_turn = is_historical || (idx + 1 < msg_count);
 
             // A) Handle standalone reasoning message items
-            if is_historical && self.config.drop_historical_reasoning && msg_type == "reasoning" {
+            if is_completed_turn && self.config.drop_historical_reasoning && msg_type == "reasoning" {
                 if let Some(obj) = msg.as_object_mut() {
                     if let Some(c) = obj.get_mut("content") {
                         *c = Value::String(String::new());
@@ -166,7 +171,7 @@ impl ContextCondenser {
 
             // B) Handle assistant messages with reasoning fields or <think> tags
             // CRITICAL INVARIANT: tool_calls array is NEVER mutated
-            if is_historical && self.config.drop_historical_reasoning && (role == "assistant" || msg_type == "message") {
+            if is_completed_turn && self.config.drop_historical_reasoning && (role == "assistant" || msg_type == "message") {
                 if let Some(obj) = msg.as_object_mut() {
                     if obj.remove("reasoning").is_some() {
                         stats.reasoning_blocks_dropped += 1;
@@ -255,18 +260,30 @@ impl ContextCondenser {
         // Truncation logic
         if self.config.truncate_tool_outputs {
             if is_historical {
-                // Historical turns: aggressive truncation to max_tool_chars with signal awareness
+                // Historical turns: smart truncation to max_tool_chars with signal awareness.
+                // When max_tool_chars is set to a large stationary budget (>= 8000), use the same
+                // head/tail window as recent turns so tool messages never mutate across turn transitions.
                 if processed.len() > self.config.max_tool_chars {
+                    let hist_head = if self.config.max_tool_chars >= 8000 {
+                        self.config.head_lines.max(30)
+                    } else {
+                        self.config.head_lines
+                    };
+                    let hist_tail = if self.config.max_tool_chars >= 8000 {
+                        self.config.tail_lines.max(20)
+                    } else {
+                        self.config.tail_lines
+                    };
                     processed = truncate_tool_content_smart(
                         &processed,
-                        self.config.head_lines,
-                        self.config.tail_lines,
+                        hist_head,
+                        hist_tail,
                         &mut stats.signals_extracted_count,
                     );
                     stats.tool_outputs_truncated += 1;
                 }
             } else {
-                // Recent active turn: generous runaway safety cap (default 60k chars)
+                // Recent active turn: runaway safety cap
                 // Prevents blinding the auditor on code files being analyzed
                 if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
                     let recent_head = self.config.head_lines.max(30);
@@ -284,8 +301,8 @@ impl ContextCondenser {
 
         // Permanent invariant: PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
         if !is_historical {
-            // In the recent active turn, 100% of critical anchors must survive
-            let anchors = extract_critical_anchors(initial_text);
+            // In the recent active turn, 100% of technical/critical anchors must survive
+            let anchors = extract_tool_anchors(initial_text);
             if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
                 warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
                 stats.ledger_vetoed_count += 1;
@@ -694,11 +711,12 @@ impl ContextCondenser {
             }
         }
 
-        // 3. Minify pretty-printed JSON outputs
+        // 3. Minify pretty-printed JSON outputs (skip single-line already-compact JSON)
         if self.config.minify_json_outputs {
             let trimmed = text.trim();
-            if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            if (trimmed.contains('\n') || trimmed.contains("  "))
+                && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+                    || (trimmed.starts_with('[') && trimmed.ends_with(']')))
             {
                 if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
                     if let Ok(minified) = serde_json::to_string(&val) {
@@ -792,6 +810,16 @@ pub fn segment_markdown_code_blocks(input: &str) -> Vec<ContentSegment> {
 
 /// Extracts critical anchor entities from text (file paths, URLs, ports, imperatives)
 pub fn extract_critical_anchors(text: &str) -> Vec<String> {
+    extract_anchors_internal(text, true)
+}
+
+/// Extracts technical/security anchors from tool outputs without matching common English prose words
+/// ("cannot", "not", "never", "must", "high") that appear in source code comments and cause false vetoes.
+pub fn extract_tool_anchors(text: &str) -> Vec<String> {
+    extract_anchors_internal(text, false)
+}
+
+fn extract_anchors_internal(text: &str, include_prose_imperatives: bool) -> Vec<String> {
     let mut anchors = Vec::new();
 
     for token in text.split_whitespace() {
@@ -862,21 +890,25 @@ pub fn extract_critical_anchors(text: &str) -> Vec<String> {
         }
 
         // 6. Security keywords and imperatives
-        if upper == "CRITICAL"
-            || upper == "CVSS"
-            || upper == "HIGH"
-            || upper == "NOT"
-            || upper == "NEVER"
-            || upper == "MUST"
-            || upper == "DENY"
-            || upper == "DON'T"
-            || upper == "DONT"
-            || upper == "DO_NOT"
-            || upper == "CANNOT"
-            || upper == "FORBIDDEN"
-            || upper == "RESTRICTED"
-            || upper == "PROHIBITED"
-            || upper == "BYPASS"
+        if upper == "CRITICAL" || upper == "CVSS" {
+            anchors.push(clean.to_string());
+            continue;
+        }
+
+        if include_prose_imperatives
+            && (upper == "HIGH"
+                || upper == "NOT"
+                || upper == "NEVER"
+                || upper == "MUST"
+                || upper == "DENY"
+                || upper == "DON'T"
+                || upper == "DONT"
+                || upper == "DO_NOT"
+                || upper == "CANNOT"
+                || upper == "FORBIDDEN"
+                || upper == "RESTRICTED"
+                || upper == "PROHIBITED"
+                || upper == "BYPASS")
         {
             anchors.push(clean.to_string());
             continue;
@@ -1978,5 +2010,11 @@ mod tests {
         assert!(!checkpoint.contains("• [User Request]: [Historical Context Checkpoint"));
         assert!(checkpoint.contains("First audit step"));
         assert!(checkpoint.contains("Second audit step"));
+
+        // Verify extract_tool_anchors excludes common prose words like "cannot" while keeping paths/CVEs
+        let tool_anchors = extract_tool_anchors("// Note: user cannot modify /api/cards without CVE-2026-1111");
+        assert!(!tool_anchors.iter().any(|a| a.eq_ignore_ascii_case("cannot")));
+        assert!(tool_anchors.iter().any(|a| a == "/api/cards"));
+        assert!(tool_anchors.iter().any(|a| a == "CVE-2026-1111"));
     }
 }

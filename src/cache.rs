@@ -52,9 +52,9 @@ impl ResponseCache {
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         model.hash(&mut hasher);
-        messages.to_string().hash(&mut hasher);
+        hash_json_value(messages, &mut hasher);
         if let Some(t) = tools {
-            t.to_string().hash(&mut hasher);
+            hash_json_value(t, &mut hasher);
         }
 
         Some(format!("{:016x}", hasher.finish()))
@@ -106,5 +106,45 @@ impl ResponseCache {
 
     pub async fn len(&self) -> usize {
         self.store.read().await.len()
+    }
+}
+
+/// Zero-allocation recursive hash of a `serde_json::Value` tree.
+fn hash_json_value<H: Hasher>(val: &Value, hasher: &mut H) {
+    match val {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::Number(n) => {
+            2u8.hash(hasher);
+            if let Some(i) = n.as_i64() {
+                i.hash(hasher);
+            } else if let Some(u) = n.as_u64() {
+                u.hash(hasher);
+            } else if let Some(f) = n.as_f64() {
+                f.to_bits().hash(hasher);
+            }
+        }
+        Value::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Array(arr) => {
+            4u8.hash(hasher);
+            arr.len().hash(hasher);
+            for item in arr {
+                hash_json_value(item, hasher);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(hasher);
+            map.len().hash(hasher);
+            for (k, v) in map {
+                k.hash(hasher);
+                hash_json_value(v, hasher);
+            }
+        }
     }
 }

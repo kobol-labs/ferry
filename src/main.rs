@@ -512,9 +512,15 @@ async fn chat_completions_handler(
         .map(|m| m == state.config.cloud.model || m == "cloud")
         .unwrap_or(false);
 
+    let precomputed_hard_logic = if effective_mode == ferry::router::RoutingMode::Hybrid {
+        Some(ferry::router::Router::is_hard_logic_turn(&body))
+    } else {
+        None
+    };
+
     let is_cloud_target = effective_mode == ferry::router::RoutingMode::CloudOnly
         || requested_cloud_model
-        || (effective_mode == ferry::router::RoutingMode::Hybrid && ferry::router::Router::is_hard_logic_turn(&body).0);
+        || precomputed_hard_logic.as_ref().map(|(is_hard, _)| *is_hard).unwrap_or(false);
 
     // Rolling context compaction when context exceeds compact_threshold_tokens (prunes historical turns for local & cloud):
     if state.config.condensation.rolling_compaction {
@@ -531,6 +537,8 @@ async fn chat_completions_handler(
         }
     }
 
+    let mut precomputed_tokens: Option<u64> = None;
+
     // Apply hardware-specific adaptive squeezing ONLY for local targets:
     if !is_cloud_target {
 
@@ -539,10 +547,12 @@ async fn chat_completions_handler(
         let squeeze_ratio = state.config.local.adaptive_squeeze_ratio;
         if state.config.local.adaptive_squeezing {
             let est_tokens = ferry::router::Router::estimate_tokens(&body);
+            precomputed_tokens = Some(est_tokens);
             if est_tokens > max_context && est_tokens <= (max_context as f64 * squeeze_ratio) as u64 {
                 if let Some(extra_saved) = state.condenser.adaptive_squeeze(&mut body, max_context) {
                     total_chars_saved += extra_saved;
                     let new_tokens = ferry::router::Router::estimate_tokens(&body);
+                    precomputed_tokens = Some(new_tokens);
                     if new_tokens <= max_context {
                         state.metrics.adaptive_squeezed_count.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(
@@ -564,7 +574,17 @@ async fn chat_completions_handler(
         0.0
     };
 
-    let decision = state.router.decide_for_session(&body, route_override, explicit_wait, &session_id).await;
+    let decision = state
+        .router
+        .decide_for_session_with_hints(
+            &body,
+            route_override,
+            explicit_wait,
+            &session_id,
+            precomputed_tokens,
+            precomputed_hard_logic,
+        )
+        .await;
 
     // If caller requested local-only and local provider is unavailable, fail fast with 503
     if decision.target == ferry::router::TargetProvider::Cloud && decision.local_only {

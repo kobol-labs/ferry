@@ -272,53 +272,70 @@ impl Router {
 
         // 3. Inspect messages for orchestrator signatures vs specialist signatures
         if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+            // 3a. Check actual tool_calls first: any session invoking coordinator tools is an orchestrator;
+            // any session invoking agent_finish is strictly a sub-agent.
             for msg in messages {
-                if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-                    if role == "system" {
-                        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                            let c_lower = content.to_lowercase();
-                            // If this system prompt defines a specialist subagent, do NOT mark as root orchestrator
-                            if c_lower.contains("current_agent=auth")
-                                || c_lower.contains("current_agent=sql")
-                                || c_lower.contains("current_agent=ssrf")
-                                || c_lower.contains("current_agent=tenant")
-                                || c_lower.contains("current_agent=scraper")
-                                || c_lower.contains("current_agent=static")
-                                || c_lower.contains("current_agent=live")
-                                || c_lower.contains("you are a specialist")
-                                || c_lower.contains("you are an automated security hunter")
-                            {
-                                return false;
-                            }
-                            if c_lower.starts_with("you are the root agent")
-                                || c_lower.starts_with("you are a root agent")
-                                || c_lower.contains("current_agent=root agent")
-                                || c_lower.contains("role: root_agent")
-                                || c_lower.contains("coordination/root_agent")
-                                || c_lower.contains("root=true")
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    let c_lower = content.to_lowercase();
-                    if c_lower.contains("as the root agent")
-                        || c_lower.contains("wait_for_agents")
-                        || c_lower.contains("dispatch_agent")
-                    {
-                        return true;
-                    }
-                }
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
                     for tc in tool_calls {
                         if let Some(func) = tc.get("function") {
                             if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                if matches!(name, "wait_for_agents" | "assign_task" | "dispatch_agent" | "spawn_agent") {
+                                if matches!(
+                                    name,
+                                    "wait_for_agents"
+                                        | "create_agent"
+                                        | "assign_task"
+                                        | "dispatch_agent"
+                                        | "spawn_agent"
+                                        | "finish_scan"
+                                        | "send_message_to_agent"
+                                ) {
                                     return true;
                                 }
+                                if name == "agent_finish" {
+                                    return false;
+                                }
                             }
+                        }
+                    }
+                }
+            }
+
+            // 3b. Inspect system and initial user prompts
+            for msg in messages.iter().take(2) {
+                if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        let c_lower = content.to_lowercase();
+                        // If this prompt defines a specialist subagent, do NOT mark as root orchestrator
+                        if (c_lower.contains("current_agent=auth")
+                            || c_lower.contains("current_agent=sql")
+                            || c_lower.contains("current_agent=ssrf")
+                            || c_lower.contains("current_agent=tenant")
+                            || c_lower.contains("current_agent=scraper")
+                            || c_lower.contains("current_agent=static")
+                            || c_lower.contains("current_agent=live")
+                            || c_lower.contains("you are a specialist")
+                            || c_lower.contains("you are an automated security hunter")
+                            || c_lower.contains("sub-agent")
+                            || c_lower.contains("subagent"))
+                            && !c_lower.contains("mandatory for root agent")
+                            && !c_lower.starts_with("you are the root agent")
+                        {
+                            return false;
+                        }
+                        if role == "system"
+                            && (c_lower.starts_with("you are the root agent")
+                                || c_lower.starts_with("you are a root agent")
+                                || c_lower.contains("current_agent=root agent")
+                                || c_lower.contains("role: root_agent")
+                                || c_lower.contains("coordination/root_agent")
+                                || c_lower.contains("root=true"))
+                        {
+                            return true;
+                        }
+                        if c_lower.contains("as the root agent")
+                            || c_lower.contains("mandatory for root agent")
+                        {
+                            return true;
                         }
                     }
                 }
@@ -667,7 +684,9 @@ impl Router {
                 }
             }
 
-            if line_lower.contains("[error]") || line_lower.contains("err:") {
+            if line_lower.contains("[error]")
+                || (line_lower.contains("err:") && !line_lower.contains("stderr:"))
+            {
                 return Some("error signal");
             }
         }
@@ -838,7 +857,19 @@ impl Router {
         explicit_timeout_ms: Option<u64>,
         session_id: &str,
     ) -> RouteDecision {
-        let est_tokens = Self::estimate_tokens(body);
+        self.decide_for_session_with_hints(body, route_override, explicit_timeout_ms, session_id, None, None).await
+    }
+
+    pub async fn decide_for_session_with_hints(
+        &self,
+        body: &Value,
+        route_override: Option<&str>,
+        explicit_timeout_ms: Option<u64>,
+        session_id: &str,
+        precomputed_tokens: Option<u64>,
+        precomputed_hard_logic: Option<(bool, String)>,
+    ) -> RouteDecision {
+        let est_tokens = precomputed_tokens.unwrap_or_else(|| Self::estimate_tokens(body));
         let effective_mode = route_override
             .and_then(RoutingMode::parse)
             .or_else(|| RoutingMode::parse(&self.config.routing.default_route))
@@ -911,7 +942,7 @@ impl Router {
 
         // 4. Hybrid cognitive turn routing (escalate hard logic / diagnostics to Cloud; revert to Local for mechanical)
         if effective_mode == RoutingMode::Hybrid {
-            let (is_hard, reason) = Self::is_hard_logic_turn(body);
+            let (is_hard, reason) = precomputed_hard_logic.unwrap_or_else(|| Self::is_hard_logic_turn(body));
             if is_hard {
                 if self.metrics.is_cloud_rate_limited() && self.metrics.is_strata_online() {
                     tracing::warn!(
@@ -1302,6 +1333,8 @@ mod tests {
         assert!(!is_hard_nextjs, "Next.js source code inspection must stay local, got: {}", reason_nextjs);
         assert!(Router::has_real_diagnostic_signal("return NextResponse.json({ error: 'Failed' }, { status: 500 });").is_none());
         assert!(Router::has_real_diagnostic_signal("{\"error\":\"Unauthorized\"}").is_none());
+        assert!(Router::has_real_diagnostic_signal("stdout: ok\nstderr: % Total % Received").is_none());
+        assert_eq!(Router::has_real_diagnostic_signal("err: connection reset"), Some("error signal"));
     }
 
     #[test]

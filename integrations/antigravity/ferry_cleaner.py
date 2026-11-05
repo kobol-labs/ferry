@@ -18,10 +18,15 @@ import sys
 import os
 import re
 import json
+import time
+import signal
+import selectors
 import subprocess
+from datetime import datetime
 from typing import List, Tuple, Optional
 
-# Diagnostic failure signals (from Ferry's condenser.rs DIAGNOSTIC_SIGNALS)
+# High-signal runtime & compiler failure indicators (avoids broad domain nouns like "jwt" or "idor"
+# that fragment normal source code inspection into 1-line swiss-cheese truncations).
 DIAGNOSTIC_SIGNALS = [
     "error:",
     "error[",
@@ -36,7 +41,6 @@ DIAGNOSTIC_SIGNALS = [
     "cwe-",
     "cve-",
     "ghsa-",
-    "assert",
     "traceback",
     "syntaxerror",
     "typeerror",
@@ -45,54 +49,26 @@ DIAGNOSTIC_SIGNALS = [
     "status 502",
     "status 503",
     "status 504",
-    "status 400",
-    "status 401",
-    "status 403",
-    "status 404",
-    "status 422",
-    "status 429",
-    "bad request",
-    "not found",
     "internal server error",
     "bad gateway",
     "service unavailable",
     "gateway timeout",
-    "unauthorized",
-    "forbidden",
-    "access denied",
     "permission denied",
     "connection refused",
     "timed out",
-    "timeout",
     "no such file",
     "command not found",
     "cannot find module",
     "module not found",
-    "invalid",
-    "unrecognized",
-    "malformed",
-    "corrupt",
     "warning:",
     "warn:",
     "critical:",
-    "rejected",
-    "expired",
     "sigsegv",
     "segmentation fault",
     "sql syntax",
     "sqlite3.",
     "syntax error near",
     "unterminated quotation",
-    "sqli",
-    "xss",
-    "csrf",
-    "idor",
-    "ssrf",
-    "token_version",
-    "jwt",
-    "bearer",
-    "leak",
-    "bypass",
     "unhandled",
     "uncaught",
     "nullpointer",
@@ -386,26 +362,35 @@ def truncate_signal_aware(text: str, head_lines: int = DEFAULT_HEAD_LINES, tail_
             if 0 <= target < len(mid):
                 selected_mid_indices.add(target)
 
-    # Sort and produce middle snippet
+    # Sort and produce middle snippet, coalescing tiny gaps (<= 4 lines) so we never emit
+    # a 1-line "[... Truncated 1 uninformative lines ...]" banner that costs more tokens than the line itself.
     sorted_indices = sorted(selected_mid_indices)
+    coalesced_indices = []
+    for idx in sorted_indices:
+        if coalesced_indices and 1 < (idx - coalesced_indices[-1]) <= 5:
+            for fill_idx in range(coalesced_indices[-1] + 1, idx):
+                coalesced_indices.append(fill_idx)
+        coalesced_indices.append(idx)
+
     extracted_lines = []
     last_idx = None
-    for idx in sorted_indices:
+    for idx in coalesced_indices:
         if last_idx is not None and idx > last_idx + 1:
             extracted_lines.append(f"[... Truncated {idx - last_idx - 1} uninformative lines ...]")
         extracted_lines.append(mid[idx])
         last_idx = idx
 
-    banner_start = f"\n[... Ferry Cleaner: Truncated {len(mid) - len(sorted_indices)} uninformative lines; preserved {len(signal_line_indices)} diagnostic signal(s) ...]\n"
+    banner_start = f"\n[... Ferry Cleaner: Truncated {len(mid) - len(coalesced_indices)} uninformative lines; preserved {len(signal_line_indices)} diagnostic signal(s) ...]\n"
     mid_content = '\n'.join(extracted_lines)
     return '\n'.join(head) + banner_start + mid_content + "\n\n" + '\n'.join(tail)
 
 
 STATS_FILE = "/tmp/ferry_cleaner_stats.json"
+MAX_STATS_HISTORY = 500
 
 
 def record_stats(command_str: str, raw_text: str, cleaned_text: str):
-    """Appends condensation run statistics to STATS_FILE."""
+    """Appends condensation run statistics to STATS_FILE using native datetime (zero subprocess overhead)."""
     try:
         orig_chars = len(raw_text)
         cond_chars = len(cleaned_text)
@@ -414,7 +399,7 @@ def record_stats(command_str: str, raw_text: str, cleaned_text: str):
         est_tokens_saved = saved_chars // 4
 
         entry = {
-            "timestamp": str(subprocess.check_output(["date", "+%Y-%m-%dT%H:%M:%S%z"]).decode().strip()),
+            "timestamp": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
             "command": command_str[:120],
             "orig_chars": orig_chars,
             "cond_chars": cond_chars,
@@ -434,9 +419,13 @@ def record_stats(command_str: str, raw_text: str, cleaned_text: str):
             try:
                 with open(STATS_FILE, "r") as f:
                     history = json.load(f)
+                    if not isinstance(history, list):
+                        history = []
             except Exception:
                 history = []
 
+        if len(history) >= MAX_STATS_HISTORY:
+            history = history[-(MAX_STATS_HISTORY - 1):]
         history.append(entry)
         with open(STATS_FILE, "w") as f:
             json.dump(history, f, indent=2)
@@ -444,36 +433,70 @@ def record_stats(command_str: str, raw_text: str, cleaned_text: str):
         pass
 
 
+def segment_markdown_code_blocks(text: str) -> List[Tuple[bool, str]]:
+    """Splits text into (is_code_block, chunk) segments to protect fenced code blocks from line deduplication."""
+    segments: List[Tuple[bool, str]] = []
+    current_lines: List[str] = []
+    in_code = False
+    fence_len = 0
+
+    for line in text.splitlines():
+        trimmed = line.strip()
+        if trimmed.startswith("```"):
+            backticks = len(trimmed) - len(trimmed.lstrip("`"))
+            if in_code:
+                if backticks >= fence_len:
+                    current_lines.append(line)
+                    segments.append((True, "\n".join(current_lines)))
+                    current_lines = []
+                    in_code = False
+                    fence_len = 0
+                else:
+                    current_lines.append(line)
+            else:
+                if current_lines:
+                    segments.append((False, "\n".join(current_lines)))
+                    current_lines = []
+                current_lines.append(line)
+                in_code = True
+                fence_len = backticks
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        segments.append((in_code, "\n".join(current_lines)))
+
+    return segments
+
+
+def _clean_text_chunk(text: str) -> str:
+    text = strip_ansi(text)
+    text = strip_progress_artifacts(text)
+    text = collapse_excess_whitespace(text)
+    text = deduplicate_consecutive_lines(text)
+    text = prune_git_diff_lockfiles(text)
+    text = suppress_base64_blobs(text)
+    text = shield_directory_traversals(text)
+    text = try_minify_json(text)
+    return text
+
+
 def condense_output(raw_text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
-    """Full condensation pipeline."""
+    """Full condensation pipeline with markdown code-fence protection."""
     if not raw_text:
         return ""
 
-    # 1. Strip ANSI noise
-    text = strip_ansi(raw_text)
+    if "```" in raw_text:
+        cleaned_parts = []
+        for is_code, chunk in segment_markdown_code_blocks(raw_text):
+            if is_code:
+                cleaned_parts.append(strip_ansi(chunk))
+            else:
+                cleaned_parts.append(_clean_text_chunk(chunk))
+        text = "\n".join(cleaned_parts)
+    else:
+        text = _clean_text_chunk(raw_text)
 
-    # 2. Strip progress overwrites
-    text = strip_progress_artifacts(text)
-
-    # 3. Collapse excess whitespace
-    text = collapse_excess_whitespace(text)
-
-    # 4. Deduplicate consecutive repeated lines
-    text = deduplicate_consecutive_lines(text)
-
-    # 5. Prune git diff lockfile and generated bundle noise
-    text = prune_git_diff_lockfiles(text)
-
-    # 6. Suppress massive Base64 payloads and hex blobs
-    text = suppress_base64_blobs(text)
-
-    # 7. Shield directory traversal bombs (node_modules, .git, target, etc.)
-    text = shield_directory_traversals(text)
-
-    # 8. Try minifying JSON if applicable
-    text = try_minify_json(text)
-
-    # 9. Signal-aware smart truncation if size exceeds limit
     if len(text) > max_chars:
         text = truncate_signal_aware(text)
 
@@ -481,23 +504,96 @@ def condense_output(raw_text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
 
 
 def run_command_wrapped(command_str: str) -> int:
-    """Executes a command string through shell, cleans its output, and preserves the exit code."""
+    """Executes a command string through shell, cleans its output, and preserves the exit code.
+    Fast commands (< 2.0s) use full-buffer condensation; long-running commands (> 2.0s) automatically
+    transition to live-streaming cleaned batches so background task logs are never empty while running.
+    """
     proc = subprocess.Popen(
         command_str,
         shell=True,
         stdin=sys.stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        executable="/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh",
+         executable="/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/sh",
     )
-    stdout_raw, _ = proc.communicate()
-    cleaned = condense_output(stdout_raw)
-    record_stats(command_str, stdout_raw, cleaned)
-    if cleaned:
-        sys.stdout.write(cleaned + "\n")
-        sys.stdout.flush()
+
+    start_time = time.monotonic()
+    raw_chunks: List[str] = []
+    pending_lines: List[str] = []
+    streaming_mode = False
+    flushed_any = False
+
+    def flush_pending():
+        nonlocal flushed_any
+        if not pending_lines:
+            return
+        batch_raw = "".join(pending_lines)
+        pending_lines.clear()
+        cleaned_batch = condense_output(batch_raw, max_chars=DEFAULT_MAX_CHARS)
+        if cleaned_batch:
+            sys.stdout.write(cleaned_batch + ("\n" if not cleaned_batch.endswith("\n") else ""))
+            sys.stdout.flush()
+            flushed_any = True
+
+    def handle_term(signum, _frame):
+        flush_pending()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+
+    assert proc.stdout is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+
+    try:
+        while True:
+            events = sel.select(timeout=0.25)
+            for key, _ in events:
+                data = os.read(key.fd, 8192)
+                if not data:
+                    sel.unregister(proc.stdout)
+                    break
+                decoded = data.decode("utf-8", errors="replace")
+                raw_chunks.append(decoded)
+                pending_lines.append(decoded)
+                if streaming_mode and ("\n" in decoded or sum(len(x) for x in pending_lines) >= 4096):
+                    flush_pending()
+            else:
+                # No EOF break occurred in the inner loop
+                if proc.poll() is not None and not sel.get_map():
+                    break
+                if not streaming_mode and (time.monotonic() - start_time) >= 2.0:
+                    streaming_mode = True
+                    flush_pending()
+                continue
+            # Inner loop hit EOF break
+            break
+    except Exception:
+        pass
+    finally:
+        try:
+            sel.close()
+        except Exception:
+            pass
+
+    proc.wait()
+    stdout_raw = "".join(raw_chunks)
+
+    if not streaming_mode and not flushed_any:
+        cleaned = condense_output(stdout_raw)
+        record_stats(command_str, stdout_raw, cleaned)
+        if cleaned:
+            sys.stdout.write(cleaned + "\n")
+            sys.stdout.flush()
+    else:
+        flush_pending()
+        record_stats(command_str, stdout_raw, stdout_raw)
+
     return proc.returncode
 
 
@@ -514,9 +610,18 @@ def handle_hook():
         tool_name = tool_call.get("name")
         args = tool_call.get("args", {})
         cmd = args.get("CommandLine", "")
+        is_daemon = bool(args.get("IsDaemon", False))
 
-        # Escape hatch: Allow user or agent to request uncleaned output with NO_FERRY=1 or FERRY_BYPASS=1
-        if "NO_FERRY=1" in cmd or "FERRY_BYPASS=1" in cmd or os.environ.get("NO_FERRY") == "1":
+        # Escape hatch: Allow user or agent to request uncleaned output with NO_FERRY=1, FERRY_BYPASS=1,
+        # or when launching a background daemon or interactive watcher.
+        if (
+            "NO_FERRY=1" in cmd
+            or "FERRY_BYPASS=1" in cmd
+            or os.environ.get("NO_FERRY") == "1"
+            or is_daemon
+            or "gh run watch" in cmd
+            or "tail -f" in cmd
+        ):
             sys.stdout.write(json.dumps({"decision": "allow"}))
             return
 
@@ -537,7 +642,7 @@ def handle_hook():
             return
 
         sys.stdout.write(json.dumps({"decision": "allow"}))
-    except Exception as e:
+    except Exception:
         # Fallback gracefully so we never block user workflow
         sys.stdout.write(json.dumps({"decision": "allow"}))
 
