@@ -21,7 +21,7 @@ queue_timeout_ms = 60000
 name = "minimax"
 api_base = "https://api.minimax.io/v1"
 api_key = ""
-model = "MiniMax-M3"
+model = "MiniMax-M3.1-Flash"
 timeout_secs = 300
 
 [routing]
@@ -30,7 +30,7 @@ timeout_secs = 300
 # - "local-only": Enforces strict local GPU execution ($0 spend). Returns HTTP 503 if unavailable.
 # - "hybrid": Segregates turns based on cognitive complexity. Mechanical commands stay local; hard logic/diagnostic failures escalate to cloud, then immediately revert to local.
 # - "cloud-only": Bypasses local hardware entirely and routes directly to cloud.
-default_route = "local-preferred"
+default_route = "hybrid"
 
 [affinity]
 enabled = true
@@ -60,8 +60,8 @@ enable_constraint_ledger = true
 protect_static_prefix = true
 fold_repeated_tool_failures = true
 rolling_compaction = true
-compact_threshold_tokens = 48000
-compact_keep_recent_turns = 8
+compact_threshold_tokens = 16000
+compact_keep_recent_turns = 4
 
 [telemetry]
 enabled = true

@@ -48,7 +48,6 @@ pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
     "assertion failed",
     "cwe-",
     "cve-",
-    "vulnerability",
     "security alert",
     "injection vulnerability",
     "buffer overflow",
@@ -67,10 +66,6 @@ pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
 ];
 
 pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
-    "vulnerability",
-    "exploit",
-    "cve",
-    "audit",
     "threat model",
     "architect",
     "refactor",
@@ -85,8 +80,8 @@ pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
     "invariant",
     "formal verification",
     "algorithmic",
-    "security review",
-    "penetration",
+    "exploit synthesis",
+    "proof of concept",
 ];
 
 pub struct RouteOverride {
@@ -401,12 +396,17 @@ impl Router {
             || trimmed.starts_with("kill ")
             || trimmed.starts_with("cat ")
             || trimmed.starts_with("ls ")
+            || trimmed.starts_with("curl ")
+            || trimmed.starts_with("grep ")
+            || trimmed.starts_with("find ")
             || trimmed.starts_with("docker ")
             || trimmed.starts_with("cargo ")
             || trimmed.starts_with("npm ")
             || trimmed.starts_with("pnpm ")
             || trimmed.starts_with("python ")
             || trimmed.starts_with("python3 ")
+            || trimmed.starts_with("node ")
+            || trimmed.starts_with("npx ")
         {
             return true;
         }
@@ -556,25 +556,25 @@ impl Router {
                     return (false, format!("procedural confirmation: '{trimmed}'"));
                 }
 
-                // 2. High-cognitive keywords -> escalate to Cloud
-                for kw in HARD_LOGIC_USER_KEYWORDS {
-                    if trimmed_lower.contains(kw) {
-                        return (true, format!("cognitive prompt keyword: '{kw}'"));
-                    }
-                }
-
-                // 3. Mechanical action requests -> stay local ($0)
+                // 2. Mechanical action requests -> stay local ($0)
                 if Self::is_mechanical_user_command(&trimmed_lower) {
                     return (false, format!("mechanical action request: '{trimmed}'"));
                 }
 
-                // 4. Initial prompt framing escalation
+                // 3. Initial prompt framing escalation (initial user task specification >= 60 chars)
                 let non_system_count = messages.iter().filter(|m| {
                     m.get("role").and_then(|r| r.as_str()) != Some("system")
                 }).count();
 
                 if non_system_count <= 1 && trimmed.len() >= 60 {
                     return (true, "initial task specification / prompt framing".to_string());
+                }
+
+                // 4. High-cognitive keywords -> escalate to Cloud
+                for kw in HARD_LOGIC_USER_KEYWORDS {
+                    if trimmed_lower.contains(kw) {
+                        return (true, format!("cognitive prompt keyword: '{kw}'"));
+                    }
                 }
 
                 // 5. Reasoning / architectural / debugging intent verbs -> Cloud
@@ -1110,15 +1110,28 @@ mod tests {
         assert!(!is_hard, "Mechanical git prompt should stay local, got: {}", reason);
         assert!(reason.contains("mechanical action request"));
 
-        // User prompt with cognitive keyword -> hard logic escalation
+        // User prompt with cognitive keyword in ongoing conversation -> hard logic escalation
         let body_kw = json!({
             "messages": [
-                {"role": "user", "content": "please conduct a security audit and find any vulnerability in this auth module"}
+                {"role": "user", "content": "Initial setup"},
+                {"role": "assistant", "content": "Ready"},
+                {"role": "user", "content": "please diagnose the root cause of the memory leak in this auth module"}
             ]
         });
         let (is_hard, reason) = Router::is_hard_logic_turn(&body_kw);
         assert!(is_hard);
-        assert!(reason.contains("cognitive prompt keyword"));
+        assert!(reason.contains("cognitive prompt keyword") || reason.contains("reasoning intent verb"));
+
+        // Mid-session security specialist testing command -> stays local ($0)
+        let body_specialist = json!({
+            "messages": [
+                {"role": "user", "content": "Initial audit task"},
+                {"role": "assistant", "content": "Scanning routes"},
+                {"role": "user", "content": "Check the cards API for IDOR vulnerability and test /api/cards endpoint"}
+            ]
+        });
+        let (is_hard_spec, reason_spec) = Router::is_hard_logic_turn(&body_specialist);
+        assert!(!is_hard_spec, "Mid-session specialist testing must stay local, got: {}", reason_spec);
 
         // Initial task prompt (> 60 chars) -> hard logic escalation
         let body_initial = json!({
