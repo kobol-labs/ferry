@@ -386,6 +386,27 @@ impl UpstreamClient {
                         "Cloud provider returned HTTP 429 (Rate Limit / Quota Exceeded). Activating 60-second local fallback guard."
                     );
                     self.metrics.record_cloud_rate_limit(60);
+
+                    // Zero-drop in-flight failover: Attempt local execution instead of failing the client request
+                    if !is_failover {
+                        warn!(
+                            req_id = req_id,
+                            "Failing over in-flight request to local Strata engine after Cloud HTTP 429 (Zero-Drop Failover)"
+                        );
+                        let local_decision = RouteDecision {
+                            target: TargetProvider::Local,
+                            est_tokens: decision.est_tokens,
+                            is_spillover: false,
+                            reason: "Failover from Cloud HTTP 429 (Quota Exceeded)".to_string(),
+                            local_only: true,
+                            slot_guard: None,
+                            slot_id: None,
+                            is_affinity_hit: false,
+                            affinity_type: crate::affinity::AffinityType::NewSlot,
+                            session_id: decision.session_id.clone(),
+                        };
+                        return Box::pin(self.forward_chat(body, local_decision, req_id, chars_saved, savings_pct, cache_key)).await;
+                    }
                 }
                 info!(
                     req_id = req_id,
