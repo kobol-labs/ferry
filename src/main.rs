@@ -119,6 +119,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn background Canary Probe for Cloud Quota / Rate-Limit Recovery
+    let cloud_probe_state = state.clone();
+    tokio::spawn(async move {
+        let probe_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(1)
+            .build()
+            .unwrap_or_default();
+
+        let cloud_url = format!(
+            "{}/chat/completions",
+            cloud_probe_state.config.cloud.api_base.trim_end_matches('/')
+        );
+
+        let canary_payload = serde_json::json!({
+            "model": cloud_probe_state.config.cloud.model,
+            "messages": [
+                {"role": "user", "content": "ping"}
+            ],
+            "max_tokens": 1,
+            "stream": false
+        });
+
+        info!(
+            model = %cloud_probe_state.config.cloud.model,
+            "Ferry Cloud Quota Canary Probe active (polls every 30s during 429 cooldown)"
+        );
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            if cloud_probe_state.metrics.is_cloud_rate_limited() {
+                tracing::debug!("Cloud provider is in 429 cooldown. Dispatching lightweight canary probe to check quota recovery...");
+                let resp = probe_client
+                    .post(&cloud_url)
+                    .header("Authorization", format!("Bearer {}", cloud_probe_state.config.cloud.api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&canary_payload)
+                    .send()
+                    .await;
+
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        info!(
+                            model = %cloud_probe_state.config.cloud.model,
+                            "Cloud provider quota / rate limit has CLEARED. Canary probe succeeded (HTTP 200). Restoring cloud routing immediately!"
+                        );
+                        cloud_probe_state.metrics.clear_cloud_rate_limit();
+                    }
+                    Ok(r) if r.status() == StatusCode::TOO_MANY_REQUESTS => {
+                        tracing::debug!(
+                            "Cloud provider canary probe still returned HTTP 429 (Quota still exhausted). Remaining on local Strata."
+                        );
+                        // Extend cooldown by 60s so live requests continue routing locally
+                        cloud_probe_state.metrics.record_cloud_rate_limit(60);
+                    }
+                    Ok(r) => {
+                        tracing::debug!(
+                            status = r.status().as_u16(),
+                            "Cloud canary probe returned non-success status"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            error = %err,
+                            "Cloud canary probe network error"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
     // Spawn background Pushgateway telemetry pusher if enabled
     if state.config.telemetry.enabled {
         let push_metrics = state.metrics.clone();

@@ -355,6 +355,10 @@ impl MetricsTracker {
         now < until
     }
 
+    pub fn clear_cloud_rate_limit(&self) {
+        self.cloud_rate_limited_until.store(0, Ordering::Relaxed);
+    }
+
     pub fn record_condensation(
         &self,
         orig_tokens: u64,
