@@ -560,7 +560,7 @@ async fn test_explicit_cloud_model_selection_router() {
     let router = Router::new(config, metrics);
 
     let body = json!({
-        "model": "MiniMax-M3",
+        "model": "MiniMax-M3.1-Flash",
         "messages": [
             { "role": "user", "content": "Hello" }
         ]

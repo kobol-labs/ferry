@@ -161,7 +161,7 @@ pub struct CloudConfig {
 }
 
 fn default_cloud_base() -> String { "https://api.minimax.io/v1".to_string() }
-fn default_cloud_model() -> String { "MiniMax-M3".to_string() }
+fn default_cloud_model() -> String { "MiniMax-M3.1-Flash".to_string() }
 fn default_cloud_timeout_secs() -> u64 { 300 }
 
 impl Default for CloudConfig {

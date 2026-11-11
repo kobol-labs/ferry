@@ -1,0 +1,24 @@
+#!/bin/bash
+# Pre-commit hook: Enforce Graphify knowledge graph synchronization
+GRAPHIFY_CMD=""
+if command -v graphify >/dev/null 2>&1; then
+    GRAPHIFY_CMD="graphify"
+elif [ -f "$HOME/.local/bin/graphify" ]; then
+    GRAPHIFY_CMD="$HOME/.local/bin/graphify"
+elif command -v uv >/dev/null 2>&1; then
+    GRAPHIFY_CMD="uv tool run graphify"
+elif [ -f "/opt/homebrew/bin/uv" ]; then
+    GRAPHIFY_CMD="/opt/homebrew/bin/uv tool run graphify"
+fi
+
+if [ -z "$GRAPHIFY_CMD" ]; then
+    echo "❌ [pre-commit] Error: 'graphify' is required to commit to this repository."
+    echo "👉 Please install it with: uv tool install 'graphifyy[mcp]'"
+    exit 1
+fi
+
+$GRAPHIFY_CMD update . > /dev/null 2>&1
+
+if [ -f "graphify-out/graph.json" ]; then
+    git add graphify-out/graph.json graphify-out/GRAPH_REPORT.md
+fi

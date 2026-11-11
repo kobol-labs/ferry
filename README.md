@@ -33,7 +33,7 @@ When running autonomous multi-agent swarms (e.g., Strix, Cursor agents, AutoGen)
 
 ## Empirical Benchmarks & Performance Profile
 
-From a full end-to-end autonomous penetration test run against Invoicely across 30+ attack surfaces using an NVIDIA RTX 3090 (Strata / Qwen3.8-Flash-Next) and Cloud MiniMax-M3:
+From a full end-to-end autonomous penetration test run against Invoicely across 30+ attack surfaces using an NVIDIA RTX 3090 (Strata / Qwen3.8-Flash-Next) and Cloud MiniMax-M3.1-Flash:
 
 | Metric | Result |
 | :--- | :--- |
@@ -73,7 +73,7 @@ queue_timeout_ms = 3500
 [cloud]
 api_base = "https://api.minimax.io/v1"
 api_key = "sk-..."
-model = "MiniMax-M3"
+model = "MiniMax-M3.1-Flash"
 timeout_secs = 300
 
 [routing]
@@ -180,7 +180,7 @@ Ferry supports full zero-config deployment by overriding any setting via environ
 | `FERRY_LOCAL_QUEUE_TIMEOUT_MS` | `500` | Slot contention queue timeout in milliseconds |
 | `FERRY_CLOUD_API_BASE` | `https://api.minimax.io/v1` | Cloud fallback base URL |
 | `FERRY_CLOUD_API_KEY` | `""` | Cloud provider API key |
-| `FERRY_CLOUD_MODEL` | `MiniMax-M3` | Cloud model name |
+| `FERRY_CLOUD_MODEL` | `MiniMax-M3.1-Flash` | Cloud model name |
 | `FERRY_CLOUD_TIMEOUT_SECS` | `300` | Request timeout for cloud fallback |
 | `FERRY_DEFAULT_ROUTE` | `local-preferred` | Default routing mode (`local-preferred`, `local-only`, `hybrid`, `cloud-only`) |
 | `FERRY_CONDENSATION_ENABLED` | `true` | Enable/disable prompt context condensation |

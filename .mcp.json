@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "graphify": {
+      "command": "/Users/steve/.local/bin/graphify-mcp"
+    }
+  }
+}
