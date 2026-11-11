@@ -410,6 +410,39 @@ Client (Strix / Agent Swarm / OpenWebUI)
 
 ---
 
+## 🧠 Codebase Knowledge Graph (Graphify)
+
+This repository maintains an AST-based architectural knowledge graph in `graphify-out/` (`graph.json` and `GRAPH_REPORT.md`). It maps all classes, functions, callers, callees, database queries, and test assertions across the codebase, enabling AI coding assistants (Google Antigravity, Claude Code, Cursor) to navigate relationships with surgical token efficiency.
+
+### ⚙️ Setup & Pre-Commit Synchronization
+
+1. **Install the CLI locally** (uses local CPU and tree-sitter, $0 token cost):
+   ```bash
+   uv tool install "graphifyy[mcp]"
+   ```
+2. **Automatic Git Hook**:
+   Point Git to the version-controlled `.githooks/` directory:
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+3. **Atomic Commits**:
+   Whenever you run `git commit`, `.githooks/pre-commit` runs an incremental hash-based AST update in **~200ms** and stages the updated `graph.json` and `GRAPH_REPORT.md` into that same commit.
+
+### 🔍 Helpful CLI Commands
+
+```bash
+# Explain an engine module or router
+graphify explain "src/router.rs"
+
+# Trace dependencies between modules
+graphify path "src/main.rs" "src/condenser.rs"
+
+# Manually refresh the AST graph
+graphify update .
+```
+
+---
+
 ## License
 
 MIT © [Kobol Labs](https://github.com/kobol-labs)
