@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@a54c7fe93609e2f8f1c8f5e57d47201c696bf888 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Run Cargo Tests
         run: cargo test --verbose
