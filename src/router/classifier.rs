@@ -34,6 +34,13 @@ pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
 ];
 
 pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
+    "audit",
+    "vulnerability",
+    "vulnerabilities",
+    "cve",
+    "cwe",
+    "exploit",
+    "penetration",
     "threat model",
     "architect",
     "refactor",

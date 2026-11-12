@@ -1,7 +1,7 @@
 # Graph Report - ferry  (2026-11-12)
 
 ## Corpus Check
-- 37 files · ~38,892 words
+- 37 files · ~38,899 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 3 file(s) not represented in the graph (top: (none) 2, .toml 1)
 
@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `f7a7f6e1`
+- Built from commit: `b230bbaf`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
