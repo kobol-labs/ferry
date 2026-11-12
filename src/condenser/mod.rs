@@ -1,44 +1,21 @@
+pub mod code;
+pub mod directory;
+pub mod stats;
+pub mod truncation;
+pub mod whitespace;
+
+pub use code::*;
+pub use directory::*;
+pub use stats::*;
+pub use truncation::*;
+pub use whitespace::*;
+
 use crate::config::CondenserConfig;
 use serde_json::Value;
 use tracing::{debug, warn};
 
 pub struct ContextCondenser {
     config: CondenserConfig,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct CondensationStats {
-    pub orig_chars: usize,
-    pub cond_chars: usize,
-    pub reasoning_blocks_dropped: usize,
-    pub tool_outputs_truncated: usize,
-    pub chars_saved: usize,
-    pub ansi_stripped_count: usize,
-    pub progress_cleaned_count: usize,
-    pub lines_deduped_count: usize,
-    pub whitespace_collapsed_count: usize,
-    pub json_minified_count: usize,
-    pub ledger_checks_passed: usize,
-    pub ledger_vetoed_count: usize,
-    pub signals_extracted_count: usize,
-    pub loops_collapsed_count: usize,
-    pub lockfile_diffs_pruned_count: usize,
-    pub base64_blobs_suppressed_count: usize,
-    pub dir_traversals_shielded_count: usize,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RollingCompactionStats {
-    pub turns_compacted: usize,
-    pub chars_saved: usize,
-    pub original_chars: usize,
-    pub compacted_chars: usize,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ContentSegment {
-    Text(String),
-    Code(String),
 }
 
 impl ContextCondenser {
@@ -150,9 +127,6 @@ impl ContextCondenser {
             }
 
             let is_historical = idx < cutoff_index;
-            // Any assistant/reasoning message that is already followed by a tool result or user reply
-            // is a completed past turn. Stripping its internal reasoning immediately ensures the prefix
-            // bytes never mutate on the Turn T -> Turn T+1 transition.
             let is_completed_turn = is_historical || (idx + 1 < msg_count);
 
             // A) Handle standalone reasoning message items
@@ -260,9 +234,6 @@ impl ContextCondenser {
         // Truncation logic
         if self.config.truncate_tool_outputs {
             if is_historical {
-                // Historical turns: smart truncation to max_tool_chars with signal awareness.
-                // When max_tool_chars is set to a large stationary budget (>= 8000), use the same
-                // head/tail window as recent turns so tool messages never mutate across turn transitions.
                 if processed.len() > self.config.max_tool_chars {
                     let hist_head = if self.config.max_tool_chars >= 8000 {
                         self.config.head_lines.max(30)
@@ -283,8 +254,6 @@ impl ContextCondenser {
                     stats.tool_outputs_truncated += 1;
                 }
             } else {
-                // Recent active turn: runaway safety cap
-                // Prevents blinding the auditor on code files being analyzed
                 if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
                     let recent_head = self.config.head_lines.max(30);
                     let recent_tail = self.config.tail_lines.max(20);
@@ -301,7 +270,6 @@ impl ContextCondenser {
 
         // Permanent invariant: PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
         if !is_historical {
-            // In the recent active turn, 100% of technical/critical anchors must survive
             let anchors = extract_tool_anchors(initial_text);
             if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
                 warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
@@ -311,7 +279,6 @@ impl ContextCondenser {
                 stats.ledger_checks_passed += 1;
             }
         } else {
-            // In historical turns, basic verification passes
             stats.ledger_checks_passed += 1;
         }
 
@@ -325,14 +292,13 @@ impl ContextCondenser {
     }
 
     pub fn clean_tool_text_with_stats(&self, input: &str, stats: &mut CondensationStats) -> String {
-        // Built-in invariant: Always protect markdown code blocks from destructive cleaners
         if input.contains("```") {
             let segments = segment_markdown_code_blocks(input);
             let mut cleaned_parts = Vec::new();
             for seg in segments {
                 match seg {
                     ContentSegment::Text(t) => cleaned_parts.push(self.clean_single_chunk(&t, stats)),
-                    ContentSegment::Code(c) => cleaned_parts.push(c), // 100% verbatim protection
+                    ContentSegment::Code(c) => cleaned_parts.push(c),
                 }
             }
             cleaned_parts.join("\n")
@@ -342,7 +308,7 @@ impl ContextCondenser {
     }
 
     pub fn extract_critical_anchors(&self, text: &str) -> Vec<String> {
-        extract_critical_anchors(text)
+        code::extract_critical_anchors(text)
     }
 
     pub fn find_missing_anchor(&self, anchors: &[String], text: &str) -> Option<String> {
@@ -366,7 +332,6 @@ impl ContextCondenser {
     }
 
     /// Secondary adaptive squeezing pass: shrinks older historical tool outputs from 2000 chars down to 500 chars
-    /// to attempt fitting prompts within the local context limit.
     pub fn adaptive_squeeze(
         &self,
         body: &mut Value,
@@ -390,7 +355,7 @@ impl ContextCondenser {
 
         for (idx, msg) in messages.iter_mut().enumerate() {
             if idx >= recent_boundary {
-                continue; // Preserve recent active context verbatim
+                continue;
             }
 
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
@@ -418,10 +383,7 @@ impl ContextCondenser {
     }
 
     /// Rolling Context Compaction:
-    /// When total context tokens exceed `compact_threshold_tokens`, compacts older historical turns
-    /// into a structured checkpoint block, leaving the system prompt and the recent turns intact.
-    /// Invariant: Respects tool call boundaries so that assistant tool_calls are never separated
-    /// from their matching tool response messages.
+    /// Compacts older historical turns into a structured checkpoint block, leaving system prompt and recent turns intact.
     pub fn rolling_compact(&self, body: &mut Value) -> Option<RollingCompactionStats> {
         if !self.config.rolling_compaction {
             return None;
@@ -436,12 +398,9 @@ impl ContextCondenser {
             return None;
         }
 
-        // Preserve system message if present at index 0
         let has_system = messages.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system");
         let start_idx = if has_system { 1 } else { 0 };
 
-        // Exclude static system prompt when measuring against the compaction threshold
-        // so that heavy system prompts (schemas, threat models) do not starve conversational memory.
         let conv_chars = count_message_chars(&messages[start_idx..]);
         let conv_tokens = estimate_tokens_from_chars(conv_chars);
 
@@ -454,17 +413,12 @@ impl ContextCondenser {
             return None;
         }
 
-        // Prefix-cache stability: Quantize compaction boundary to fixed 16-message epochs
-        // from `start_idx` so that in stateless proxy requests, `messages[1]` (the checkpoint
-        // summary) remains 100% byte-for-byte immutable across 8 consecutive turns instead of
-        // mutating on every single turn and invalidating the local GPU KV cache.
         let raw_compacted = split_idx - start_idx;
         if raw_compacted >= 16 {
             let quantized = (raw_compacted / 16) * 16;
             split_idx = start_idx + quantized;
         }
 
-        // Safety: ensure we do not split an assistant tool_call from its tool responses
         while split_idx > start_idx {
             let role = messages[split_idx].get("role").and_then(|r| r.as_str()).unwrap_or("");
             if role == "tool" {
@@ -497,7 +451,6 @@ impl ContextCondenser {
                 "user" => {
                     if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                         if content.starts_with("[Historical Context Checkpoint:") {
-                            // Unpack existing summary lines from prior compaction pass so historical context is merged seamlessly
                             for line in content.lines() {
                                 let trimmed = line.trim();
                                 if trimmed.starts_with("• ") || trimmed.starts_with("└─ ") {
@@ -617,67 +570,10 @@ impl ContextCondenser {
             compacted_chars: new_chars,
         })
     }
-}
 
-pub fn extract_compact_tool_arguments(args_json: &str) -> String {
-    if let Ok(val) = serde_json::from_str::<Value>(args_json) {
-        if let Some(obj) = val.as_object() {
-            for key in &["cmd", "command", "CommandLine", "url", "path", "endpoint", "query", "script"] {
-                if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
-                    let snippet: String = v.chars().take(120).collect();
-                    return format!("{}=\"{}\"", key, snippet.trim());
-                }
-            }
-        }
-    }
-    let snippet: String = args_json.chars().take(100).collect();
-    snippet.trim().to_string()
-}
-
-pub fn collect_discovered_entities(
-    text: &str,
-    endpoints: &mut std::collections::BTreeSet<String>,
-    auth: &mut std::collections::BTreeSet<String>,
-    anomalies: &mut std::collections::BTreeSet<String>,
-) {
-    for token in text.split_whitespace() {
-        let clean = token.trim_matches(|c: char| c == ',' || c == ';' || c == '(' || c == ')' || c == '"' || c == '\'' || c == '[' || c == ']' || c == '<' || c == '>' || c == '{' || c == '}');
-        let upper = clean.to_ascii_uppercase();
-
-        // 1. Endpoints & URLs
-        if (clean.starts_with("/api/") || clean.starts_with("http://") || clean.starts_with("https://")) && clean.len() < 80 {
-            endpoints.insert(clean.to_string());
-            if endpoints.len() > 15 {
-                let first = endpoints.iter().next().cloned().unwrap();
-                endpoints.remove(&first);
-            }
-        }
-
-        // 2. Auth artifacts: tokens, cookies, headers
-        if (clean.starts_with("sps_session") || clean.starts_with("token_version") || clean.starts_with("eyJ") || upper.starts_with("BEARER")) && clean.len() <= 500 {
-            auth.insert(clean.to_string());
-            if auth.len() > 10 {
-                let first = auth.iter().next().cloned().unwrap();
-                auth.remove(&first);
-            }
-        }
-
-        // 3. Security Finding IDs (CVE, CWE, GHSA)
-        if (upper.starts_with("CVE-") || upper.starts_with("CWE-") || upper.starts_with("GHSA-")) && clean.len() < 40 {
-            anomalies.insert(clean.to_string());
-            if anomalies.len() > 10 {
-                let first = anomalies.iter().next().cloned().unwrap();
-                anomalies.remove(&first);
-            }
-        }
-    }
-}
-
-impl ContextCondenser {
     fn clean_single_chunk(&self, input: &str, stats: &mut CondensationStats) -> String {
         let mut text = input.to_string();
 
-        // 1. Strip terminal noise (ANSI escapes, carriage-return progress overwrites, excess blank lines)
         if self.config.strip_terminal_noise {
             if text.contains('\x1b') {
                 let (cleaned, stripped) = strip_ansi_codes(&text);
@@ -702,7 +598,6 @@ impl ContextCondenser {
             }
         }
 
-        // 2. Deduplicate consecutive identical lines (RTK signature feature, safe for code)
         if self.config.deduplicate_lines && text.contains('\n') {
             let (cleaned, count) = deduplicate_lines(&text);
             if count > 0 {
@@ -711,7 +606,6 @@ impl ContextCondenser {
             }
         }
 
-        // 3. Minify pretty-printed JSON outputs (skip single-line already-compact JSON)
         if self.config.minify_json_outputs {
             let trimmed = text.trim();
             if (trimmed.contains('\n') || trimmed.contains("  "))
@@ -729,7 +623,6 @@ impl ContextCondenser {
             }
         }
 
-        // 4. Prune verbose lockfile diffs in git output
         if self.config.prune_lockfile_diffs && text.contains("diff --git ") {
             let (cleaned, count) = prune_git_diff_lockfiles(&text);
             if count > 0 {
@@ -738,7 +631,6 @@ impl ContextCondenser {
             }
         }
 
-        // 5. Suppress massive Base64 payloads and hex blobs
         if self.config.suppress_base64_blobs && text.len() >= 120 {
             let (cleaned, count) = suppress_base64_and_hex_blobs(&text);
             if count > 0 {
@@ -747,7 +639,6 @@ impl ContextCondenser {
             }
         }
 
-        // 6. Shield directory traversal bombs (node_modules, .git, target, etc.)
         if self.config.shield_dir_traversals && text.contains('\n') {
             let (cleaned, count) = shield_directory_traversals(&text);
             if count > 0 {
@@ -758,917 +649,6 @@ impl ContextCondenser {
 
         text
     }
-}
-
-/// Segments a tool output into plain text chunks and protected markdown code blocks.
-/// Supports multi-backtick nested fences (e.g. 4+ backticks enclosing 3 backticks).
-pub fn segment_markdown_code_blocks(input: &str) -> Vec<ContentSegment> {
-    let mut segments = Vec::new();
-    let mut current_chunk = Vec::new();
-    let mut in_code_block = false;
-    let mut fence_len = 0;
-
-    for line in input.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            let backtick_count = trimmed.chars().take_while(|&c| c == '`').count();
-            if in_code_block {
-                if backtick_count >= fence_len {
-                    current_chunk.push(line);
-                    segments.push(ContentSegment::Code(current_chunk.join("\n")));
-                    current_chunk.clear();
-                    in_code_block = false;
-                    fence_len = 0;
-                } else {
-                    current_chunk.push(line);
-                }
-            } else {
-                if !current_chunk.is_empty() {
-                    segments.push(ContentSegment::Text(current_chunk.join("\n")));
-                    current_chunk.clear();
-                }
-                current_chunk.push(line);
-                in_code_block = true;
-                fence_len = backtick_count;
-            }
-        } else {
-            current_chunk.push(line);
-        }
-    }
-
-    if !current_chunk.is_empty() {
-        let content = current_chunk.join("\n");
-        if in_code_block {
-            segments.push(ContentSegment::Code(content));
-        } else {
-            segments.push(ContentSegment::Text(content));
-        }
-    }
-
-    segments
-}
-
-/// Extracts critical anchor entities from text (file paths, URLs, ports, imperatives)
-pub fn extract_critical_anchors(text: &str) -> Vec<String> {
-    extract_anchors_internal(text, true)
-}
-
-/// Extracts technical/security anchors from tool outputs without matching common English prose words
-/// ("cannot", "not", "never", "must", "high") that appear in source code comments and cause false vetoes.
-pub fn extract_tool_anchors(text: &str) -> Vec<String> {
-    extract_anchors_internal(text, false)
-}
-
-fn extract_anchors_internal(text: &str, include_prose_imperatives: bool) -> Vec<String> {
-    let mut anchors = Vec::new();
-
-    for token in text.split_whitespace() {
-        let clean = token.trim_matches(|c: char| c == ',' || c == ';' || c == '(' || c == ')' || c == '"' || c == '\'' || c == '[' || c == ']' || c == '<' || c == '>');
-        let clean = clean.strip_suffix('.').unwrap_or(clean);
-        let clean = clean.strip_suffix(':').unwrap_or(clean);
-
-        if clean.len() < 3 {
-            continue;
-        }
-
-        let upper = clean.to_ascii_uppercase();
-
-        // 1. URLs
-        if clean.starts_with("http://") || clean.starts_with("https://") {
-            anchors.push(clean.to_string());
-            continue;
-        }
-
-        // 2. CVE & Advisory identifiers (e.g., CVE-2024-1234, GHSA-xxxx-xxxx)
-        if upper.starts_with("CVE-") || upper.starts_with("GHSA-") {
-            anchors.push(clean.to_string());
-            continue;
-        }
-
-        // 3. File paths with directories and API endpoints
-        if (clean.starts_with('/') && clean.contains('/'))
-            || ((clean.contains('/') || clean.contains('\\'))
-                && (clean.ends_with(".go")
-                    || clean.ends_with(".rs")
-                    || clean.ends_with(".py")
-                    || clean.ends_with(".js")
-                    || clean.ends_with(".ts")
-                    || clean.ends_with(".json")
-                    || clean.ends_with(".toml")
-                    || clean.ends_with(".yaml")
-                    || clean.ends_with(".yml")
-                    || clean.ends_with(".sql")
-                    || clean.ends_with(".sh")
-                    || clean.starts_with("api/")
-                    || clean.starts_with("v1/")
-                    || clean.starts_with("v2/")))
-        {
-            anchors.push(clean.to_string());
-            continue;
-        }
-
-        // 4. Critical standalone configuration files
-        if clean == "Dockerfile" || clean == "Makefile" || clean == "Cargo.toml" || clean == "go.mod" || clean == "package.json" || clean == ".env" {
-            anchors.push(clean.to_string());
-            continue;
-        }
-
-        // 5. Host:Port, IPv4 addresses, and Port bindings (:8080, 8080/tcp)
-        let is_port_binding = clean.starts_with(':') && clean[1..].chars().all(|c| c.is_ascii_digit()) && clean.len() <= 6;
-        let is_port_proto = clean.contains("/tcp") || clean.contains("/udp");
-        let is_ipv4 = clean.split('.').count() == 4 && clean.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-        let is_host_port = clean.contains(':')
-            && clean.split(':').count() == 2
-            && {
-                let port = clean.split(':').nth(1).unwrap();
-                !port.is_empty() && port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit())
-            };
-
-        if is_port_binding || is_port_proto || is_ipv4 || is_host_port {
-            anchors.push(clean.to_string());
-            continue;
-        }
-
-        // 6. Security keywords and imperatives
-        if upper == "CRITICAL" || upper == "CVSS" {
-            anchors.push(clean.to_string());
-            continue;
-        }
-
-        if include_prose_imperatives
-            && (upper == "HIGH"
-                || upper == "NOT"
-                || upper == "NEVER"
-                || upper == "MUST"
-                || upper == "DENY"
-                || upper == "DON'T"
-                || upper == "DONT"
-                || upper == "DO_NOT"
-                || upper == "CANNOT"
-                || upper == "FORBIDDEN"
-                || upper == "RESTRICTED"
-                || upper == "PROHIBITED"
-                || upper == "BYPASS")
-        {
-            anchors.push(clean.to_string());
-            continue;
-        }
-    }
-
-    anchors
-}
-
-/// Strips all inline `<think>...</think>` tags from assistant text
-pub fn strip_think_tags(text: &str) -> Option<String> {
-    let open_tag = "<think>";
-    let close_tag = "</think>";
-
-    if !text.contains(open_tag) {
-        return None;
-    }
-
-    let mut current = text.to_string();
-    let mut modified = false;
-
-    while let Some(start) = current.find(open_tag) {
-        if let Some(end_offset) = current[start..].find(close_tag) {
-            let end = start + end_offset + close_tag.len();
-            let before = &current[..start];
-            let after = &current[end..];
-            let had_space = before.ends_with(char::is_whitespace) || after.starts_with(char::is_whitespace);
-            let sep = if had_space && !before.is_empty() && !after.is_empty() { " " } else { "" };
-            current = format!("{}{}{}", before.trim_end(), sep, after.trim_start());
-            modified = true;
-        } else {
-            // Unclosed <think> tag: strip from <think> to end of text
-            current = current[..start].trim_end().to_string();
-            modified = true;
-            break;
-        }
-    }
-
-    if modified {
-        Some(current.trim().to_string())
-    } else {
-        None
-    }
-}
-
-fn safe_floor_char_boundary(s: &str, mut index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    while index > 0 && !s.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn safe_ceil_char_boundary(s: &str, mut index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    while index < s.len() && !s.is_char_boundary(index) {
-        index += 1;
-    }
-    index
-}
-
-pub const DIAGNOSTIC_SIGNALS: &[&str] = &[
-    "error:",
-    "error[",
-    "failed",
-    "failure",
-    "exception",
-    "panic:",
-    "panicked",
-    "fatal:",
-    "vulnerability",
-    "vulnerabilities",
-    "cwe-",
-    "cve-",
-    "ghsa-",
-    "assert",
-    "traceback",
-    "syntaxerror",
-    "typeerror",
-    "referenceerror",
-    "status 500",
-    "status 502",
-    "status 503",
-    "status 504",
-    "status 400",
-    "status 401",
-    "status 403",
-    "status 404",
-    "status 422",
-    "status 429",
-    "bad request",
-    "not found",
-    "internal server error",
-    "bad gateway",
-    "service unavailable",
-    "gateway timeout",
-    "unauthorized",
-    "forbidden",
-    "access denied",
-    "permission denied",
-    "connection refused",
-    "timed out",
-    "timeout",
-    "no such file",
-    "command not found",
-    "cannot find module",
-    "module not found",
-    "invalid",
-    "unrecognized",
-    "malformed",
-    "corrupt",
-    "warning:",
-    "warn:",
-    "critical:",
-    "rejected",
-    "expired",
-    "sigsegv",
-    "segmentation fault",
-    "sql syntax",
-    "sqlite3.",
-    "syntax error near",
-    "unterminated quotation",
-    "sqli",
-    "xss",
-    "csrf",
-    "idor",
-    "ssrf",
-    "token_version",
-    "jwt",
-    "bearer",
-    "leak",
-    "bypass",
-    "unhandled",
-    "uncaught",
-    "nullpointer",
-    "stack overflow",
-];
-
-/// Scans lines for diagnostic error signals and returns line index of the highest density signal region
-pub fn find_diagnostic_signal_index(lines: &[&str], start_idx: usize, end_idx: usize) -> Option<usize> {
-    let regions = find_diagnostic_signal_regions(lines, start_idx, end_idx);
-    regions.first().map(|(start, end)| (start + end) / 2)
-}
-
-/// Scans lines for diagnostic error signals and returns up to 3 non-overlapping signal windows (start_line, end_line)
-pub fn find_diagnostic_signal_regions(lines: &[&str], start_idx: usize, end_idx: usize) -> Vec<(usize, usize)> {
-    if start_idx >= end_idx || lines.is_empty() {
-        return Vec::new();
-    }
-    let mut signal_line_indices = Vec::new();
-    for i in start_idx..end_idx.min(lines.len()) {
-        let line_lower = lines[i].to_ascii_lowercase();
-        let has_signal = DIAGNOSTIC_SIGNALS.iter().any(|sig| line_lower.contains(sig));
-        if has_signal {
-            signal_line_indices.push(i);
-        }
-    }
-    if signal_line_indices.is_empty() {
-        return Vec::new();
-    }
-
-    let mut regions = Vec::new();
-    let mut cur_start = signal_line_indices[0].saturating_sub(2).max(start_idx);
-    let mut cur_end = (signal_line_indices[0] + 5).min(end_idx);
-
-    for &idx in &signal_line_indices[1..] {
-        let win_start = idx.saturating_sub(2).max(start_idx);
-        let win_end = (idx + 5).min(end_idx);
-        if win_start <= cur_end + 2 {
-            if win_end - cur_start <= 12 {
-                cur_end = cur_end.max(win_end);
-            } else {
-                regions.push((cur_start, cur_end));
-                cur_start = win_start;
-                cur_end = win_end;
-                if regions.len() >= 3 {
-                    break;
-                }
-            }
-        } else {
-            regions.push((cur_start, cur_end));
-            cur_start = win_start;
-            cur_end = win_end;
-            if regions.len() >= 3 {
-                break;
-            }
-        }
-    }
-    if regions.len() < 3 && cur_start < cur_end {
-        regions.push((cur_start, cur_end));
-    }
-    regions
-}
-
-/// Truncates long tool content keeping head and tail lines with omission indicator.
-/// Guarantees 100% panic-freedom on multi-byte UTF-8 inputs.
-pub fn truncate_tool_content(text: &str, head_lines: usize, tail_lines: usize) -> String {
-    let mut dummy = 0;
-    truncate_tool_content_smart(text, head_lines, tail_lines, &mut dummy)
-}
-
-/// Signal-aware smart truncation that preserves error diagnostic regions in the middle of long outputs.
-pub fn truncate_tool_content_smart(
-    text: &str,
-    head_lines: usize,
-    tail_lines: usize,
-    signals_extracted: &mut usize,
-) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= head_lines + tail_lines {
-        // Line count is small, do byte/char boundary truncation safely on UTF-8 boundaries.
-        // First check if the middle portion contains diagnostic/security signals before blind truncation!
-        let head_target = (head_lines * 80).clamp(600, 1800).min(text.len() / 3);
-        let tail_target = (tail_lines * 80).clamp(600, 1800).min(text.len() / 3);
-        let head_idx = safe_floor_char_boundary(text, head_target);
-        let tail_start = text.len().saturating_sub(tail_target);
-        let tail_idx = safe_ceil_char_boundary(text, tail_start);
-
-        if head_idx < tail_idx {
-            let mid_slice = &text[head_idx..tail_idx];
-            let mid_lower = mid_slice.to_ascii_lowercase();
-            for sig in DIAGNOSTIC_SIGNALS {
-                if let Some(pos_in_mid) = mid_lower.find(sig) {
-                    *signals_extracted += 1;
-                    let abs_pos = head_idx + pos_in_mid;
-                    let sig_start = safe_floor_char_boundary(text, abs_pos.saturating_sub(120).max(head_idx));
-                    let sig_end = safe_ceil_char_boundary(text, (abs_pos + sig.len() + 200).min(tail_idx));
-
-                    let head_part = &text[..head_idx];
-                    let signal_part = &text[sig_start..sig_end];
-                    let tail_part = &text[tail_idx..];
-
-                    let dropped_before = sig_start.saturating_sub(head_idx);
-                    let dropped_after = tail_idx.saturating_sub(sig_end);
-
-                    let mut out = head_part.to_string();
-                    if dropped_before > 0 {
-                        out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_before} characters of passing output ...]\n\n"));
-                    }
-                    out.push_str(signal_part);
-                    if dropped_after > 0 {
-                        out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped_after} characters ...]\n\n"));
-                    }
-                    out.push_str(tail_part);
-                    return out;
-                }
-            }
-        }
-
-        let head_str = &text[..head_idx];
-        let tail_str = &text[tail_idx..];
-        let dropped = text.len().saturating_sub(head_str.len() + tail_str.len());
-
-        return format!(
-            "{}\n\n[... Ferry Proxy: truncated {} characters of earlier tool output ...]\n\n{}",
-            head_str,
-            dropped,
-            tail_str
-        );
-    }
-
-    // Multi-line smart truncation with multi-region signal preservation
-    let mid_start = head_lines;
-    let mid_end = lines.len().saturating_sub(tail_lines);
-    let signal_regions = find_diagnostic_signal_regions(&lines, mid_start, mid_end);
-
-    if !signal_regions.is_empty() {
-        *signals_extracted += signal_regions.len();
-        let head_part = lines[..head_lines].join("\n");
-        let tail_part = lines[lines.len() - tail_lines..].join("\n");
-
-        let mut out = head_part;
-        let mut last_pos = head_lines;
-
-        for (r_start, r_end) in signal_regions {
-            let dropped = r_start.saturating_sub(last_pos);
-            if dropped > 0 {
-                out.push_str(&format!("\n\n[... Ferry Proxy: truncated {dropped} lines of passing logs ...]\n\n"));
-            } else {
-                out.push('\n');
-            }
-            out.push_str(&lines[r_start..r_end].join("\n"));
-            last_pos = r_end;
-        }
-
-        let final_dropped = mid_end.saturating_sub(last_pos);
-        if final_dropped > 0 {
-            out.push_str(&format!("\n\n[... Ferry Proxy: truncated {final_dropped} lines ...]\n\n"));
-        } else {
-            out.push('\n');
-        }
-        out.push_str(&tail_part);
-        return out;
-    }
-
-    let head_part = lines[..head_lines].join("\n");
-    let tail_part = lines[lines.len() - tail_lines..].join("\n");
-    let dropped_lines = lines.len() - head_lines - tail_lines;
-    let dropped_chars = text.len().saturating_sub(head_part.len() + tail_part.len());
-
-    format!(
-        "{head_part}\n\n[... Ferry Proxy: truncated {dropped_lines} lines ({dropped_chars} characters) of earlier tool output ...]\n\n{tail_part}"
-    )
-}
-
-/// Strips ANSI terminal escape codes (e.g. \x1b[32m or \x1b[0m) without external regex crate
-pub fn strip_ansi_codes(input: &str) -> (String, bool) {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut modified = false;
-
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next(); // consume '['
-                modified = true;
-                // Consume characters until terminator [a-zA-Z] or end of string
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-        out.push(c);
-    }
-
-    (out, modified)
-}
-
-/// Resolves `\r` carriage returns (keeps final line overwrite) and removes progress bars
-pub fn strip_progress_artifacts(input: &str) -> (String, bool) {
-    let mut clean_lines = Vec::new();
-    let mut modified = false;
-
-    for line in input.lines() {
-        let (effective_line, had_cr) = if line.contains('\r') {
-            (
-                line.split('\r').filter(|s| !s.trim().is_empty()).last().unwrap_or(""),
-                true,
-            )
-        } else {
-            (line, false)
-        };
-
-        if had_cr {
-            modified = true;
-        }
-
-        let trimmed = effective_line.trim();
-        let is_progress = (trimmed.contains('[') && trimmed.contains(']') && trimmed.contains('%') && (trimmed.contains('=') || trimmed.contains('>')))
-            || (trimmed.contains('|') && (trimmed.contains('█') || trimmed.contains('#')) && trimmed.contains('%'))
-            || (trimmed.starts_with("Downloading ") && trimmed.ends_with('%'))
-            || (trimmed.starts_with("Fetch: ") && trimmed.ends_with('%'));
-
-        if is_progress {
-            modified = true;
-        } else {
-            clean_lines.push(effective_line);
-        }
-    }
-
-    (clean_lines.join("\n"), modified)
-}
-
-/// Collapses runs of consecutive identical lines into a single line with `(repeated N times)`
-/// Safety invariants:
-/// 1. Only deduplicate if repeat_count >= 3 (never for just 2 repetitions).
-/// 2. Line must have trimmed length >= 12 and contain alphanumeric characters.
-///    This strictly avoids mangling nested code closures (e.g. `}`, `);`, `---`, `***`).
-pub fn deduplicate_lines(input: &str) -> (String, usize) {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.len() <= 2 {
-        return (input.to_string(), 0);
-    }
-
-    let mut result = Vec::new();
-    let mut current_line = lines[0];
-    let mut repeat_count = 1;
-    let mut dedup_count = 0;
-
-    let can_dedup = |line: &str| -> bool {
-        let trimmed = line.trim();
-        trimmed.len() >= 12 && trimmed.chars().any(|c| c.is_alphanumeric())
-    };
-
-    for &line in &lines[1..] {
-        if line == current_line && !line.trim().is_empty() {
-            repeat_count += 1;
-        } else {
-            result.push(current_line.to_string());
-            if repeat_count >= 3 && can_dedup(current_line) {
-                result.push(format!("    [... repeated {} times ...]", repeat_count - 1));
-                dedup_count += 1;
-            } else if repeat_count > 1 {
-                for _ in 1..repeat_count {
-                    result.push(current_line.to_string());
-                }
-            }
-            current_line = line;
-            repeat_count = 1;
-        }
-    }
-
-    result.push(current_line.to_string());
-    if repeat_count >= 3 && can_dedup(current_line) {
-        result.push(format!("    [... repeated {} times ...]", repeat_count - 1));
-        dedup_count += 1;
-    } else if repeat_count > 1 {
-        for _ in 1..repeat_count {
-            result.push(current_line.to_string());
-        }
-    }
-
-    (result.join("\n"), dedup_count)
-}
-
-/// Collapses 3+ consecutive newlines into 2, and trims trailing whitespace per line
-pub fn collapse_excess_whitespace(input: &str) -> (String, bool) {
-    let mut out = String::with_capacity(input.len());
-    let mut consecutive_newlines = 0;
-    let mut modified = false;
-
-    for line in input.lines() {
-        let trimmed_line = line.trim_end();
-        if trimmed_line.len() != line.len() {
-            modified = true;
-        }
-
-        if trimmed_line.is_empty() {
-            consecutive_newlines += 1;
-            if consecutive_newlines <= 2 {
-                out.push('\n');
-            } else {
-                modified = true;
-            }
-        } else {
-            consecutive_newlines = 0;
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(trimmed_line);
-        }
-    }
-
-    (out, modified)
-}
-
-const LOCKFILE_NAMES: &[&str] = &[
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "Cargo.lock",
-    "poetry.lock",
-    "Gemfile.lock",
-    "composer.lock",
-    "mix.lock",
-    "flake.lock",
-];
-
-const LOCKFILE_EXTENSIONS: &[&str] = &[
-    ".min.js",
-    ".min.css",
-    ".map",
-    ".bundle.js",
-    ".bundle.css",
-];
-
-const COMMON_CODE_EXTS: &[&str] = &[
-    ".rs", ".py", ".js", ".ts", ".go", ".json", ".toml", ".yaml", ".yml",
-    ".md", ".txt", ".html", ".css", ".sh", ".c", ".cpp", ".h", ".sql"
-];
-
-fn is_base64_or_hex_payload(token: &str) -> bool {
-    if token.len() < 120 {
-        return false;
-    }
-    // Never suppress JWT tokens, API keys, or authentication headers
-    if token.starts_with("eyJ")
-        || token.starts_with("sk-")
-        || token.starts_with("ghp_")
-        || token.starts_with("gho_")
-        || token.starts_with("glpat-")
-        || token.starts_with("xoxb-")
-    {
-        return false;
-    }
-    if token.starts_with('/') || token.starts_with("./") || token.starts_with("../") || token.starts_with("http://") || token.starts_with("https://") {
-        return false;
-    }
-    if COMMON_CODE_EXTS.iter().any(|ext| token.ends_with(ext)) {
-        return false;
-    }
-    if token.matches('/').count() >= 2 {
-        return false;
-    }
-    true
-}
-
-fn is_directory_listing_line(line: &str, category: &str) -> bool {
-    let trimmed = line.trim();
-    if !trimmed.contains(category) {
-        return false;
-    }
-    if trimmed.contains(';') || trimmed.contains('{') || trimmed.contains('}') || trimmed.contains('=') {
-        return false;
-    }
-    if trimmed.starts_with("import ") || trimmed.starts_with("from ")
-        || trimmed.starts_with("def ") || trimmed.starts_with("class ")
-        || trimmed.starts_with("const ") || trimmed.starts_with("let ")
-        || trimmed.starts_with("var ") || trimmed.starts_with("//")
-        || trimmed.starts_with("/*") || trimmed.starts_with('*') || trimmed.starts_with('#') {
-        return false;
-    }
-    true
-}
-
-/// Prunes verbose diff bodies of lockfiles and generated asset bundles in git diff output.
-pub fn prune_git_diff_lockfiles(input: &str) -> (String, usize) {
-    if !input.contains("diff --git ") {
-        return (input.to_string(), 0);
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut pruned_count = 0;
-
-    let chunks: Vec<&str> = input.split("diff --git ").collect();
-    if chunks.is_empty() {
-        return (input.to_string(), 0);
-    }
-
-    out.push_str(chunks[0]);
-
-    for chunk in &chunks[1..] {
-        out.push_str("diff --git ");
-        let first_line = chunk.lines().next().unwrap_or("");
-
-        let is_target_file = LOCKFILE_NAMES.iter().any(|name| first_line.contains(&format!("/{name}")) || first_line.ends_with(name))
-            || LOCKFILE_EXTENSIONS.iter().any(|ext| first_line.contains(ext));
-
-        if is_target_file {
-            let mut adds = 0;
-            let mut dels = 0;
-            for line in chunk.lines() {
-                if line.starts_with('+') && !line.starts_with("+++") {
-                    adds += 1;
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    dels += 1;
-                }
-            }
-
-            if (adds + dels) > 10 {
-                for line in chunk.lines() {
-                    out.push_str(line);
-                    out.push('\n');
-                    if line.starts_with("+++") || line.starts_with("@@") {
-                        break;
-                    }
-                }
-                out.push_str(&format!(
-                    "[... Ferry Proxy: lockfile/asset diff suppressed (+{adds} lines, -{dels} lines) ...]\n"
-                ));
-                pruned_count += 1;
-                continue;
-            }
-        }
-
-        out.push_str(chunk);
-    }
-
-    (out, pruned_count)
-}
-
-/// Replaces large inline base64 payloads and continuous hex blobs with size banners.
-pub fn suppress_base64_and_hex_blobs(input: &str) -> (String, usize) {
-    if input.len() < 120 {
-        return (input.to_string(), 0);
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut suppressed_count = 0;
-
-    for line in input.lines() {
-        if line.len() < 120 {
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-
-        let mut processed_line = String::with_capacity(line.len());
-        let mut remainder = line;
-
-        while let Some(data_idx) = remainder.find("data:") {
-            if let Some(semi_idx) = remainder[data_idx..].find(";base64,") {
-                if semi_idx < 64 && !remainder[data_idx..data_idx + semi_idx].contains(' ') {
-                    let base64_start = data_idx + semi_idx + 8;
-                    let base64_len = remainder[base64_start..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
-                        .count();
-
-                    if base64_len >= 80 {
-                        processed_line.push_str(&remainder[..base64_start]);
-                        processed_line.push_str(&format!("[... Ferry Proxy: base64 payload ({base64_len} chars) suppressed ...]"));
-                        remainder = &remainder[base64_start + base64_len..];
-                        suppressed_count += 1;
-                        continue;
-                    }
-                }
-            }
-            processed_line.push_str(&remainder[..data_idx + 5]);
-            remainder = &remainder[data_idx + 5..];
-        }
-        processed_line.push_str(remainder);
-
-        let mut line_tokens = Vec::new();
-        let mut current_token = String::new();
-        let is_b64_char = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=';
-
-        for c in processed_line.chars() {
-            if is_b64_char(c) {
-                current_token.push(c);
-            } else {
-                if is_base64_or_hex_payload(&current_token) {
-                    line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
-                    suppressed_count += 1;
-                } else {
-                    line_tokens.push(current_token.clone());
-                }
-                current_token.clear();
-                line_tokens.push(c.to_string());
-            }
-        }
-        if is_base64_or_hex_payload(&current_token) {
-            line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
-            suppressed_count += 1;
-        } else {
-            line_tokens.push(current_token);
-        }
-
-        out.push_str(&line_tokens.concat());
-        out.push('\n');
-    }
-
-    if out.ends_with('\n') && !input.ends_with('\n') {
-        out.pop();
-    }
-
-    (out, suppressed_count)
-}
-
-const DIR_SHIELD_PATTERNS: &[(&str, &str)] = &[
-    ("node_modules/", "node_modules/"),
-    (".git/", ".git/"),
-    ("target/debug/", "target/debug/"),
-    ("target/release/", "target/release/"),
-    ("__pycache__/", "__pycache__/"),
-    (".venv/", ".venv/"),
-    ("/venv/", "venv/"),
-    ("vendor/bundle/", "vendor/bundle/"),
-    (".cache/", ".cache/"),
-];
-
-/// Folds long runs of file traversals into dependency or cache directories.
-pub fn shield_directory_traversals(input: &str) -> (String, usize) {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.len() < 6 {
-        return (input.to_string(), 0);
-    }
-
-    let mut out = Vec::new();
-    let mut shielded_count = 0;
-    let mut idx = 0;
-
-    while idx < lines.len() {
-        let line = lines[idx];
-        let mut matched_cat = None;
-
-        for (pattern, cat) in DIR_SHIELD_PATTERNS {
-            if is_directory_listing_line(line, pattern) {
-                matched_cat = Some(*cat);
-                break;
-            }
-        }
-
-        if let Some(cat) = matched_cat {
-            let start_run = idx;
-            while idx < lines.len() && is_directory_listing_line(lines[idx], cat) {
-                idx += 1;
-            }
-            let run_count = idx - start_run;
-            if run_count >= 4 {
-                out.push(format!("[... Ferry Proxy: {run_count} directory entries in {cat} suppressed ...]"));
-                shielded_count += run_count;
-            } else {
-                for i in start_run..idx {
-                    out.push(lines[i].to_string());
-                }
-            }
-        } else {
-            out.push(line.to_string());
-            idx += 1;
-        }
-    }
-
-    (out.join("\n"), shielded_count)
-}
-
-/// Zero-allocation character counter across all OpenAI-compatible message formats.
-/// Traverses existing in-memory JSON values without serializing to strings.
-pub fn count_message_chars(messages: &[Value]) -> usize {
-    let mut total = 0;
-    for msg in messages {
-        if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
-            total += c.len();
-        } else if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
-            for part in arr {
-                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                    total += t.len();
-                }
-            }
-        }
-        if let Some(o) = msg.get("output").and_then(|o| o.as_str()) {
-            total += o.len();
-        }
-        if let Some(r) = msg.get("reasoning").and_then(|r| r.as_str()) {
-            total += r.len();
-        }
-        if let Some(rc) = msg.get("reasoning_content").and_then(|rc| rc.as_str()) {
-            total += rc.len();
-        }
-        if let Some(tc) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
-            for call in tc {
-                if let Some(args) = call.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
-                    total += args.len();
-                }
-            }
-        }
-    }
-    total
-}
-
-/// Unified token estimation ratio: 3.5 characters per token for mixed code, tool JSON, and natural text.
-pub fn estimate_tokens_from_chars(chars: usize) -> u64 {
-    if chars == 0 {
-        return 0;
-    }
-    (chars as f64 / 3.5).ceil() as u64
-}
-
-/// Estimates token count for an array of messages using unified 3.5 chars/token ratio.
-pub fn estimate_message_tokens(messages: &[Value]) -> u64 {
-    let chars = count_message_chars(messages);
-    estimate_tokens_from_chars(chars)
 }
 
 #[cfg(test)]
@@ -1740,9 +720,7 @@ mod tests {
         let raw = "Log output here\nWarning: connection timeout\nWarning: connection timeout\nWarning: connection timeout\n```go\nfunc main() {\n\t// Repeated comments inside code fence must NOT be touched\n\t// Repeated comments inside code fence must NOT be touched\n\t// Repeated comments inside code fence must NOT be touched\n}\n```\nLog end";
         let cleaned = condenser.clean_tool_text(raw);
 
-        // Outside log is deduped
         assert!(cleaned.contains("[... repeated 2 times ...]"));
-        // Inside code block is 100% verbatim
         assert!(cleaned.contains("```go\nfunc main() {\n\t// Repeated comments inside code fence must NOT be touched\n\t// Repeated comments inside code fence must NOT be touched\n\t// Repeated comments inside code fence must NOT be touched\n}\n```"));
     }
 
@@ -1783,8 +761,8 @@ mod tests {
     fn test_rolling_context_compaction_preserves_system_and_recent() {
         let config = CondenserConfig {
             rolling_compaction: true,
-            compact_threshold_tokens: 50, // low threshold for testing
-            compact_keep_recent_turns: 1, // keep last 2 messages
+            compact_threshold_tokens: 50,
+            compact_keep_recent_turns: 1,
             ..Default::default()
         };
         let condenser = ContextCondenser::new(config);
@@ -1810,17 +788,14 @@ mod tests {
         assert!(s.chars_saved > 0);
 
         let msgs = body["messages"].as_array().unwrap();
-        // System prompt preserved at index 0
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "You are a pentester.");
 
-        // Checkpoint message at index 1
         assert_eq!(msgs[1]["role"], "user");
         let checkpoint = msgs[1]["content"].as_str().unwrap();
         assert!(checkpoint.contains("Historical Context Checkpoint"));
         assert!(checkpoint.contains("Explore target 1"));
 
-        // Recent turns preserved at the end
         let last_user = &msgs[msgs.len() - 2];
         let last_asst = &msgs[msgs.len() - 1];
         assert_eq!(last_user["role"], "user");
@@ -1865,27 +840,20 @@ mod tests {
     #[test]
     fn test_multi_region_diagnostic_signal_preservation() {
         let mut lines = Vec::new();
-        // Head lines
         for i in 0..5 {
             lines.push(format!("HEAD line {}", i));
         }
-        // Filler
         for i in 0..30 {
             lines.push(format!("filler passing log {}", i));
         }
-        // First diagnostic signal region
         lines.push("CRITICAL ERROR: SQL syntax error near 'OR 1=1' in table users".to_string());
-        // Filler
         for i in 0..30 {
             lines.push(format!("more passing info {}", i));
         }
-        // Second diagnostic signal region
         lines.push("ALERT: 500 Internal Server Error: unhandled nullpointer exception".to_string());
-        // Filler
         for i in 0..30 {
             lines.push(format!("tail filler {}", i));
         }
-        // Tail lines
         for i in 0..5 {
             lines.push(format!("TAIL line {}", i));
         }
@@ -1894,7 +862,7 @@ mod tests {
         let mut signals_extracted = 0;
         let truncated = truncate_tool_content_smart(&full_text, 5, 5, &mut signals_extracted);
 
-        assert!(signals_extracted >= 2, "Expected at least 2 distinct signals extracted");
+        assert!(signals_extracted >= 2);
         assert!(truncated.contains("HEAD line 0"));
         assert!(truncated.contains("TAIL line 4"));
         assert!(truncated.contains("SQL syntax error near 'OR 1=1'"));
@@ -2011,7 +979,6 @@ mod tests {
         assert!(checkpoint.contains("First audit step"));
         assert!(checkpoint.contains("Second audit step"));
 
-        // Verify extract_tool_anchors excludes common prose words like "cannot" while keeping paths/CVEs
         let tool_anchors = extract_tool_anchors("// Note: user cannot modify /api/cards without CVE-2026-1111");
         assert!(!tool_anchors.iter().any(|a| a.eq_ignore_ascii_case("cannot")));
         assert!(tool_anchors.iter().any(|a| a == "/api/cards"));
