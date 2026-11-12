@@ -657,7 +657,8 @@ def main():
         if len(sys.argv) == 3:
             cmd_to_run = sys.argv[2]
         else:
-            cmd_to_run = " ".join(sys.argv[2:])
+            import shlex
+            cmd_to_run = shlex.join(sys.argv[2:])
         exit_code = run_command_wrapped(cmd_to_run)
         sys.exit(exit_code)
 

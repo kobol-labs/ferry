@@ -190,6 +190,16 @@ class TestFerryCleanerSubprocess(unittest.TestCase):
         )
         self.assertEqual(res.returncode, 42)
 
+    def test_multi_argument_cli_preserves_spaces(self):
+        res = subprocess.run(
+            ["python3", self.script_path, "--", "echo", "hello world with spaces"],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("hello world with spaces", res.stdout)
+
     def test_stdin_pipeline_cleaning(self):
         payload = "Line 1\nWaiting for socket...\nWaiting for socket...\nWaiting for socket...\nLine 5\n"
         proc = subprocess.Popen(

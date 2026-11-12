@@ -606,23 +606,29 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
                     return (true, format!("read tool failed: '{tool_name}' returned error"));
                 }
 
-                // Contextual continuity: only escalate passive file reads if the IMMEDIATE
-                // preceding message was an explicit interactive reasoning/debugging prompt from the user.
-                // Routine agent loops running in an audit/benchmark session must keep file inspection local ($0).
-                if messages.len() >= 2 {
-                    let prev_msg = &messages[messages.len() - 2];
-                    if prev_msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                        let user_text = extract_message_text(prev_msg);
+                // Contextual continuity: escalate passive file reads if the initiating
+                // user prompt requested an explicit cognitive or reasoning task.
+                for msg in messages.iter().rev() {
+                    if msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                        let user_text = extract_message_text(msg);
                         let user_lower = user_text.to_lowercase();
+
+                        for kw in HARD_LOGIC_USER_KEYWORDS {
+                            if user_lower.contains(kw) {
+                                return (true, format!("info gathering for cognitive task: '{kw}'"));
+                            }
+                        }
+
                         let reasoning_verbs = [
                             "why", "diagnose", "debug", "architect", "design", "explain",
                             "solve", "analyze", "investigate", "fix the bug", "find the bug"
                         ];
                         for verb in reasoning_verbs {
                             if user_lower.starts_with(verb) || user_lower.contains(&format!(" {verb} ")) {
-                                return (true, format!("info gathering for immediate user reasoning task: '{verb}'"));
+                                return (true, format!("info gathering for user reasoning task: '{verb}'"));
                             }
                         }
+                        break;
                     }
                 }
 
@@ -703,6 +709,84 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
                 }
             }
             (false, "default mechanical turn".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_routine_read_file_stays_local() {
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "check package.json and show dependencies" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "c1", "type": "function", "function": { "name": "read_file", "arguments": "package.json" } }
+                    ]
+                },
+                { "role": "tool", "tool_call_id": "c1", "content": "{\"name\": \"test\", \"dependencies\": {\"express\": \"^4.0\"}}" }
+            ]
+        });
+        let (is_hard, reason) = is_hard_logic_turn(&body);
+        assert!(!is_hard, "Routine read_file must stay local, got: {reason}");
+    }
+
+    #[test]
+    fn test_read_file_in_cognitive_audit_escalates() {
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "conduct a security audit of our token authentication logic and check for cwe vulnerabilities" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "c_aud", "type": "function", "function": { "name": "read_file", "arguments": "src/auth.rs" } }
+                    ]
+                },
+                { "role": "tool", "tool_call_id": "c_aud", "content": "pub fn verify_token() { /* token logic */ }" }
+            ]
+        });
+        let (is_hard, reason) = is_hard_logic_turn(&body);
+        assert!(is_hard, "Cognitive audit read_file must escalate to Cloud, got: {reason}");
+        assert!(reason.contains("cognitive task"));
+    }
+
+    #[test]
+    fn test_compiler_panic_escalates() {
+        let body = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "c_test", "type": "function", "function": { "name": "run_command", "arguments": "cargo test" } }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c_test",
+                    "content": "running 1 test\ntest test_auth ... FAILED\nthread 'main' panicked at 'assertion failed: 2 == 3'"
+                }
+            ]
+        });
+        let (is_hard, reason) = is_hard_logic_turn(&body);
+        assert!(is_hard, "Compiler panic must escalate, got: {reason}");
+    }
+
+    #[test]
+    fn test_procedural_affirmations_stay_local() {
+        for word in &["yes", "ok", "proceed", "continue", "go ahead", "approved", "run it"] {
+            let body = json!({
+                "messages": [
+                    { "role": "assistant", "content": "Should I proceed with the build?" },
+                    { "role": "user", "content": word }
+                ]
+            });
+            let (is_hard, reason) = is_hard_logic_turn(&body);
+            assert!(!is_hard, "Affirmation '{word}' must stay local, got: {reason}");
         }
     }
 }
