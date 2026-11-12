@@ -11,3 +11,5 @@ graphify-out/cache/
 graphify-out/graph.html
 graphify-out/.*
 graphify-out/manifest.json
+graphify-out/20*/
+.pytest_cache/
