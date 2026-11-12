@@ -1,17 +1,17 @@
 # Graph Report - ferry  (2026-11-12)
 
 ## Corpus Check
-- 37 files · ~38,899 words
+- 37 files · ~38,926 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 3 file(s) not represented in the graph (top: (none) 2, .toml 1)
 
 ## Summary
-- 664 nodes · 1145 edges · 25 communities (16 shown, 9 thin omitted)
+- 665 nodes · 1146 edges · 25 communities (16 shown, 9 thin omitted)
 - Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 79 edges (avg confidence: 0.77)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `b230bbaf`
+- Built from commit: `78106904`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -27,7 +27,7 @@
 - ⛴️ Ferry
 - antigravity/ferry_cleaner.py
 - main.rs
-- hardware.rs
+- condenser.rs
 - steps
 - ferry_cleaner.py
 - is_hard_logic_turn
@@ -52,12 +52,12 @@
   tests/condenser_invariants.rs → src/condenser/stats.rs
 - `test_signal_aware_truncation_preserves_middle_error()` --calls--> `truncate_tool_content_smart()`  [INFERRED]
   tests/condenser_invariants.rs → src/condenser/truncation.rs
-- `Config` --references--> `CloudConfig`  [INFERRED]
-  src/config/mod.rs → src/config/hardware.rs
-- `Config` --references--> `LocalConfig`  [INFERRED]
-  src/config/mod.rs → src/config/hardware.rs
-- `Config` --references--> `ServerConfig`  [INFERRED]
-  src/config/mod.rs → src/config/hardware.rs
+- `Config` --references--> `CondenserConfig`  [INFERRED]
+  src/config/mod.rs → src/config/condenser.rs
+- `ResponseMeta` --references--> `AffinityType`  [INFERRED]
+  src/upstream.rs → src/affinity.rs
+- `test_multi_region_diagnostic_signal_preservation()` --calls--> `truncate_tool_content_smart()`  [INFERRED]
+  src/condenser/mod.rs → src/condenser/truncation.rs
 
 ## Import Cycles
 - None detected.
@@ -74,7 +74,7 @@ Nodes (12): circuit_open_reason(), CircuitState, Closed, Open, evaluate_circuit_
 
 ### Community 2 - "hardware.rs"
 Cohesion: 0.07
-Nodes (36): CondenserConfig, default_compact_keep_recent_turns(), default_compact_threshold_tokens(), default_condensation_enabled(), default_deduplicate_lines(), default_drop_historical_reasoning(), default_fold_repeated_tool_failures(), default_head_lines() (+28 more)
+Nodes (37): CloudConfig, default_adaptive_squeeze_ratio(), default_adaptive_squeezing(), default_bind(), default_circuit_breaker_threshold(), default_cloud_base(), default_cloud_model(), default_cloud_timeout_secs() (+29 more)
 
 ### Community 3 - "condenser_invariants.rs"
 Cohesion: 0.04
@@ -86,7 +86,7 @@ Nodes (14): LocalSlotGuard, DONE_SSE_CHUNK, extract_streaming_usage(), GuardedSt
 
 ### Community 5 - "Router"
 Cohesion: 0.10
-Nodes (21): detect_orchestrator(), estimate_tokens(), extract_message_text(), get_last_tool_args(), get_last_tool_name(), HARD_LOGIC_DIAGNOSTIC_SIGNALS, HARD_LOGIC_USER_KEYWORDS, has_real_diagnostic_signal() (+13 more)
+Nodes (22): COGNITIVE_TOOL_CONTEXT_KEYWORDS, detect_orchestrator(), estimate_tokens(), extract_message_text(), get_last_tool_args(), get_last_tool_name(), HARD_LOGIC_DIAGNOSTIC_SIGNALS, HARD_LOGIC_USER_KEYWORDS (+14 more)
 
 ### Community 6 - "with"
 Cohesion: 0.06
@@ -108,9 +108,9 @@ Nodes (21): _clean_text_chunk(), collapse_excess_whitespace(), condense_output()
 Cohesion: 0.21
 Nodes (10): AppState, chat_completions_handler(), cors_options_handler(), embeddings_handler(), extract_session_id(), health_handler(), metrics_handler(), model_detail_handler() (+2 more)
 
-### Community 11 - "hardware.rs"
-Cohesion: 0.14
-Nodes (20): CloudConfig, default_adaptive_squeeze_ratio(), default_adaptive_squeezing(), default_bind(), default_circuit_breaker_threshold(), default_cloud_base(), default_cloud_model(), default_cloud_timeout_secs() (+12 more)
+### Community 11 - "condenser.rs"
+Cohesion: 0.18
+Nodes (19): CondenserConfig, default_compact_keep_recent_turns(), default_compact_threshold_tokens(), default_condensation_enabled(), default_deduplicate_lines(), default_drop_historical_reasoning(), default_fold_repeated_tool_failures(), default_head_lines() (+11 more)
 
 ### Community 12 - "steps"
 Cohesion: 0.10
@@ -130,13 +130,13 @@ Nodes (6): Architecture & Alignment with Ferry Core, Ferry Antigravity Integrati
 
 ## Knowledge Gaps
 - **13 isolated node(s):** `Closed`, `Open`, `/Users/steve/.local/bin/graphify-mcp`, `ferry`, `CloudOnly` (+8 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 230 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 231 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
 - **9 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Config` connect `hardware.rs` to `upstream.rs`, `Router`, `SessionAffinityTracker`, `main.rs`, `hardware.rs`?**
+- **Why does `Config` connect `hardware.rs` to `upstream.rs`, `Router`, `SessionAffinityTracker`, `main.rs`, `condenser.rs`?**
   _High betweenness centrality (0.120) - this node is a cross-community bridge._
 - **Are the 8 inferred relationships involving `Config` (e.g. with `CondenserConfig` and `CloudConfig`) actually correct?**
   _`Config` has 8 INFERRED edges - model-reasoned connections that need verification._
@@ -148,5 +148,5 @@ _Questions this graph is uniquely positioned to answer:_
   _High betweenness centrality (0.102) - this node is a cross-community bridge._
 - **Should `MetricsTracker` be split into smaller, more focused modules?**
   _Cohesion score 0.05587808417997097 - nodes in this community are weakly interconnected._
-- **Why does `ContextCondenser` connect `condenser/mod.rs` to `condenser_invariants.rs`, `hardware.rs`, `main.rs`?**
+- **Why does `ContextCondenser` connect `condenser/mod.rs` to `condenser_invariants.rs`, `main.rs`, `condenser.rs`?**
   _High betweenness centrality (0.065) - this node is a cross-community bridge._

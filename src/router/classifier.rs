@@ -34,13 +34,6 @@ pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
 ];
 
 pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
-    "audit",
-    "vulnerability",
-    "vulnerabilities",
-    "cve",
-    "cwe",
-    "exploit",
-    "penetration",
     "threat model",
     "architect",
     "refactor",
@@ -57,6 +50,17 @@ pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
     "algorithmic",
     "exploit synthesis",
     "proof of concept",
+];
+
+pub const COGNITIVE_TOOL_CONTEXT_KEYWORDS: &[&str] = &[
+    "audit",
+    "vulnerability",
+    "vulnerabilities",
+    "cve",
+    "cwe",
+    "exploit",
+    "penetration",
+    "security review",
 ];
 
 pub fn estimate_tokens(body: &Value) -> u64 {
@@ -621,6 +625,12 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
                         let user_lower = user_text.to_lowercase();
 
                         for kw in HARD_LOGIC_USER_KEYWORDS {
+                            if user_lower.contains(kw) {
+                                return (true, format!("info gathering for cognitive task: '{kw}'"));
+                            }
+                        }
+
+                        for kw in COGNITIVE_TOOL_CONTEXT_KEYWORDS {
                             if user_lower.contains(kw) {
                                 return (true, format!("info gathering for cognitive task: '{kw}'"));
                             }
