@@ -59,6 +59,9 @@ pub fn render_prometheus(s: &StatsSnapshot) -> String {
          ferry_condensation_cleaner_actions_total{{action=\"json_minified\"}} {json_minified}\n\
          ferry_condensation_cleaner_actions_total{{action=\"signals_extracted\"}} {signals_extracted}\n\
          ferry_condensation_cleaner_actions_total{{action=\"loops_collapsed\"}} {loops_collapsed}\n\
+         # HELP ferry_loop_nudges_total Total times the stateless loop guard nudged repeated identical failing tool calls\n\
+         # TYPE ferry_loop_nudges_total counter\n\
+         ferry_loop_nudges_total {loop_nudges}\n\
          # HELP ferry_ledger_checks_passed_total Total compression operations verified by the constraint ledger\n\
          # TYPE ferry_ledger_checks_passed_total counter\n\
          ferry_ledger_checks_passed_total {ledger_passed}\n\
@@ -138,6 +141,7 @@ pub fn render_prometheus(s: &StatsSnapshot) -> String {
         json_minified = s.json_minified_count,
         signals_extracted = s.signals_extracted_count,
         loops_collapsed = s.loops_collapsed_count,
+        loop_nudges = s.loop_nudges_total,
         ledger_passed = s.ledger_checks_passed,
         ledger_vetoed = s.ledger_vetoed_count,
         last_orig = s.last_prompt_tokens_original,

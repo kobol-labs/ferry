@@ -55,6 +55,7 @@ impl Config {
         cfg
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
         Self {
             server: ServerConfig::default(),
@@ -144,6 +145,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_FOLD_REPEATED_TOOL_FAILURES") {
             if let Some(b) = parse_bool(&v) { self.condensation.fold_repeated_tool_failures = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_NUDGE_REPEATED_FAILURES") {
+            if let Some(b) = parse_bool(&v) { self.condensation.nudge_repeated_failures = b; }
         }
         if let Ok(v) = std::env::var("FERRY_ROLLING_COMPACTION") {
             if let Some(b) = parse_bool(&v) { self.condensation.rolling_compaction = b; }

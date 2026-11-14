@@ -1091,3 +1091,28 @@ async fn test_adaptive_queueing_wait_timeout_override() {
     assert_eq!(d_fast.target, ferry::router::TargetProvider::Cloud);
     assert!(d_fast.is_spillover);
 }
+
+#[test]
+fn test_loop_nudge_backward_compat_config_and_prometheus_metrics() {
+    use ferry::config::Config;
+
+    // Legacy TOML omitting `nudge_repeated_failures` must deserialize cleanly and default to `true`
+    let legacy_toml = r#"
+[condensation]
+enabled = true
+fold_repeated_tool_failures = true
+"#;
+    let parsed: Config = toml::from_str(legacy_toml).expect("Legacy TOML must parse cleanly");
+    assert!(parsed.condensation.nudge_repeated_failures);
+
+    let metrics = MetricsTracker::new();
+    assert_eq!(metrics.snapshot().loop_nudges_total, 0);
+    metrics.record_loop_nudge();
+    metrics.record_loop_nudge();
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.loop_nudges_total, 2);
+    let prom = metrics.prometheus_metrics();
+    assert!(prom.contains("# TYPE ferry_loop_nudges_total counter"));
+    assert!(prom.contains("ferry_loop_nudges_total 2"));
+}

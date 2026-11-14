@@ -14,6 +14,354 @@ use crate::config::CondenserConfig;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+pub const LOOP_GUARD_MARKER: &str = "[Ferry Loop Guard]:";
+pub const LOOP_GUARD_SUFFIX: &str = "\n\n[Ferry Loop Guard]: This exact tool call has failed 3 times consecutively with the same result. Do not repeat it; inspect the root cause or pivot to a different approach.";
+
+struct ParsedToolCall {
+    id: Option<String>,
+    signature: (String, String),
+}
+
+struct ParsedToolOutput {
+    id: Option<String>,
+    clean_text: String,
+}
+
+struct TurnTuple {
+    signatures: Vec<(String, String)>,
+    outputs: Vec<String>,
+}
+
+/// Stateless tail-only loop guard: detects 3 consecutive identical failing `(assistant -> tool)` turns
+/// at the end of `body.messages` and appends a single redirect line ONLY to the final `tool` message.
+pub fn nudge_repeated_tool_failure(body: &mut Value) -> bool {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    if messages.len() < 6 {
+        return false;
+    }
+
+    // Fast path & idempotency guard: inspect tail message first.
+    let last_msg = &messages[messages.len() - 1];
+    if !is_tool_output_message(last_msg) {
+        return false;
+    }
+    let Some(last_raw_text) = extract_tool_output_text(last_msg) else {
+        return false;
+    };
+    if last_raw_text.contains(LOOP_GUARD_MARKER) {
+        return false;
+    }
+
+    // Walk backward over the last 3 completed (assistant -> k tool outputs) turns.
+    let mut cursor = messages.len();
+    let mut turns: Vec<TurnTuple> = Vec::with_capacity(3);
+    for step in 0..3 {
+        let mut tool_start = cursor;
+        while tool_start > 0 && is_tool_output_message(&messages[tool_start - 1]) {
+            tool_start -= 1;
+        }
+        let k = cursor - tool_start;
+        if k == 0 || tool_start == 0 {
+            return false;
+        }
+
+        let mut raw_outputs = Vec::with_capacity(k);
+        for msg in &messages[tool_start..cursor] {
+            let Some(raw_out) = extract_tool_output_text(msg) else {
+                return false;
+            };
+            if step == 0 && raw_out.contains(LOOP_GUARD_MARKER) {
+                return false;
+            }
+            let clean_text = raw_out
+                .strip_suffix(LOOP_GUARD_SUFFIX)
+                .unwrap_or(&raw_out)
+                .to_string();
+            raw_outputs.push(ParsedToolOutput {
+                id: extract_tool_output_id(msg),
+                clean_text,
+            });
+        }
+
+        let Some((next_cursor, calls)) = extract_preceding_tool_calls(messages, tool_start, k)
+        else {
+            return false;
+        };
+        let Some(aligned_outputs) = align_tool_outputs(&calls, &raw_outputs) else {
+            return false;
+        };
+
+        let signatures = calls.into_iter().map(|c| c.signature).collect();
+        turns.push(TurnTuple {
+            signatures,
+            outputs: aligned_outputs,
+        });
+        cursor = next_cursor;
+    }
+
+    if turns[0].signatures != turns[1].signatures || turns[1].signatures != turns[2].signatures {
+        return false;
+    }
+
+    let tuple_len = turns[0].outputs.len();
+    for slot in 0..tuple_len {
+        let o0 = &turns[0].outputs[slot];
+        let o1 = &turns[1].outputs[slot];
+        let o2 = &turns[2].outputs[slot];
+
+        let all_diagnostic_failures = is_diagnostic_tool_failure(o0)
+            && is_diagnostic_tool_failure(o1)
+            && is_diagnostic_tool_failure(o2);
+        let all_identical_non_empty = !o0.trim().is_empty() && o0 == o1 && o1 == o2;
+
+        if !all_diagnostic_failures && !all_identical_non_empty {
+            return false;
+        }
+    }
+
+    // Non-destructive tail-only mutation: ONLY messages.last_mut() is ever modified.
+    if let Some(tail) = messages.last_mut() {
+        return append_nudge_to_tool_message(tail);
+    }
+    false
+}
+
+fn is_tool_output_message(msg: &Value) -> bool {
+    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
+    let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+    matches!(role, "tool" | "function") || matches!(msg_type, "function_call_output" | "tool_result")
+}
+
+fn extract_tool_output_id(msg: &Value) -> Option<String> {
+    msg.get("tool_call_id")
+        .or_else(|| msg.get("call_id"))
+        .or_else(|| msg.get("tool_use_id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_tool_output_text(msg: &Value) -> Option<String> {
+    if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+        return Some(c.to_string());
+    }
+    if let Some(o) = msg.get("output").and_then(|o| o.as_str()) {
+        return Some(o.to_string());
+    }
+    if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !texts.is_empty() {
+            return Some(texts.join("\n"));
+        }
+    }
+    None
+}
+
+fn append_nudge_to_tool_message(msg: &mut Value) -> bool {
+    let Some(obj) = msg.as_object_mut() else {
+        return false;
+    };
+    if let Some(Value::String(c)) = obj.get_mut("content") {
+        c.push_str(LOOP_GUARD_SUFFIX);
+        return true;
+    }
+    if let Some(Value::String(o)) = obj.get_mut("output") {
+        o.push_str(LOOP_GUARD_SUFFIX);
+        return true;
+    }
+    if let Some(Value::Array(parts)) = obj.get_mut("content") {
+        for part in parts.iter_mut().rev() {
+            if let Some(Value::String(t)) = part.get_mut("text") {
+                t.push_str(LOOP_GUARD_SUFFIX);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn extract_preceding_tool_calls(
+    messages: &[Value],
+    tool_start: usize,
+    expected_k: usize,
+) -> Option<(usize, Vec<ParsedToolCall>)> {
+    if tool_start == 0 || expected_k == 0 {
+        return None;
+    }
+
+    let prev = &messages[tool_start - 1];
+    let role = prev.get("role").and_then(|r| r.as_str()).unwrap_or_default();
+
+    if role == "assistant" {
+        if let Some(arr) = prev.get("tool_calls").and_then(|tc| tc.as_array()) {
+            if arr.len() != expected_k {
+                return None;
+            }
+            let mut calls = Vec::with_capacity(expected_k);
+            for item in arr {
+                let id = item
+                    .get("id")
+                    .or_else(|| item.get("call_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let func = item.get("function").unwrap_or(item);
+                let name = func.get("name").and_then(|n| n.as_str())?.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                let args = normalize_tool_arguments(func.get("arguments"));
+                calls.push(ParsedToolCall {
+                    id,
+                    signature: (name.to_lowercase(), args),
+                });
+            }
+            return Some((tool_start - 1, calls));
+        }
+
+        if let Some(fc) = prev.get("function_call").filter(|_| expected_k == 1) {
+            let name = fc.get("name").and_then(|n| n.as_str())?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let args = normalize_tool_arguments(fc.get("arguments"));
+            return Some((
+                tool_start - 1,
+                vec![ParsedToolCall {
+                    id: None,
+                    signature: (name.to_lowercase(), args),
+                }],
+            ));
+        }
+
+        return None;
+    }
+
+    let mut fc_start = tool_start;
+    while fc_start > 0
+        && messages[fc_start - 1]
+            .get("type")
+            .and_then(|t| t.as_str())
+            == Some("function_call")
+    {
+        fc_start -= 1;
+    }
+    let fc_count = tool_start - fc_start;
+    if fc_count > 0 {
+        if fc_count != expected_k {
+            return None;
+        }
+        let mut calls = Vec::with_capacity(expected_k);
+        for item in &messages[fc_start..tool_start] {
+            let id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let name = item.get("name").and_then(|n| n.as_str())?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let args = normalize_tool_arguments(item.get("arguments"));
+            calls.push(ParsedToolCall {
+                id,
+                signature: (name.to_lowercase(), args),
+            });
+        }
+        return Some((fc_start, calls));
+    }
+
+    None
+}
+
+fn align_tool_outputs(
+    calls: &[ParsedToolCall],
+    outputs: &[ParsedToolOutput],
+) -> Option<Vec<String>> {
+    let k = calls.len();
+    if k == 0 || outputs.len() != k {
+        return None;
+    }
+
+    let mut aligned: Vec<Option<String>> = vec![None; k];
+    let mut used_out = vec![false; k];
+
+    // Pass 1: exact match whenever both call_id and tool_call_id are present and non-empty.
+    for (ci, call) in calls.iter().enumerate() {
+        let Some(cid) = call.id.as_deref() else {
+            continue;
+        };
+        if let Some(oi) = (0..k).find(|&oi| !used_out[oi] && outputs[oi].id.as_deref() == Some(cid))
+        {
+            used_out[oi] = true;
+            aligned[ci] = Some(outputs[oi].clean_text.clone());
+        }
+    }
+
+    // Pass 2: positional fallback only when at least one side omits an ID.
+    let mut next_unused = 0usize;
+    for (ci, call) in calls.iter().enumerate() {
+        if aligned[ci].is_some() {
+            continue;
+        }
+        while next_unused < k && used_out[next_unused] {
+            next_unused += 1;
+        }
+        if next_unused >= k {
+            return None;
+        }
+        let out = &outputs[next_unused];
+        if call.id.is_some() && out.id.is_some() {
+            return None;
+        }
+        used_out[next_unused] = true;
+        aligned[ci] = Some(out.clean_text.clone());
+    }
+
+    aligned.into_iter().collect()
+}
+
+fn normalize_tool_arguments(args_val: Option<&Value>) -> String {
+    match args_val {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                serde_json::to_string(&parsed).unwrap_or_else(|_| trimmed.to_string())
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+fn is_diagnostic_tool_failure(text: &str) -> bool {
+    if crate::router::classifier::has_real_diagnostic_signal(text).is_some() {
+        return true;
+    }
+    let prefix_lower: String = text
+        .trim_start()
+        .chars()
+        .take(24)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    prefix_lower.starts_with("error:")
+        || prefix_lower.starts_with("file not found")
+        || prefix_lower.starts_with("no such file")
+        || prefix_lower.starts_with("permission denied")
+        || prefix_lower.starts_with("notfound")
+}
+
 pub struct ContextCondenser {
     config: CondenserConfig,
 }
@@ -229,36 +577,43 @@ impl ContextCondenser {
             return String::new();
         }
 
-        let mut processed = self.clean_tool_text_with_stats(initial_text, stats);
+        let (base_text, has_loop_nudge) = match initial_text.strip_suffix(LOOP_GUARD_SUFFIX) {
+            Some(s) => (s, true),
+            None => (initial_text, false),
+        };
 
-        // Truncation logic
-        if self.config.truncate_tool_outputs {
-            if is_historical {
-                if processed.len() > self.config.max_tool_chars {
-                    let hist_head = if self.config.max_tool_chars >= 8000 {
-                        self.config.head_lines.max(30)
-                    } else {
-                        self.config.head_lines
-                    };
-                    let hist_tail = if self.config.max_tool_chars >= 8000 {
-                        self.config.tail_lines.max(20)
-                    } else {
-                        self.config.tail_lines
-                    };
-                    processed = truncate_tool_content_smart(
-                        &processed,
-                        hist_head,
-                        hist_tail,
-                        &mut stats.signals_extracted_count,
-                    );
-                    stats.tool_outputs_truncated += 1;
-                }
-            } else {
-                if self.config.recent_max_tool_chars > 0 && processed.len() > self.config.recent_max_tool_chars {
+        let mut processed = if base_text.is_empty() {
+            String::new()
+        } else {
+            let mut p = self.clean_tool_text_with_stats(base_text, stats);
+
+            // Truncation logic
+            if self.config.truncate_tool_outputs {
+                if is_historical {
+                    if p.len() > self.config.max_tool_chars {
+                        let hist_head = if self.config.max_tool_chars >= 8000 {
+                            self.config.head_lines.max(30)
+                        } else {
+                            self.config.head_lines
+                        };
+                        let hist_tail = if self.config.max_tool_chars >= 8000 {
+                            self.config.tail_lines.max(20)
+                        } else {
+                            self.config.tail_lines
+                        };
+                        p = truncate_tool_content_smart(
+                            &p,
+                            hist_head,
+                            hist_tail,
+                            &mut stats.signals_extracted_count,
+                        );
+                        stats.tool_outputs_truncated += 1;
+                    }
+                } else if self.config.recent_max_tool_chars > 0 && p.len() > self.config.recent_max_tool_chars {
                     let recent_head = self.config.head_lines.max(30);
                     let recent_tail = self.config.tail_lines.max(20);
-                    processed = truncate_tool_content_smart(
-                        &processed,
+                    p = truncate_tool_content_smart(
+                        &p,
                         recent_head,
                         recent_tail,
                         &mut stats.signals_extracted_count,
@@ -266,20 +621,25 @@ impl ContextCondenser {
                     stats.tool_outputs_truncated += 1;
                 }
             }
-        }
 
-        // Permanent invariant: PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
-        if !is_historical {
-            let anchors = extract_tool_anchors(initial_text);
-            if let Some(missing) = self.find_missing_anchor(&anchors, &processed) {
-                warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
-                stats.ledger_vetoed_count += 1;
-                processed = initial_text.to_string();
+            // Permanent invariant: PromptTrim-inspired Constraint Ledger verification (Proof-of-safety)
+            if !is_historical {
+                let anchors = extract_tool_anchors(base_text);
+                if let Some(missing) = self.find_missing_anchor(&anchors, &p) {
+                    warn!(missing_anchor = %missing, "Constraint ledger vetoed compression on recent turn; restored verbatim");
+                    stats.ledger_vetoed_count += 1;
+                    p = base_text.to_string();
+                } else {
+                    stats.ledger_checks_passed += 1;
+                }
             } else {
                 stats.ledger_checks_passed += 1;
             }
-        } else {
-            stats.ledger_checks_passed += 1;
+            p
+        };
+
+        if has_loop_nudge {
+            processed.push_str(LOOP_GUARD_SUFFIX);
         }
 
         processed
@@ -983,5 +1343,411 @@ mod tests {
         assert!(!tool_anchors.iter().any(|a| a.eq_ignore_ascii_case("cannot")));
         assert!(tool_anchors.iter().any(|a| a == "/api/cards"));
         assert!(tool_anchors.iter().any(|a| a == "CVE-2026-1111"));
+    }
+
+    #[test]
+    fn test_loop_nudge_3x_identical_failing_calls_tail_only_across_formats() {
+        // 1a. Diagnostic failure signal (even with non-identical timestamps across attempts) + JSON key-order normalization
+        let tc1 = json!([{ "id": "c1", "type": "function", "function": { "name": "run_command", "arguments": "{\"cmd\": \"pytest tests/\", \"timeout\": 30}" } }]);
+        let tc2 = json!([{ "id": "c2", "type": "function", "function": { "name": "run_command", "arguments": "{\n  \"timeout\": 30,\n  \"cmd\": \"pytest tests/\"\n}" } }]);
+        let tc3 = json!([{ "id": "c3", "type": "function", "function": { "name": "run_command", "arguments": "{\"cmd\":\"pytest tests/\",\"timeout\":30}" } }]);
+
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "You are an autonomous agent." },
+                { "role": "user", "content": "Run tests" },
+                { "role": "assistant", "content": null, "tool_calls": tc1 },
+                { "role": "tool", "tool_call_id": "c1", "content": "test result: test failed in 0.11s\nAssertionError: 1 != 2" },
+                { "role": "assistant", "content": null, "tool_calls": tc2 },
+                { "role": "tool", "tool_call_id": "c2", "content": "test result: test failed in 0.14s\nAssertionError: 1 != 2" },
+                { "role": "assistant", "content": null, "tool_calls": tc3 },
+                { "role": "tool", "tool_call_id": "c3", "content": "test result: test failed in 0.12s\nAssertionError: 1 != 2" }
+            ]
+        });
+        let snapshot_before = body["messages"].as_array().unwrap()[..7].to_vec();
+
+        assert!(nudge_repeated_tool_failure(&mut body));
+
+        let msgs = body["messages"].as_array().unwrap();
+        // Historical messages (< len - 1) and all assistant.tool_calls are 100% unmutated
+        assert_eq!(&msgs[..7], snapshot_before.as_slice());
+        assert_eq!(msgs[2]["tool_calls"], tc1);
+        assert_eq!(msgs[4]["tool_calls"], tc2);
+        assert_eq!(msgs[6]["tool_calls"], tc3);
+        assert_eq!(
+            msgs[7]["content"].as_str().unwrap(),
+            format!("test result: test failed in 0.12s\nAssertionError: 1 != 2{LOOP_GUARD_SUFFIX}")
+        );
+
+        // 1b. Read-tool error prefix per classifier.rs:611-615 on `output` string format (`function_call_output`)
+        let mut body_output = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "r1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"/missing.txt\"}" } }] },
+                { "type": "function_call_output", "call_id": "r1", "output": "File not found: /missing.txt (attempt 1)" },
+                { "role": "assistant", "tool_calls": [{ "id": "r2", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"/missing.txt\"}" } }] },
+                { "type": "function_call_output", "call_id": "r2", "output": "File not found: /missing.txt (attempt 2)" },
+                { "role": "assistant", "tool_calls": [{ "id": "r3", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"/missing.txt\"}" } }] },
+                { "type": "function_call_output", "call_id": "r3", "output": "File not found: /missing.txt (attempt 3)" }
+            ]
+        });
+        let hist_output = body_output["messages"].as_array().unwrap()[..5].to_vec();
+        assert!(nudge_repeated_tool_failure(&mut body_output));
+        let msgs_out = body_output["messages"].as_array().unwrap();
+        assert_eq!(&msgs_out[..5], hist_output.as_slice());
+        assert_eq!(
+            msgs_out[5]["output"].as_str().unwrap(),
+            format!("File not found: /missing.txt (attempt 3){LOOP_GUARD_SUFFIX}")
+        );
+
+        // 1c. Byte-identical non-empty output (without diagnostic signal) on `content` text-part array
+        let mut body_parts = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "p1", "type": "function", "function": { "name": "run_command", "arguments": "{\"cmd\":\"which missing_bin\"}" } }] },
+                { "role": "tool", "content": [{ "type": "text", "text": "missing_bin not installed" }] },
+                { "role": "assistant", "tool_calls": [{ "id": "p2", "type": "function", "function": { "name": "run_command", "arguments": "{\"cmd\":\"which missing_bin\"}" } }] },
+                { "role": "tool", "content": [{ "type": "text", "text": "missing_bin not installed" }] },
+                { "role": "assistant", "tool_calls": [{ "id": "p3", "type": "function", "function": { "name": "run_command", "arguments": "{\"cmd\":\"which missing_bin\"}" } }] },
+                { "role": "tool", "content": [{ "type": "text", "text": "missing_bin not installed" }] }
+            ]
+        });
+        let hist_parts = body_parts["messages"].as_array().unwrap()[..5].to_vec();
+        assert!(nudge_repeated_tool_failure(&mut body_parts));
+        let msgs_parts = body_parts["messages"].as_array().unwrap();
+        assert_eq!(&msgs_parts[..5], hist_parts.as_slice());
+        assert_eq!(
+            msgs_parts[5]["content"][0]["text"].as_str().unwrap(),
+            format!("missing_bin not installed{LOOP_GUARD_SUFFIX}")
+        );
+    }
+
+    #[test]
+    fn test_loop_nudge_idempotent_no_double_nudge() {
+        let mut body = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "content": "error: exit status 1" },
+                { "role": "assistant", "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "content": "error: exit status 1" },
+                { "role": "assistant", "tool_calls": [{ "id": "c3", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "content": "error: exit status 1" }
+            ]
+        });
+
+        assert!(nudge_repeated_tool_failure(&mut body));
+        let after_first = body.clone();
+
+        // Second invocation must be a no-op and return false
+        assert!(!nudge_repeated_tool_failure(&mut body));
+        assert_eq!(body, after_first);
+        let tail = body["messages"][5]["content"].as_str().unwrap();
+        assert_eq!(tail.matches(LOOP_GUARD_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn test_loop_nudge_same_tool_different_arguments_does_not_nudge() {
+        let mut body = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"a.txt\"}" } }] },
+                { "role": "tool", "content": "File not found" },
+                { "role": "assistant", "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"b.txt\"}" } }] },
+                { "role": "tool", "content": "File not found" },
+                { "role": "assistant", "tool_calls": [{ "id": "c3", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"c.txt\"}" } }] },
+                { "role": "tool", "content": "File not found" }
+            ]
+        });
+        let orig = body.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body));
+        assert_eq!(body, orig);
+    }
+
+    #[test]
+    fn test_loop_nudge_only_2_consecutive_failures_does_not_nudge() {
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "System" },
+                { "role": "user", "content": "Run" },
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"curl http://localhost:9999\"}" } }] },
+                { "role": "tool", "content": "error: connection refused" },
+                { "role": "assistant", "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"curl http://localhost:9999\"}" } }] },
+                { "role": "tool", "content": "error: connection refused" }
+            ]
+        });
+        let orig = body.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body));
+        assert_eq!(body, orig);
+    }
+
+    #[test]
+    fn test_loop_nudge_changing_non_error_outputs_does_not_nudge() {
+        let mut body = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "poll_job", "arguments": "{\"job_id\":\"42\"}" } }] },
+                { "role": "tool", "content": "pending 1/3" },
+                { "role": "assistant", "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "poll_job", "arguments": "{\"job_id\":\"42\"}" } }] },
+                { "role": "tool", "content": "pending 2/3" },
+                { "role": "assistant", "tool_calls": [{ "id": "c3", "type": "function", "function": { "name": "poll_job", "arguments": "{\"job_id\":\"42\"}" } }] },
+                { "role": "tool", "content": "ready 3/3" }
+            ]
+        });
+        let orig = body.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body));
+        assert_eq!(body, orig);
+    }
+
+    #[test]
+    fn test_loop_nudge_preserves_json_minification_and_suffix_in_condense() {
+        let condenser = ContextCondenser::new(CondenserConfig::default());
+        let pretty_json_err = "{\n  \"error\": \"status 500\",\n  \"detail\": \"upstream gateway failure\"\n}";
+        let mut body = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "j1", "type": "function", "function": { "name": "http_get", "arguments": "{\"url\":\"http://api.local/health\"}" } }] },
+                { "role": "tool", "tool_call_id": "j1", "content": pretty_json_err },
+                { "role": "assistant", "tool_calls": [{ "id": "j2", "type": "function", "function": { "name": "http_get", "arguments": "{\"url\":\"http://api.local/health\"}" } }] },
+                { "role": "tool", "tool_call_id": "j2", "content": pretty_json_err },
+                { "role": "assistant", "tool_calls": [{ "id": "j3", "type": "function", "function": { "name": "http_get", "arguments": "{\"url\":\"http://api.local/health\"}" } }] },
+                { "role": "tool", "tool_call_id": "j3", "content": pretty_json_err }
+            ]
+        });
+
+        assert!(nudge_repeated_tool_failure(&mut body));
+        let stats = condenser.condense(&mut body);
+        assert!(stats.json_minified_count >= 1);
+
+        let tail = body["messages"][5]["content"].as_str().unwrap();
+        assert!(tail.ends_with(LOOP_GUARD_SUFFIX));
+        let prefix = tail.strip_suffix(LOOP_GUARD_SUFFIX).unwrap();
+        assert!(!prefix.contains('\n'));
+        assert!(prefix.contains("\"error\":\"status 500\""));
+    }
+
+    #[test]
+    fn test_loop_nudge_preserves_lockfile_diff_pruning_and_suffix_in_condense() {
+        let condenser = ContextCondenser::new(CondenserConfig::default());
+        let mut diff_lines = vec![
+            "diff --git a/Cargo.lock b/Cargo.lock".to_string(),
+            "--- a/Cargo.lock".to_string(),
+            "+++ b/Cargo.lock".to_string(),
+            "@@ -1,15 +1,15 @@".to_string(),
+        ];
+        for i in 0..15 {
+            diff_lines.push(format!("+checksum-{i} = \"deadbeef\""));
+        }
+        let lockfile_diff = diff_lines.join("\n");
+
+        let mut body = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "d1", "type": "function", "function": { "name": "git_diff", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "d1", "content": lockfile_diff },
+                { "role": "assistant", "tool_calls": [{ "id": "d2", "type": "function", "function": { "name": "git_diff", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "d2", "content": lockfile_diff },
+                { "role": "assistant", "tool_calls": [{ "id": "d3", "type": "function", "function": { "name": "git_diff", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "d3", "content": lockfile_diff }
+            ]
+        });
+
+        assert!(nudge_repeated_tool_failure(&mut body));
+        let stats = condenser.condense(&mut body);
+        assert!(stats.lockfile_diffs_pruned_count >= 1);
+
+        let tail = body["messages"][5]["content"].as_str().unwrap();
+        assert!(tail.contains("[... Ferry Proxy: lockfile/asset diff suppressed"));
+        assert!(tail.ends_with(LOOP_GUARD_SUFFIX));
+    }
+
+    #[test]
+    fn test_loop_nudge_preserves_suffix_under_large_and_small_truncation_budgets() {
+        // 1. Default condenser (> 24,000 char failing output)
+        let condenser_default = ContextCondenser::new(CondenserConfig::default());
+        let mut big_lines = vec!["error: build failed with multiple diagnostics".to_string()];
+        for i in 0..380 {
+            big_lines.push(format!(
+                "log entry {i:04}: compiler diagnostic frame output padding {}",
+                "x".repeat(50)
+            ));
+        }
+        let big_err = big_lines.join("\n");
+        assert!(big_err.len() > 24_000);
+
+        let mut body_big = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "b1", "type": "function", "function": { "name": "cargo_build", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "b1", "content": big_err },
+                { "role": "assistant", "tool_calls": [{ "id": "b2", "type": "function", "function": { "name": "cargo_build", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "b2", "content": big_err },
+                { "role": "assistant", "tool_calls": [{ "id": "b3", "type": "function", "function": { "name": "cargo_build", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "b3", "content": big_err }
+            ]
+        });
+
+        assert!(nudge_repeated_tool_failure(&mut body_big));
+        let stats_big = condenser_default.condense(&mut body_big);
+        assert!(stats_big.tool_outputs_truncated >= 1);
+        let tail_big = body_big["messages"][5]["content"].as_str().unwrap();
+        assert!(tail_big.ends_with(LOOP_GUARD_SUFFIX));
+
+        // 2. Small `recent_max_tool_chars = 200` boundary
+        let small_cfg = CondenserConfig {
+            recent_max_tool_chars: 200,
+            ..CondenserConfig::default()
+        };
+        let condenser_small = ContextCondenser::new(small_cfg);
+        let mut med_lines = vec!["error: command exited with status 1".to_string()];
+        for i in 0..80 {
+            med_lines.push(format!("frame {i:03}: stack trace detail line"));
+        }
+        let med_err = med_lines.join("\n");
+        assert!(med_err.len() > 200);
+
+        let mut body_small = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "s1", "type": "function", "function": { "name": "run_cmd", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "s1", "content": med_err },
+                { "role": "assistant", "tool_calls": [{ "id": "s2", "type": "function", "function": { "name": "run_cmd", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "s2", "content": med_err },
+                { "role": "assistant", "tool_calls": [{ "id": "s3", "type": "function", "function": { "name": "run_cmd", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "s3", "content": med_err }
+            ]
+        });
+
+        assert!(nudge_repeated_tool_failure(&mut body_small));
+        let stats_small = condenser_small.condense(&mut body_small);
+        assert!(stats_small.tool_outputs_truncated >= 1);
+        let tail_small = body_small["messages"][5]["content"].as_str().unwrap();
+        assert!(tail_small.ends_with(LOOP_GUARD_SUFFIX));
+    }
+
+    #[test]
+    fn test_loop_nudge_mismatched_tool_call_id_and_partial_parallel_batch_do_not_nudge() {
+        // 1. Mismatched `tool_call_id` ("c1" vs "c99")
+        let mut body_mismatch = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "tool_call_id": "c1", "content": "error: exit status 1" },
+                { "role": "assistant", "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "tool_call_id": "c2", "content": "error: exit status 1" },
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "tool_call_id": "c99", "content": "error: exit status 1" }
+            ]
+        });
+        let orig_mismatch = body_mismatch.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body_mismatch));
+        assert_eq!(body_mismatch, orig_mismatch);
+
+        // 2. Partial parallel batch (2 `tool_calls` + only 1 `tool` message)
+        let two_calls = json!([
+            { "id": "p1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"a.rs\"}" } },
+            { "id": "p2", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"b.rs\"}" } }
+        ]);
+        let mut body_partial = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": two_calls },
+                { "role": "tool", "tool_call_id": "p1", "content": "File not found" },
+                { "role": "assistant", "tool_calls": two_calls },
+                { "role": "tool", "tool_call_id": "p1", "content": "File not found" },
+                { "role": "assistant", "tool_calls": two_calls },
+                { "role": "tool", "tool_call_id": "p1", "content": "File not found" }
+            ]
+        });
+        let orig_partial = body_partial.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body_partial));
+        assert_eq!(body_partial, orig_partial);
+    }
+
+    #[test]
+    fn test_loop_nudge_3x_identical_failing_parallel_tuple_nudges_tail_only() {
+        let mut body = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "a1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"x.rs\"}" } },
+                        { "id": "b1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"y.rs\"}" } }
+                    ]
+                },
+                { "role": "tool", "tool_call_id": "a1", "content": "error: 1" },
+                { "role": "tool", "tool_call_id": "b1", "content": "error: 2" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "a2", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"x.rs\"}" } },
+                        { "id": "b2", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"y.rs\"}" } }
+                    ]
+                },
+                { "role": "tool", "tool_call_id": "a2", "content": "error: 1" },
+                { "role": "tool", "tool_call_id": "b2", "content": "error: 2" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "a3", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"x.rs\"}" } },
+                        { "id": "b3", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"y.rs\"}" } }
+                    ]
+                },
+                { "role": "tool", "tool_call_id": "a3", "content": "error: 1" },
+                { "role": "tool", "tool_call_id": "b3", "content": "error: 2" }
+            ]
+        });
+        let snapshot_before_tail = body["messages"].as_array().unwrap()[..8].to_vec();
+
+        assert!(nudge_repeated_tool_failure(&mut body));
+
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(&msgs[..8], snapshot_before_tail.as_slice());
+        assert_eq!(msgs[7]["content"].as_str().unwrap(), "error: 1");
+        assert_eq!(
+            msgs[8]["content"].as_str().unwrap(),
+            format!("error: 2{LOOP_GUARD_SUFFIX}")
+        );
+
+        // Idempotent on subsequent pass
+        assert!(!nudge_repeated_tool_failure(&mut body));
+    }
+
+    #[test]
+    fn test_loop_nudge_interleaved_user_and_empty_whitespace_outputs_do_not_nudge() {
+        // 1. Interleaved `user` message breaking the 3-turn consecutive streak
+        let mut body_interleaved = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "tool_call_id": "c1", "content": "error: exit status 1" },
+                { "role": "user", "content": "Try again please" },
+                { "role": "assistant", "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "tool_call_id": "c2", "content": "error: exit status 1" },
+                { "role": "assistant", "tool_calls": [{ "id": "c3", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"false\"}" } }] },
+                { "role": "tool", "tool_call_id": "c3", "content": "error: exit status 1" }
+            ]
+        });
+        let orig_interleaved = body_interleaved.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body_interleaved));
+        assert_eq!(body_interleaved, orig_interleaved);
+
+        // 2. 3x empty outputs
+        let mut body_empty = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "e1", "type": "function", "function": { "name": "noop", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "e1", "content": "" },
+                { "role": "assistant", "tool_calls": [{ "id": "e2", "type": "function", "function": { "name": "noop", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "e2", "content": "" },
+                { "role": "assistant", "tool_calls": [{ "id": "e3", "type": "function", "function": { "name": "noop", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "e3", "content": "" }
+            ]
+        });
+        let orig_empty = body_empty.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body_empty));
+        assert_eq!(body_empty, orig_empty);
+
+        // 3. 3x whitespace-only outputs
+        let mut body_ws = json!({
+            "messages": [
+                { "role": "assistant", "tool_calls": [{ "id": "w1", "type": "function", "function": { "name": "noop", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "w1", "content": "   \n\t  " },
+                { "role": "assistant", "tool_calls": [{ "id": "w2", "type": "function", "function": { "name": "noop", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "w2", "content": "   \n\t  " },
+                { "role": "assistant", "tool_calls": [{ "id": "w3", "type": "function", "function": { "name": "noop", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "w3", "content": "   \n\t  " }
+            ]
+        });
+        let orig_ws = body_ws.clone();
+        assert!(!nudge_repeated_tool_failure(&mut body_ws));
+        assert_eq!(body_ws, orig_ws);
     }
 }
