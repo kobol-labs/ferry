@@ -279,7 +279,7 @@
       },
       "targets": [
         {
-          "expr": "clamp_max((ferry_requests_total{provider=\"local\"} / (ferry_requests_total > 0)) * 100, 100) or vector(100)",
+          "expr": "clamp_max((sum(ferry_provider_requests_total{provider=\"local\"}) / clamp_min(sum(ferry_provider_requests_total), 1)) * 100, 100)",
           "legendFormat": "On-Prem GPU %",
           "refId": "A"
         }
@@ -319,7 +319,7 @@
       },
       "targets": [
         {
-          "expr": "ferry_requests_total",
+          "expr": "ferry_requests_dispatched_total",
           "legendFormat": "Total LLM Calls",
           "refId": "A"
         }
@@ -509,13 +509,13 @@
       },
       "targets": [
         {
-          "expr": "sum by (provider) (rate(ferry_requests_total{provider=~\"local|cloud\"}[1m]))",
+          "expr": "sum by (provider) (rate(ferry_provider_requests_total[1m]))",
           "legendFormat": "{{provider}}",
           "refId": "A"
         },
         {
-          "expr": "sum by (type) (rate(ferry_requests_total{type=~\"spillover|failover\"}[1m]))",
-          "legendFormat": "{{type}}",
+          "expr": "sum by (event) (rate(ferry_routing_events_total[1m]))",
+          "legendFormat": "{{event}}",
           "refId": "B"
         }
       ]
@@ -560,17 +560,17 @@
       },
       "targets": [
         {
-          "expr": "ferry_requests_total{provider=\"local\"}",
+          "expr": "sum(ferry_provider_requests_total{provider=\"local\"})",
           "legendFormat": "Local GPU (Strata)",
           "refId": "A"
         },
         {
-          "expr": "ferry_requests_total{provider=\"cloud\"}",
-          "legendFormat": "Cloud (MiniMax)",
+          "expr": "clamp_min(sum(ferry_provider_requests_total{provider=\"cloud\"}) - sum(ferry_routing_events_total{event=\"spillover\"}), 0)",
+          "legendFormat": "Cloud Direct (MiniMax)",
           "refId": "B"
         },
         {
-          "expr": "ferry_requests_total{type=\"spillover\"}",
+          "expr": "sum(ferry_routing_events_total{event=\"spillover\"})",
           "legendFormat": "Cloud Spillover",
           "refId": "C"
         }
@@ -692,12 +692,12 @@
           "refId": "A"
         },
         {
-          "expr": "rate(ferry_request_duration_ms_total{provider=\"local\"}[5m]) / (rate(ferry_requests_total{provider=\"local\"}[5m]) > 0)",
+          "expr": "rate(ferry_request_duration_ms_total{provider=\"local\"}[5m]) / (rate(ferry_provider_requests_total{provider=\"local\"}[5m]) > 0)",
           "legendFormat": "Avg Local GPU Turn Latency (5m)",
           "refId": "B"
         },
         {
-          "expr": "rate(ferry_request_duration_ms_total{provider=\"cloud\"}[5m]) / (rate(ferry_requests_total{provider=\"cloud\"}[5m]) > 0)",
+          "expr": "rate(ferry_request_duration_ms_total{provider=\"cloud\"}[5m]) / (rate(ferry_provider_requests_total{provider=\"cloud\"}[5m]) > 0)",
           "legendFormat": "Avg Cloud Turn Latency (5m)",
           "refId": "C"
         }
@@ -844,7 +844,7 @@
       },
       "targets": [
         {
-          "expr": "topk(10, ferry_condensation_cleaner_actions_total)",
+          "expr": "topk(12, ferry_condensation_cleaner_actions_total)",
           "legendFormat": "{{action}}",
           "refId": "A"
         }

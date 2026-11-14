@@ -3,8 +3,8 @@ bind = "0.0.0.0:4000"
 
 [local]
 name = "strata"
-api_base = "http://192.168.9.99:8080/v1"
-api_key = "sk-strata-stevegaming"
+api_base = "http://127.0.0.1:8080/v1"
+api_key = ""
 model = "qwen3.8-flash-next-unsloth-ud-iq4_xs"
 max_slots = 4
 max_context_tokens = 256000
@@ -26,7 +26,7 @@ timeout_secs = 300
 
 [routing]
 # Default routing strategy:
-# - "local-preferred": 100% local GPU execution, only spilling over to cloud on queue timeout (45s) or VRAM/context exhaustion.
+# - "local-preferred": 100% local GPU execution, only spilling over to cloud on queue timeout or VRAM/context exhaustion.
 # - "local-only": Enforces strict local GPU execution ($0 spend). Returns HTTP 503 if unavailable.
 # - "hybrid": Segregates turns based on cognitive complexity. Mechanical commands stay local; hard logic/diagnostic failures escalate to cloud, then immediately revert to local.
 # - "cloud-only": Bypasses local hardware entirely and routes directly to cloud.
@@ -34,9 +34,12 @@ default_route = "hybrid"
 
 [affinity]
 enabled = true
-max_slots = 4
-timeout_secs = 3600
 idle_reclaim_secs = 60
+
+[cache]
+enabled = true
+max_entries = 500
+ttl_secs = 600
 
 [condensation]
 enabled = true
@@ -47,17 +50,12 @@ max_tool_chars = 12000
 recent_max_tool_chars = 24000
 head_lines = 15
 tail_lines = 10
-strip_ansi_escapes = true
-strip_progress_bars = true
-collapse_whitespace = true
+strip_terminal_noise = true
 deduplicate_lines = true
 minify_json_outputs = true
 prune_lockfile_diffs = true
 suppress_base64_blobs = true
 shield_dir_traversals = true
-protect_code_blocks = true
-enable_constraint_ledger = true
-protect_static_prefix = true
 fold_repeated_tool_failures = true
 nudge_repeated_failures = true
 rolling_compaction = true
@@ -65,7 +63,7 @@ compact_threshold_tokens = 36000
 compact_keep_recent_turns = 4
 
 [telemetry]
-enabled = true
-pushgateway_url = "http://10.10.10.101:9091"
+enabled = false
+pushgateway_url = "http://127.0.0.1:9091"
 push_interval_secs = 5
 job_name = "sentry_ferry"

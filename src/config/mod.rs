@@ -173,9 +173,6 @@ impl Config {
         if let Ok(v) = std::env::var("FERRY_AFFINITY_ENABLED") {
             if let Some(b) = parse_bool(&v) { self.affinity.enabled = b; }
         }
-        if let Ok(v) = std::env::var("FERRY_AFFINITY_TIMEOUT_SECS") {
-            if let Ok(n) = v.parse() { self.affinity.timeout_secs = n; }
-        }
         if let Ok(v) = std::env::var("FERRY_IDLE_RECLAIM_SECS").or_else(|_| std::env::var("FERRY_AFFINITY_IDLE_RECLAIM_SECS")) {
             if let Ok(n) = v.parse() { self.affinity.idle_reclaim_secs = n; }
         }

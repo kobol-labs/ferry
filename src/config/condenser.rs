@@ -18,7 +18,7 @@ pub struct CondenserConfig {
     pub head_lines: usize,
     #[serde(default = "default_tail_lines")]
     pub tail_lines: usize,
-    #[serde(default = "default_strip_terminal_noise")]
+    #[serde(default = "default_strip_terminal_noise", alias = "strip_ansi_escapes")]
     pub strip_terminal_noise: bool,
     #[serde(default = "default_deduplicate_lines")]
     pub deduplicate_lines: bool,
