@@ -499,11 +499,36 @@ async fn chat_completions_handler(
         state.metrics.record_pillar(pillar);
     }
 
-    // 1. Fast-path deterministic response cache check (for non-streaming temperature <= 0.05)
-    let cache_allowed = match headers.get("x-ferry-cache").and_then(|h| h.to_str().ok()) {
+    // 1. Client header control: X-Ferry-Condense (defaults to config setting)
+    let condense_enabled = match headers.get("x-ferry-condense").and_then(|h| h.to_str().ok()) {
         Some("false") | Some("0") | Some("no") => false,
-        _ => state.config.cache.enabled,
+        _ => state.config.condensation.enabled,
     };
+
+    // Stateless 3x identical failing tool-call tail nudge:
+    // Must execute BEFORE ResponseCache lookup and BEFORE condense() (which folds historical duplicates).
+    let loop_nudged = if condense_enabled && state.config.condensation.nudge_repeated_failures {
+        let nudged = ferry::condenser::nudge_repeated_tool_failure(&mut body);
+        if nudged {
+            state.metrics.record_loop_nudge();
+            info!(
+                session = %session_id,
+                "Stateless loop guard appended tail nudge after 3x identical failing tool calls"
+            );
+        }
+        nudged
+    } else {
+        false
+    };
+
+    // 2. Fast-path deterministic response cache check (for non-streaming temperature <= 0.05).
+    // Bypassed completely (`cache_key = None`) when loop nudge fires so nudged turns never read
+    // stale cached loops or poison clean deterministic ResponseCache entries.
+    let cache_allowed = !loop_nudged
+        && match headers.get("x-ferry-cache").and_then(|h| h.to_str().ok()) {
+            Some("false") | Some("0") | Some("no") => false,
+            _ => state.config.cache.enabled,
+        };
 
     let cache_key = if cache_allowed {
         ResponseCache::compute_cache_key(&body)
@@ -529,12 +554,6 @@ async fn chat_completions_handler(
             ).into_response();
         }
     }
-
-    // 2. Client header control: X-Ferry-Condense (defaults to config setting)
-    let condense_enabled = match headers.get("x-ferry-condense").and_then(|h| h.to_str().ok()) {
-        Some("false") | Some("0") | Some("no") => false,
-        _ => state.config.condensation.enabled,
-    };
 
     let cond_stats = if condense_enabled {
         state.condenser.condense(&mut body)
@@ -678,4 +697,178 @@ async fn chat_completions_handler(
     }
 
     state.upstream.forward_chat(body, decision, req_id, total_chars_saved, savings_pct, cache_key).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn test_handler_loop_nudge_bypasses_cache_and_runs_before_fold() {
+        let captured_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured_bodies.clone();
+
+        let upstream_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let cap = captured_clone.clone();
+                async move {
+                    cap.lock().await.push(payload);
+                    Json(json!({
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "pivoting approach" },
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream_app).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", addr);
+        cfg.routing.default_route = "local-only".to_string();
+        cfg.cache.enabled = true;
+        cfg.condensation.enabled = true;
+        cfg.condensation.fold_repeated_tool_failures = true;
+        cfg.condensation.nudge_repeated_failures = true;
+
+        let config = Arc::new(cfg);
+        let metrics = Arc::new(MetricsTracker::new());
+        let affinity = Arc::new(SessionAffinityTracker::with_idle_reclaim(true, 4, 60));
+        let router = HybridRouter::with_affinity(config.clone(), metrics.clone(), affinity);
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(true, 64, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics: metrics.clone(),
+            router,
+            condenser,
+            upstream,
+            cache: cache.clone(),
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        // 3 identical non-diagnostic >=25 char outputs: if condense() ran BEFORE loop guard,
+        // fold_repeated_tool_failures would rewrite attempt #2 and mask byte-equality!
+        let repeated_out = "Exit status 1: command produced identical stuck output";
+        let loop_body = json!({
+            "model": "ferry",
+            "temperature": 0.0,
+            "stream": false,
+            "messages": [
+                { "role": "user", "content": "Check service" },
+                { "role": "assistant", "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"check_svc\"}" } }] },
+                { "role": "tool", "content": repeated_out },
+                { "role": "assistant", "tool_calls": [{ "id": "c2", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"check_svc\"}" } }] },
+                { "role": "tool", "content": repeated_out },
+                { "role": "assistant", "tool_calls": [{ "id": "c3", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"check_svc\"}" } }] },
+                { "role": "tool", "content": repeated_out }
+            ]
+        });
+
+        // Seed ResponseCache with a stale loop response for the unmutated key
+        let clean_key = ResponseCache::compute_cache_key(&loop_body).unwrap();
+        cache
+            .set(
+                clean_key.clone(),
+                bytes::Bytes::from_static(b"{\"stale_cached_loop\":true}"),
+                200,
+                vec![],
+            )
+            .await;
+        assert_eq!(cache.len().await, 1);
+
+        // Execute handler: must nudge, bypass early cache hit, and NOT write nudged key to cache
+        let resp = chat_completions_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(loop_body.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ne!(
+            resp.headers().get("x-ferry-cache").and_then(|v| v.to_str().ok()),
+            Some("HIT")
+        );
+        let resp_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let resp_json: Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(resp_json["choices"][0]["message"]["content"], "pivoting approach");
+
+        // Verify metric incremented and Prometheus renders it
+        assert_eq!(metrics.loop_nudges_total.load(Ordering::Relaxed), 1);
+        assert!(metrics.prometheus_metrics().contains("ferry_loop_nudges_total 1"));
+
+        // Verify ResponseCache was NOT poisoned with a second entry
+        assert_eq!(cache.len().await, 1);
+
+        // Verify upstream received folded attempt #2 AND tail nudge on attempt #3
+        let sent = captured_bodies.lock().await;
+        assert_eq!(sent.len(), 1);
+        let sent_msgs = sent[0]["messages"].as_array().unwrap();
+        assert!(sent_msgs[4]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Repeated identical tool failure suppressed"));
+        assert!(sent_msgs[6]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with(ferry::condenser::LOOP_GUARD_SUFFIX));
+        drop(sent);
+
+        // When X-Ferry-Condense: false header is passed, loop guard is disabled and cache HIT works
+        let mut no_condense_headers = HeaderMap::new();
+        no_condense_headers.insert("x-ferry-condense", "false".parse().unwrap());
+        let cached_resp = chat_completions_handler(
+            State(state.clone()),
+            no_condense_headers,
+            Json(loop_body.clone()),
+        )
+        .await;
+        assert_eq!(
+            cached_resp.headers().get("x-ferry-cache").and_then(|v| v.to_str().ok()),
+            Some("HIT")
+        );
+        assert_eq!(metrics.loop_nudges_total.load(Ordering::Relaxed), 1);
+
+        // When config `condensation.nudge_repeated_failures = false`, loop guard is also disabled
+        let mut cfg_disabled = (*state.config).clone();
+        cfg_disabled.condensation.nudge_repeated_failures = false;
+        let disabled_state = Arc::new(AppState {
+            config: Arc::new(cfg_disabled.clone()),
+            metrics: metrics.clone(),
+            router: HybridRouter::with_affinity(
+                Arc::new(cfg_disabled.clone()),
+                metrics.clone(),
+                Arc::new(SessionAffinityTracker::with_idle_reclaim(true, 4, 60)),
+            ),
+            condenser: ContextCondenser::new(cfg_disabled.condensation.clone()),
+            upstream: UpstreamClient::new(Arc::new(cfg_disabled), metrics.clone(), cache.clone()),
+            cache,
+            request_id_counter: AtomicU64::new(2),
+        });
+        let disabled_resp = chat_completions_handler(
+            State(disabled_state),
+            HeaderMap::new(),
+            Json(loop_body),
+        )
+        .await;
+        assert_eq!(
+            disabled_resp.headers().get("x-ferry-cache").and_then(|v| v.to_str().ok()),
+            Some("HIT")
+        );
+        assert_eq!(metrics.loop_nudges_total.load(Ordering::Relaxed), 1);
+    }
 }

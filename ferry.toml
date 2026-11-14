@@ -59,6 +59,7 @@ protect_code_blocks = true
 enable_constraint_ledger = true
 protect_static_prefix = true
 fold_repeated_tool_failures = true
+nudge_repeated_failures = true
 rolling_compaction = true
 compact_threshold_tokens = 36000
 compact_keep_recent_turns = 4

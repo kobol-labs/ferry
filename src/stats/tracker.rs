@@ -29,6 +29,7 @@ pub struct MetricsTracker {
     pub ledger_vetoed_count: AtomicU64,
     pub signals_extracted_count: AtomicU64,
     pub loops_collapsed_count: AtomicU64,
+    pub loop_nudges_total: AtomicU64,
 
     // Last request gauges (for real-time Grafana observation)
     pub last_prompt_tokens_original: AtomicU64,
@@ -96,6 +97,7 @@ impl Default for MetricsTracker {
             ledger_vetoed_count: AtomicU64::new(0),
             signals_extracted_count: AtomicU64::new(0),
             loops_collapsed_count: AtomicU64::new(0),
+            loop_nudges_total: AtomicU64::new(0),
 
             last_prompt_tokens_original: AtomicU64::new(0),
             last_prompt_tokens_condensed: AtomicU64::new(0),
@@ -160,6 +162,7 @@ pub struct StatsSnapshot {
     pub ledger_vetoed_count: u64,
     pub signals_extracted_count: u64,
     pub loops_collapsed_count: u64,
+    pub loop_nudges_total: u64,
 
     pub last_prompt_tokens_original: u64,
     pub last_prompt_tokens_condensed: u64,
@@ -359,6 +362,7 @@ impl MetricsTracker {
         self.cloud_rate_limited_until.store(0, Ordering::Relaxed);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_condensation(
         &self,
         orig_tokens: u64,
@@ -472,6 +476,7 @@ impl MetricsTracker {
             ledger_vetoed_count: self.ledger_vetoed_count.load(Ordering::Relaxed),
             signals_extracted_count: self.signals_extracted_count.load(Ordering::Relaxed),
             loops_collapsed_count: self.loops_collapsed_count.load(Ordering::Relaxed),
+            loop_nudges_total: self.loop_nudges_total.load(Ordering::Relaxed),
 
             last_prompt_tokens_original: self.last_prompt_tokens_original.load(Ordering::Relaxed),
             last_prompt_tokens_condensed: self.last_prompt_tokens_condensed.load(Ordering::Relaxed),
@@ -544,5 +549,9 @@ impl MetricsTracker {
         if is_spillover {
             self.orchestrator_spillover.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_loop_nudge(&self) {
+        self.loop_nudges_total.fetch_add(1, Ordering::Relaxed);
     }
 }

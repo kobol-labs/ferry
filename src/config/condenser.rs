@@ -32,6 +32,8 @@ pub struct CondenserConfig {
     pub shield_dir_traversals: bool,
     #[serde(default = "default_fold_repeated_tool_failures")]
     pub fold_repeated_tool_failures: bool,
+    #[serde(default = "default_true")]
+    pub nudge_repeated_failures: bool,
     #[serde(default = "default_rolling_compaction")]
     pub rolling_compaction: bool,
     #[serde(default = "default_compact_threshold_tokens")]
@@ -55,6 +57,7 @@ fn default_prune_lockfile_diffs() -> bool { true }
 fn default_suppress_base64_blobs() -> bool { true }
 fn default_shield_dir_traversals() -> bool { true }
 fn default_fold_repeated_tool_failures() -> bool { true }
+fn default_true() -> bool { true }
 fn default_rolling_compaction() -> bool { true }
 fn default_compact_threshold_tokens() -> u64 { 36000 }
 fn default_compact_keep_recent_turns() -> usize { 4 }
@@ -77,6 +80,7 @@ impl Default for CondenserConfig {
             suppress_base64_blobs: default_suppress_base64_blobs(),
             shield_dir_traversals: default_shield_dir_traversals(),
             fold_repeated_tool_failures: default_fold_repeated_tool_failures(),
+            nudge_repeated_failures: default_true(),
             rolling_compaction: default_rolling_compaction(),
             compact_threshold_tokens: default_compact_threshold_tokens(),
             compact_keep_recent_turns: default_compact_keep_recent_turns(),
