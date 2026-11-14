@@ -47,16 +47,50 @@ pub struct SessionAffinityTracker {
 
 /// Hashes the first system prompt or initial turn content to identify warm KV cache prefixes.
 pub fn compute_prefix_hash(messages: &[serde_json::Value]) -> u64 {
+    const MAX_PREFIX_BYTES: usize = 8192;
+    let Some(first) = messages.first() else {
+        return 0;
+    };
+
     let mut hasher = DefaultHasher::new();
-    if let Some(first) = messages.first() {
-        if let Some(role) = first.get("role").and_then(|r| r.as_str()) {
-            role.hash(&mut hasher);
+    let mut hashed_bytes: usize = 0;
+
+    if let Some(role) = first.get("role").and_then(|r| r.as_str()) {
+        role.hash(&mut hasher);
+    }
+
+    if let Some(content) = first.get("content").and_then(|c| c.as_str()) {
+        let bytes = content.as_bytes();
+        let take = bytes.len().min(MAX_PREFIX_BYTES);
+        if take > 0 {
+            bytes[..take].hash(&mut hasher);
+            hashed_bytes += take;
         }
-        if let Some(content) = first.get("content").and_then(|c| c.as_str()) {
-            content[..content.len().min(8192)].hash(&mut hasher);
+    } else if let Some(parts) = first.get("content").and_then(|c| c.as_array()) {
+        for part in parts {
+            if hashed_bytes >= MAX_PREFIX_BYTES {
+                break;
+            }
+            let text_opt = part
+                .get("text")
+                .and_then(|t| t.as_str())
+                .or_else(|| part.as_str());
+            if let Some(text) = text_opt {
+                let bytes = text.as_bytes();
+                let take = bytes.len().min(MAX_PREFIX_BYTES - hashed_bytes);
+                if take > 0 {
+                    bytes[..take].hash(&mut hasher);
+                    hashed_bytes += take;
+                }
+            }
         }
     }
-    hasher.finish()
+
+    if hashed_bytes == 0 {
+        return 0;
+    }
+    let h = hasher.finish();
+    if h == 0 { 1 } else { h }
 }
 
 impl SessionAffinityTracker {
@@ -118,13 +152,18 @@ impl SessionAffinityTracker {
                 // Try to acquire the preferred slot
                 if !self.slot_busy[preferred].swap(true, Ordering::SeqCst) {
                     if let Ok(mut write) = self.sessions.write() {
-                        if let Some(entry) = write.get_mut(session_id) {
-                            entry.last_active = now;
-                            entry.turns_count += 1;
-                            if prefix_hash != 0 {
-                                entry.prefix_hash = prefix_hash;
-                            }
-                        }
+                        let prev_turns = write.get(session_id).map(|e| e.turns_count).unwrap_or(0);
+                        let prev_prefix = write.get(session_id).map(|e| e.prefix_hash).unwrap_or(0);
+                        write.retain(|k, v| k == session_id || v.slot_id != preferred);
+                        write.insert(
+                            session_id.to_string(),
+                            SessionEntry {
+                                slot_id: preferred,
+                                prefix_hash: if prefix_hash != 0 { prefix_hash } else { prev_prefix },
+                                last_active: now,
+                                turns_count: prev_turns + 1,
+                            },
+                        );
                     }
                     if let Ok(mut p_write) = self.slot_prefix.write() {
                         if prefix_hash != 0 && preferred < p_write.len() {
@@ -141,46 +180,81 @@ impl SessionAffinityTracker {
             }
         }
 
+        // Compute active leases held by other sessions (< idle_reclaim_secs), using deterministic max timestamp per slot.
+        let active_assigned_slots: HashMap<usize, Instant> = {
+            let read = self.sessions.read().ok()?;
+            let mut map: HashMap<usize, Instant> = HashMap::new();
+            for (k, e) in read.iter() {
+                if k != session_id && now.duration_since(e.last_active).as_secs() < self.idle_reclaim_secs {
+                    map.entry(e.slot_id)
+                        .and_modify(|t| {
+                            if e.last_active > *t {
+                                *t = e.last_active;
+                            }
+                        })
+                        .or_insert(e.last_active);
+                }
+            }
+            map
+        };
+
         // 2. Preferred slot is busy or session is new:
         // Check for an IDLE slot that already has the MATCHING prefix_hash (Warm Prefix Reuse).
+        // Prefer unleased/expired warm slots first; only steal actively leased warm slots if allow_eviction is true.
         if prefix_hash != 0 {
-            if let Ok(p_read) = self.slot_prefix.read() {
-                for slot in 0..self.max_slots {
-                    if slot < p_read.len() && p_read[slot] == Some(prefix_hash) {
-                        if !self.slot_busy[slot].swap(true, Ordering::SeqCst) {
-                            // Acquired warm prefix slot!
-                            if let Ok(mut write) = self.sessions.write() {
-                                write.insert(
-                                    session_id.to_string(),
-                                    SessionEntry {
-                                        slot_id: slot,
-                                        prefix_hash,
-                                        last_active: now,
-                                        turns_count: 1,
-                                    },
-                                );
-                            }
-                            if let Ok(mut la_write) = self.slot_last_active.write() {
-                                if slot < la_write.len() {
-                                    la_write[slot] = now;
-                                }
-                            }
-                            return Some((slot, AffinityType::PrefixHit));
+            let matching_slots: Vec<usize> = if let Ok(p_read) = self.slot_prefix.read() {
+                (0..self.max_slots)
+                    .filter(|&slot| slot < p_read.len() && p_read[slot] == Some(prefix_hash))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let mut candidates: Vec<usize> = matching_slots
+                .iter()
+                .copied()
+                .filter(|slot| !active_assigned_slots.contains_key(slot))
+                .collect();
+
+            if allow_eviction {
+                let mut leased_warm: Vec<usize> = matching_slots
+                    .into_iter()
+                    .filter(|slot| active_assigned_slots.contains_key(slot))
+                    .collect();
+                leased_warm.sort_by_key(|slot| active_assigned_slots.get(slot).copied().unwrap_or(now));
+                candidates.extend(leased_warm);
+            }
+
+            for slot in candidates {
+                if !self.slot_busy[slot].swap(true, Ordering::SeqCst) {
+                    if let Ok(mut write) = self.sessions.write() {
+                        write.retain(|k, v| k == session_id || v.slot_id != slot);
+                        write.insert(
+                            session_id.to_string(),
+                            SessionEntry {
+                                slot_id: slot,
+                                prefix_hash,
+                                last_active: now,
+                                turns_count: 1,
+                            },
+                        );
+                    }
+                    if let Ok(mut p_write) = self.slot_prefix.write() {
+                        if slot < p_write.len() {
+                            p_write[slot] = Some(prefix_hash);
                         }
                     }
+                    if let Ok(mut la_write) = self.slot_last_active.write() {
+                        if slot < la_write.len() {
+                            la_write[slot] = now;
+                        }
+                    }
+                    return Some((slot, AffinityType::PrefixHit));
                 }
             }
         }
 
         // 3. Find an idle slot, prioritizing unassigned slots or slots whose lease expired (idle >= idle_reclaim_secs).
-        let active_assigned_slots: HashMap<usize, Instant> = {
-            let read = self.sessions.read().ok()?;
-            read.values()
-                .filter(|e| now.duration_since(e.last_active).as_secs() < self.idle_reclaim_secs)
-                .map(|e| (e.slot_id, e.last_active))
-                .collect()
-        };
-
         for slot in 0..self.max_slots {
             if !active_assigned_slots.contains_key(&slot) {
                 if !self.slot_busy[slot].swap(true, Ordering::SeqCst) {
@@ -198,8 +272,8 @@ impl SessionAffinityTracker {
                         );
                     }
                     if let Ok(mut p_write) = self.slot_prefix.write() {
-                        if prefix_hash != 0 && slot < p_write.len() {
-                            p_write[slot] = Some(prefix_hash);
+                        if slot < p_write.len() {
+                            p_write[slot] = if prefix_hash != 0 { Some(prefix_hash) } else { None };
                         }
                     }
                     if let Ok(mut la_write) = self.slot_last_active.write() {
@@ -217,14 +291,29 @@ impl SessionAffinityTracker {
             return None;
         }
 
-        // Pick an idle slot whose assigned session was active longest ago (LRU eviction).
+        // Pick an idle slot whose assigned session was active longest ago (LRU eviction), using deterministic max timestamp per slot.
         let all_assigned_slots: HashMap<usize, Instant> = {
             let read = self.sessions.read().ok()?;
-            read.values().map(|e| (e.slot_id, e.last_active)).collect()
+            let mut map: HashMap<usize, Instant> = HashMap::new();
+            for e in read.values() {
+                map.entry(e.slot_id)
+                    .and_modify(|t| {
+                        if e.last_active > *t {
+                            *t = e.last_active;
+                        }
+                    })
+                    .or_insert(e.last_active);
+            }
+            map
         };
 
         let mut candidates: Vec<usize> = (0..self.max_slots).collect();
-        candidates.sort_by_key(|slot| all_assigned_slots.get(slot).copied().unwrap_or(now));
+        candidates.sort_by_key(|slot| {
+            (
+                all_assigned_slots.contains_key(slot),
+                all_assigned_slots.get(slot).copied().unwrap_or(now),
+            )
+        });
 
         for slot in candidates {
             if !self.slot_busy[slot].swap(true, Ordering::SeqCst) {
@@ -241,8 +330,8 @@ impl SessionAffinityTracker {
                     );
                 }
                 if let Ok(mut p_write) = self.slot_prefix.write() {
-                    if prefix_hash != 0 && slot < p_write.len() {
-                        p_write[slot] = Some(prefix_hash);
+                    if slot < p_write.len() {
+                        p_write[slot] = if prefix_hash != 0 { Some(prefix_hash) } else { None };
                     }
                 }
                 if let Ok(mut la_write) = self.slot_last_active.write() {
@@ -395,5 +484,63 @@ mod tests {
         let (slot2, aff2) = s2.unwrap();
         assert_eq!(slot2, 0);
         assert_eq!(aff2, AffinityType::NewSlot);
+    }
+
+    #[test]
+    fn test_prefix_hit_one_to_one_slot_ownership_and_unleased_preference() {
+        let tracker = SessionAffinityTracker::with_idle_reclaim(true, 2, 60);
+        let shared_prefix = 0xDEAD_BEEF_9999;
+
+        // Many distinct subagent sessions reuse warm slots via PrefixHit (allow_eviction = true)
+        for i in 0..40 {
+            let sid = format!("subagent-{i}");
+            let (slot, _aff) = tracker
+                .try_acquire_slot_opt(&sid, shared_prefix, true)
+                .unwrap();
+            tracker.release_slot(slot);
+        }
+
+        // Invariant: self.sessions must NEVER leak unbounded entries or map multiple sessions to one slot_id
+        let sessions = tracker.sessions.read().unwrap();
+        assert!(
+            sessions.len() <= 2,
+            "SessionAffinityTracker leaked SessionEntry records on PrefixHit: len={}",
+            sessions.len()
+        );
+        let mut seen_slots = std::collections::HashSet::new();
+        for entry in sessions.values() {
+            assert!(
+                seen_slots.insert(entry.slot_id),
+                "Duplicate sessions mapped to the same slot_id={}",
+                entry.slot_id
+            );
+        }
+        drop(sessions);
+
+        // Also verify unleased/expired warm slot is preferred over actively leased warm slot
+        let tracker_pref = SessionAffinityTracker::with_idle_reclaim(true, 2, 60);
+        // Prime both slot 0 and slot 1 with shared_prefix
+        let (s0, _) = tracker_pref.try_acquire_slot_opt("sess-a", shared_prefix, true).unwrap();
+        let (s1, _) = tracker_pref.try_acquire_slot_opt("sess-b", shared_prefix, true).unwrap();
+        assert_eq!(s0, 0);
+        assert_eq!(s1, 1);
+        tracker_pref.release_slot(s0);
+        tracker_pref.release_slot(s1);
+
+        // Expire sess-b's lease on slot 1 while keeping sess-a's active lease on slot 0
+        {
+            let mut w = tracker_pref.sessions.write().unwrap();
+            if let Some(entry_b) = w.get_mut("sess-b") {
+                entry_b.last_active = Instant::now() - std::time::Duration::from_secs(120);
+            }
+        }
+
+        // Caller with allow_eviction = false MUST skip leased slot 0 and acquire expired warm slot 1 as PrefixHit!
+        let (chosen_slot, chosen_aff) = tracker_pref
+            .try_acquire_slot_opt("sess-c", shared_prefix, false)
+            .expect("Expired warm slot 1 should be acquired via PrefixHit even with !allow_eviction");
+        assert_eq!(chosen_slot, 1, "Must prefer unleased/expired warm slot 1 over leased warm slot 0");
+        assert_eq!(chosen_aff, AffinityType::PrefixHit);
+        tracker_pref.release_slot(chosen_slot);
     }
 }

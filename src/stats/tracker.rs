@@ -207,13 +207,51 @@ impl MetricsTracker {
     }
 
     pub fn try_acquire_local_capacity(&self, tokens: u64, max_slots: usize, max_token_budget: u64) -> bool {
+        if max_slots == 0 || self.active_local_slots.load(Ordering::SeqCst) >= max_slots {
+            return false;
+        }
+
+        // 1. Atomically reserve token capacity first so concurrent callers cannot oversubscribe max_token_budget
+        if tokens > 0 {
+            let mut curr_tokens = self.active_local_tokens.load(Ordering::SeqCst);
+            loop {
+                let Some(next_tokens) = curr_tokens.checked_add(tokens) else {
+                    return false;
+                };
+                if max_token_budget > 0 && next_tokens > max_token_budget {
+                    return false;
+                }
+                match self.active_local_tokens.compare_exchange_weak(
+                    curr_tokens,
+                    next_tokens,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => curr_tokens = actual,
+                }
+            }
+        }
+
+        // 2. Atomically reserve slot; roll back reserved tokens cleanly if slots saturated concurrently
         let mut curr_slots = self.active_local_slots.load(Ordering::SeqCst);
-        let mut curr_tokens = self.active_local_tokens.load(Ordering::SeqCst);
         loop {
             if curr_slots >= max_slots {
-                return false;
-            }
-            if max_token_budget > 0 && curr_tokens.saturating_add(tokens) > max_token_budget {
+                if tokens > 0 {
+                    let mut curr = self.active_local_tokens.load(Ordering::SeqCst);
+                    while curr > 0 {
+                        let next = curr.saturating_sub(tokens);
+                        match self.active_local_tokens.compare_exchange_weak(
+                            curr,
+                            next,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => curr = actual,
+                        }
+                    }
+                }
                 return false;
             }
             match self.active_local_slots.compare_exchange_weak(
@@ -222,14 +260,8 @@ impl MetricsTracker {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => {
-                    self.active_local_tokens.fetch_add(tokens, Ordering::SeqCst);
-                    return true;
-                }
-                Err(actual) => {
-                    curr_slots = actual;
-                    curr_tokens = self.active_local_tokens.load(Ordering::SeqCst);
-                }
+                Ok(_) => return true,
+                Err(actual) => curr_slots = actual,
             }
         }
     }

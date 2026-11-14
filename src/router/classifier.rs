@@ -241,7 +241,25 @@ pub fn detect_orchestrator(body: &Value, session_id: &str, priority_override: Op
         // 3b. Inspect system and initial user prompts
         for msg in messages.iter().take(2) {
             if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                let joined;
+                let content_opt = if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+                    Some(c)
+                } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                    let mut buf = String::new();
+                    for part in parts {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()).or_else(|| part.as_str()) {
+                            if !buf.is_empty() {
+                                buf.push('\n');
+                            }
+                            buf.push_str(t);
+                        }
+                    }
+                    joined = buf;
+                    if joined.is_empty() { None } else { Some(joined.as_str()) }
+                } else {
+                    None
+                };
+                if let Some(content) = content_opt {
                     let c_lower = content.to_lowercase();
                     // If this prompt defines a specialist subagent, do NOT mark as root orchestrator
                     if (c_lower.contains("current_agent=auth")
