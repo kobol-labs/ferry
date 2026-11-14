@@ -397,13 +397,15 @@ impl Router {
                         est_tokens,
                         is_spillover: false,
                         reason: format!("rescued from cloud 429: acquired slot {slot_id} via emergency eviction"),
-                        local_only: false,
+                        local_only,
                         slot_guard: Some(slot_guard),
                         slot_id: Some(slot_id),
                         is_affinity_hit: aff_type.is_hit(),
                         affinity_type: aff_type,
                         session_id: session_id.to_string(),
                     };
+                } else {
+                    self.affinity_tracker.release_slot(slot_id);
                 }
             }
         }

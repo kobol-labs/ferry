@@ -53,7 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.cache.max_entries,
         config.cache.ttl_secs,
     ));
-    let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+    let upstream = UpstreamClient::with_affinity(
+        config.clone(),
+        metrics.clone(),
+        cache.clone(),
+        affinity_tracker,
+    );
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -223,6 +228,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let max_body_bytes = std::env::var("FERRY_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32 * 1024 * 1024);
+
     let app = Router::new()
         // Universal endpoints
         .route("/health", get(health_handler))
@@ -243,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/chat/completions",
             post(chat_completions_handler).options(cors_options_handler),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state);
 
     let bind_addr = &config.server.bind;
@@ -469,14 +480,30 @@ fn extract_session_id(headers: &HeaderMap, body: &Value) -> String {
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hashed_any = false;
         for msg in messages.iter().take(2) {
             if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                content.hash(&mut hasher);
+                if !content.is_empty() {
+                    content.hash(&mut hasher);
+                    hashed_any = true;
+                }
+            } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                for part in parts {
+                    let text_opt = part
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .or_else(|| part.as_str());
+                    if let Some(text) = text_opt {
+                        if !text.is_empty() {
+                            text.hash(&mut hasher);
+                            hashed_any = true;
+                        }
+                    }
+                }
             }
         }
-        let hash = hasher.finish();
-        if hash != 0 {
-            return format!("session-{:016x}", hash);
+        if hashed_any {
+            return format!("session-{:016x}", hasher.finish());
         }
     }
 

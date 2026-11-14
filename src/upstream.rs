@@ -154,10 +154,25 @@ pub struct UpstreamClient {
     config: Arc<Config>,
     metrics: Arc<MetricsTracker>,
     cache: Arc<ResponseCache>,
+    affinity_tracker: Arc<crate::affinity::SessionAffinityTracker>,
 }
 
 impl UpstreamClient {
     pub fn new(config: Arc<Config>, metrics: Arc<MetricsTracker>, cache: Arc<ResponseCache>) -> Self {
+        let affinity_tracker = Arc::new(crate::affinity::SessionAffinityTracker::with_idle_reclaim(
+            config.affinity.enabled,
+            config.local.max_slots,
+            config.affinity.idle_reclaim_secs,
+        ));
+        Self::with_affinity(config, metrics, cache, affinity_tracker)
+    }
+
+    pub fn with_affinity(
+        config: Arc<Config>,
+        metrics: Arc<MetricsTracker>,
+        cache: Arc<ResponseCache>,
+        affinity_tracker: Arc<crate::affinity::SessionAffinityTracker>,
+    ) -> Self {
         let client = Client::builder()
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .pool_max_idle_per_host(10)
@@ -171,6 +186,7 @@ impl UpstreamClient {
             config,
             metrics,
             cache,
+            affinity_tracker,
         }
     }
 
@@ -304,31 +320,63 @@ impl UpstreamClient {
                     Ok(resp) => {
                         let status = resp.status();
                         let error_text = resp.text().await.unwrap_or_default();
+                        let tripped = self.metrics.record_local_failure(self.config.local.circuit_breaker_threshold);
+                        if tripped {
+                            warn!(
+                                req_id = req_id,
+                                threshold = self.config.local.circuit_breaker_threshold,
+                                "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
+                            );
+                        }
+                        drop(slot_guard); // Release local slot immediately
+                        if decision.local_only {
+                            warn!(
+                                req_id = req_id,
+                                status = status.as_u16(),
+                                error = %error_text,
+                                "Local provider returned server error under local-only routing; refusing cloud failover"
+                            );
+                            let err_status = if status == StatusCode::GATEWAY_TIMEOUT {
+                                StatusCode::GATEWAY_TIMEOUT
+                            } else if status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::TOO_MANY_REQUESTS {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                StatusCode::BAD_GATEWAY
+                            };
+                            return (
+                                err_status,
+                                [
+                                    ("access-control-allow-origin", "*"),
+                                    ("content-type", "application/json"),
+                                    ("x-ferry-provider", "local"),
+                                    ("x-ferry-failover", "false"),
+                                ],
+                                serde_json::json!({
+                                    "error": {
+                                        "message": format!(
+                                            "Local upstream returned HTTP {} and local-only routing prevents cloud failover: {}",
+                                            status.as_u16(),
+                                            error_text
+                                        ),
+                                        "type": "ferry_local_upstream_error",
+                                        "code": "local_upstream_failed"
+                                    }
+                                })
+                                .to_string(),
+                            )
+                                .into_response();
+                        }
                         warn!(
                             req_id = req_id,
                             status = status.as_u16(),
                             error = %error_text,
                             "Local provider returned server error. Failing over to cloud..."
                         );
-                        let tripped = self.metrics.record_local_failure(self.config.local.circuit_breaker_threshold);
-                        if tripped {
-                            warn!(
-                                req_id = req_id,
-                                threshold = self.config.local.circuit_breaker_threshold,
-                                "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
-                            );
-                        }
-                        drop(slot_guard); // Release local slot immediately before failing over to Cloud
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
                         self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key).await
                     }
                     Err(err) => {
-                        warn!(
-                            req_id = req_id,
-                            error = %err,
-                            "Local provider connection failed. Failing over to cloud..."
-                        );
                         let tripped = self.metrics.record_local_failure(self.config.local.circuit_breaker_threshold);
                         if tripped {
                             warn!(
@@ -337,7 +385,47 @@ impl UpstreamClient {
                                 "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
                             );
                         }
-                        drop(slot_guard); // Release local slot immediately before failing over to Cloud
+                        drop(slot_guard); // Release local slot immediately
+                        if decision.local_only {
+                            warn!(
+                                req_id = req_id,
+                                error = %err,
+                                "Local provider request failed under local-only routing; refusing cloud failover"
+                            );
+                            let err_status = if err.is_timeout() {
+                                StatusCode::GATEWAY_TIMEOUT
+                            } else if err.is_connect() {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                StatusCode::BAD_GATEWAY
+                            };
+                            return (
+                                err_status,
+                                [
+                                    ("access-control-allow-origin", "*"),
+                                    ("content-type", "application/json"),
+                                    ("x-ferry-provider", "local"),
+                                    ("x-ferry-failover", "false"),
+                                ],
+                                serde_json::json!({
+                                    "error": {
+                                        "message": format!(
+                                            "Local upstream request failed and local-only routing prevents cloud failover: {}",
+                                            err
+                                        ),
+                                        "type": "ferry_local_upstream_error",
+                                        "code": "local_upstream_unreachable"
+                                    }
+                                })
+                                .to_string(),
+                            )
+                                .into_response();
+                        }
+                        warn!(
+                            req_id = req_id,
+                            error = %err,
+                            "Local provider connection failed. Failing over to cloud..."
+                        );
                         self.metrics.inc_failover();
                         self.metrics.inc_cloud(decision.est_tokens, false);
                         self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key).await
@@ -345,6 +433,35 @@ impl UpstreamClient {
                 }
             }
             TargetProvider::Cloud => {
+                if decision.local_only {
+                    drop(decision.slot_guard.take());
+                    warn!(
+                        req_id = req_id,
+                        reason = %decision.reason,
+                        "Local provider unavailable under local-only routing; refusing cloud dispatch"
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [
+                            ("access-control-allow-origin", "*"),
+                            ("content-type", "application/json"),
+                            ("x-ferry-provider", "local"),
+                            ("x-ferry-failover", "false"),
+                        ],
+                        serde_json::json!({
+                            "error": {
+                                "message": format!(
+                                    "Local provider unavailable and local-only routing requested: {}",
+                                    decision.reason
+                                ),
+                                "type": "ferry_routing_error",
+                                "code": "local_unavailable"
+                            }
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
                 self.metrics.inc_cloud(decision.est_tokens, decision.is_spillover);
                 self.dispatch_cloud(body, decision, req_id, false, chars_saved, savings_pct, cache_key).await
             }
@@ -361,6 +478,35 @@ impl UpstreamClient {
         savings_pct: f64,
         cache_key: Option<String>,
     ) -> Response {
+        if decision.local_only {
+            warn!(
+                req_id = req_id,
+                reason = %decision.reason,
+                "Defense-in-depth: blocking cloud request because decision.local_only is true"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    ("access-control-allow-origin", "*"),
+                    ("content-type", "application/json"),
+                    ("x-ferry-provider", "local"),
+                    ("x-ferry-failover", "false"),
+                ],
+                serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "Local provider unavailable and local-only routing requested: {}",
+                            decision.reason
+                        ),
+                        "type": "ferry_routing_error",
+                        "code": "local_unavailable"
+                    }
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+
         let start = Instant::now();
         let is_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
@@ -402,25 +548,92 @@ impl UpstreamClient {
                     );
                     self.metrics.record_cloud_rate_limit(60);
 
-                    // Zero-drop in-flight failover: Attempt local execution instead of failing the client request
-                    if !is_failover {
-                        warn!(
-                            req_id = req_id,
-                            "Failing over in-flight request to local Strata engine after Cloud HTTP 429 (Zero-Drop Failover)"
-                        );
-                        let local_decision = RouteDecision {
-                            target: TargetProvider::Local,
-                            est_tokens: decision.est_tokens,
-                            is_spillover: false,
-                            reason: "Failover from Cloud HTTP 429 (Quota Exceeded)".to_string(),
-                            local_only: true,
-                            slot_guard: None,
-                            slot_id: None,
-                            is_affinity_hit: false,
-                            affinity_type: crate::affinity::AffinityType::NewSlot,
-                            session_id: decision.session_id.clone(),
+                    // Zero-drop in-flight failover: Attempt local execution ONLY if Strata is healthy,
+                    // prompt fits local context (or after adaptive squeeze), and an actual LocalSlotGuard is acquired.
+                    if !is_failover
+                        && decision.reason != "routing mode cloud-only"
+                        && !self.metrics.is_circuit_open()
+                        && self.metrics.is_strata_online()
+                    {
+                        let max_context = self.config.local.max_context_tokens as u64;
+                        let max_slots = self.config.local.max_slots;
+                        let total_kv_budget = self.config.local.total_kv_token_budget as u64;
+
+                        let mut est_tokens = if decision.est_tokens > 0 {
+                            decision.est_tokens
+                        } else {
+                            crate::router::Router::estimate_tokens(&body)
                         };
-                        return Box::pin(self.forward_chat(body, local_decision, req_id, chars_saved, savings_pct, cache_key)).await;
+                        let mut fallback_chars_saved = chars_saved;
+
+                        if est_tokens > max_context && self.config.local.adaptive_squeezing {
+                            let squeeze_limit = (max_context as f64 * self.config.local.adaptive_squeeze_ratio) as u64;
+                            if est_tokens <= squeeze_limit {
+                                let condenser = crate::condenser::ContextCondenser::new(self.config.condensation.clone());
+                                if let Some(extra_saved) = condenser.adaptive_squeeze(&mut body, max_context) {
+                                    fallback_chars_saved += extra_saved;
+                                    est_tokens = crate::router::Router::estimate_tokens(&body);
+                                    if est_tokens <= max_context {
+                                        self.metrics
+                                            .adaptive_squeezed_count
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+
+                        if est_tokens <= max_context {
+                            let prefix_hash = body
+                                .get("messages")
+                                .and_then(|m| m.as_array())
+                                .map(|arr| crate::affinity::compute_prefix_hash(arr))
+                                .unwrap_or(0);
+
+                            if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(
+                                &decision.session_id,
+                                prefix_hash,
+                                true,
+                            ) {
+                                if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
+                                    self.metrics.record_affinity(aff_type.is_hit());
+                                    warn!(
+                                        req_id = req_id,
+                                        slot = slot_id,
+                                        tokens = est_tokens,
+                                        "Failing over in-flight request to local Strata engine after Cloud HTTP 429"
+                                    );
+                                    let slot_guard = crate::router::LocalSlotGuard::new(
+                                        self.metrics.clone(),
+                                        Some(self.affinity_tracker.clone()),
+                                        Some(slot_id),
+                                        est_tokens,
+                                    );
+                                    let local_decision = RouteDecision {
+                                        target: TargetProvider::Local,
+                                        est_tokens,
+                                        is_spillover: false,
+                                        reason: format!("Failover from Cloud HTTP 429 (slot {slot_id})"),
+                                        local_only: true,
+                                        slot_guard: Some(slot_guard),
+                                        slot_id: Some(slot_id),
+                                        is_affinity_hit: aff_type.is_hit(),
+                                        affinity_type: aff_type,
+                                        session_id: decision.session_id.clone(),
+                                    };
+                                    return Box::pin(self.forward_chat(
+                                        body,
+                                        local_decision,
+                                        req_id,
+                                        fallback_chars_saved,
+                                        savings_pct,
+                                        cache_key,
+                                    ))
+                                    .await;
+                                } else {
+                                    self.affinity_tracker.release_slot(slot_id);
+                                }
+                            }
+                        }
                     }
                 }
                 info!(
@@ -443,7 +656,8 @@ impl UpstreamClient {
                     affinity_type: crate::affinity::AffinityType::NewSlot,
                     session_id: decision.session_id,
                 };
-                self.handle_upstream_response(resp, is_stream, None, meta, cache_key).await
+                let effective_cache_key = if status.is_success() { cache_key } else { None };
+                self.handle_upstream_response(resp, is_stream, None, meta, effective_cache_key).await
             }
             Err(err) => {
                 error!(req_id = req_id, error = %err, "Cloud request failed");
