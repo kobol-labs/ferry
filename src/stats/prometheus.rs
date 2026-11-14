@@ -2,13 +2,17 @@ use super::tracker::StatsSnapshot;
 
 pub fn render_prometheus(s: &StatsSnapshot) -> String {
     format!(
-        "# HELP ferry_requests_total Total number of LLM requests\n\
-         # TYPE ferry_requests_total counter\n\
-         ferry_requests_total {total}\n\
-         ferry_requests_total{{provider=\"local\"}} {local}\n\
-         ferry_requests_total{{provider=\"cloud\"}} {cloud}\n\
-         ferry_requests_total{{type=\"spillover\"}} {spill}\n\
-         ferry_requests_total{{type=\"failover\"}} {fail}\n\
+        "# HELP ferry_requests_dispatched_total Total number of LLM requests dispatched\n\
+         # TYPE ferry_requests_dispatched_total counter\n\
+         ferry_requests_dispatched_total {total}\n\
+         # HELP ferry_provider_requests_total Total number of LLM requests routed per provider\n\
+         # TYPE ferry_provider_requests_total counter\n\
+         ferry_provider_requests_total{{provider=\"local\"}} {local}\n\
+         ferry_provider_requests_total{{provider=\"cloud\"}} {cloud}\n\
+         # HELP ferry_routing_events_total Total routing spillover and failover events\n\
+         # TYPE ferry_routing_events_total counter\n\
+         ferry_routing_events_total{{event=\"spillover\"}} {spill}\n\
+         ferry_routing_events_total{{event=\"failover\"}} {fail}\n\
          # HELP ferry_active_slots Current active local hardware slots\n\
          # TYPE ferry_active_slots gauge\n\
          ferry_active_slots {slots}\n\
@@ -30,8 +34,10 @@ pub fn render_prometheus(s: &StatsSnapshot) -> String {
          # HELP ferry_tokens_estimated Total estimated tokens processed\n\
          # TYPE ferry_tokens_estimated counter\n\
          ferry_tokens_estimated {tokens}\n\
-         ferry_tokens_estimated{{provider=\"local\"}} {ltokens}\n\
-         ferry_tokens_estimated{{provider=\"cloud\"}} {ctokens}\n\
+         # HELP ferry_provider_tokens_estimated_total Total estimated tokens processed per provider\n\
+         # TYPE ferry_provider_tokens_estimated_total counter\n\
+         ferry_provider_tokens_estimated_total{{provider=\"local\"}} {ltokens}\n\
+         ferry_provider_tokens_estimated_total{{provider=\"cloud\"}} {ctokens}\n\
          # HELP ferry_request_duration_ms_total Total latency of completed LLM requests in milliseconds\n\
          # TYPE ferry_request_duration_ms_total counter\n\
          ferry_request_duration_ms_total{{provider=\"local\"}} {local_ms}\n\
@@ -59,6 +65,9 @@ pub fn render_prometheus(s: &StatsSnapshot) -> String {
          ferry_condensation_cleaner_actions_total{{action=\"json_minified\"}} {json_minified}\n\
          ferry_condensation_cleaner_actions_total{{action=\"signals_extracted\"}} {signals_extracted}\n\
          ferry_condensation_cleaner_actions_total{{action=\"loops_collapsed\"}} {loops_collapsed}\n\
+         ferry_condensation_cleaner_actions_total{{action=\"lockfile_diffs_pruned\"}} {lockfile_pruned}\n\
+         ferry_condensation_cleaner_actions_total{{action=\"base64_blobs_suppressed\"}} {base64_suppressed}\n\
+         ferry_condensation_cleaner_actions_total{{action=\"dir_traversals_shielded\"}} {dir_shielded}\n\
          # HELP ferry_loop_nudges_total Total times the stateless loop guard nudged repeated identical failing tool calls\n\
          # TYPE ferry_loop_nudges_total counter\n\
          ferry_loop_nudges_total {loop_nudges}\n\
@@ -141,6 +150,9 @@ pub fn render_prometheus(s: &StatsSnapshot) -> String {
         json_minified = s.json_minified_count,
         signals_extracted = s.signals_extracted_count,
         loops_collapsed = s.loops_collapsed_count,
+        lockfile_pruned = s.lockfile_diffs_pruned_count,
+        base64_suppressed = s.base64_blobs_suppressed_count,
+        dir_shielded = s.dir_traversals_shielded_count,
         loop_nudges = s.loop_nudges_total,
         ledger_passed = s.ledger_checks_passed,
         ledger_vetoed = s.ledger_vetoed_count,

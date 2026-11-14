@@ -87,7 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let probe_interval = std::time::Duration::from_secs(probe_state.config.local.probe_interval_secs);
         loop {
-            tokio::time::sleep(probe_interval).await;
             let resp = probe_client
                 .get(&health_url)
                 .header("Authorization", format!("Bearer {}", probe_state.config.local.api_key))
@@ -96,10 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match resp {
                 Ok(r) if r.status().is_success() => {
-                    let was_open = probe_state.metrics.is_circuit_open();
-                    let was_offline = !probe_state.metrics.strata_online.load(Ordering::Relaxed);
-                    probe_state.metrics.record_local_success();
-                    if was_open || was_offline {
+                    if probe_state
+                        .metrics
+                        .record_health_probe_success(ferry::stats::DEFAULT_CIRCUIT_COOLDOWN_SECS)
+                    {
                         info!(
                             url = %health_url,
                             "Strata hardware is BACK ONLINE. Circuit breaker CLOSED - local routing resumed."
@@ -107,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Ok(r) => {
+                    probe_state.metrics.record_health_probe_failure();
                     tracing::debug!(
                         url = %health_url,
                         status = r.status().as_u16(),
@@ -114,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 Err(err) => {
+                    probe_state.metrics.record_health_probe_failure();
                     tracing::debug!(
                         url = %health_url,
                         error = %err,
@@ -121,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            tokio::time::sleep(probe_interval).await;
         }
     });
 
@@ -610,6 +612,9 @@ async fn chat_completions_handler(
             cond_stats.ledger_vetoed_count,
             cond_stats.signals_extracted_count,
             cond_stats.loops_collapsed_count,
+            cond_stats.lockfile_diffs_pruned_count,
+            cond_stats.base64_blobs_suppressed_count,
+            cond_stats.dir_traversals_shielded_count,
         );
     }
 

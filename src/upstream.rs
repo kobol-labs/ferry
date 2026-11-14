@@ -1287,71 +1287,6 @@ pub fn transform_strata_chunk(bytes: bytes::Bytes) -> bytes::Bytes {
     }
 }
 
-/// Zero-allocation fast-path model name rewriter for streaming SSE chunks.
-/// Bypasses full serde_json::Value tree parsing and modifies bytes directly.
-pub fn rewrite_model_chunk(chunk: bytes::Bytes, target_model: &str) -> bytes::Bytes {
-    let slice = chunk.as_ref();
-    let pattern = b"\"model\"";
-
-    let mut idx = 0;
-    while idx + pattern.len() <= slice.len() {
-        if &slice[idx..idx + pattern.len()] == pattern {
-            let mut colon_pos = idx + pattern.len();
-            while colon_pos < slice.len() && (slice[colon_pos] == b':' || slice[colon_pos].is_ascii_whitespace()) {
-                colon_pos += 1;
-            }
-            if colon_pos < slice.len() && slice[colon_pos] == b'"' {
-                let start_quote = colon_pos;
-                let mut end_quote = start_quote + 1;
-                while end_quote < slice.len() && slice[end_quote] != b'"' {
-                    if slice[end_quote] == b'\\' && end_quote + 1 < slice.len() {
-                        end_quote += 2;
-                    } else {
-                        end_quote += 1;
-                    }
-                }
-                if end_quote < slice.len() && slice[end_quote] == b'"' {
-                    let existing_model = &slice[start_quote + 1..end_quote];
-                    if existing_model == target_model.as_bytes() {
-                        return chunk;
-                    }
-                    let mut out = bytes::BytesMut::with_capacity(slice.len() - (end_quote - start_quote - 1) + target_model.len());
-                    out.extend_from_slice(&slice[..start_quote + 1]);
-                    out.extend_from_slice(target_model.as_bytes());
-                    out.extend_from_slice(&slice[end_quote..]);
-                    return out.freeze();
-                }
-            }
-        }
-        idx += 1;
-    }
-    chunk
-}
-
-/// Dedicated end-of-stream token usage extractor.
-/// Only runs full JSON parsing when `"usage"` is present in the chunk.
-pub fn extract_streaming_usage(bytes: &[u8]) -> Option<(u64, u64)> {
-    if bytes.windows(7).any(|w| w == b"\"usage\"") {
-        let text = std::str::from_utf8(bytes).ok()?;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if let Some(json_str) = trimmed.strip_prefix("data:") {
-                let json_trimmed = json_str.trim();
-                if json_trimmed.starts_with('{') {
-                    if let Ok(val) = serde_json::from_str::<Value>(json_trimmed) {
-                        if let Some(usage) = val.get("usage") {
-                            let prompt = usage.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                            let comp = usage.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
-                            return Some((prompt, comp));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,30 +1308,6 @@ mod tests {
         let data_chunk = bytes::Bytes::from("data: {\"choices\":[]}\n\n");
         let untransformed = transform_strata_chunk(data_chunk.clone());
         assert_eq!(untransformed, data_chunk);
-    }
-
-    #[test]
-    fn test_rewrite_model_chunk_fast_path() {
-        let chunk = bytes::Bytes::from("data: {\"id\":\"1\",\"model\":\"raw-gpu-model-v1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
-        let rewritten = rewrite_model_chunk(chunk, "ferry");
-        assert_eq!(
-            rewritten,
-            bytes::Bytes::from("data: {\"id\":\"1\",\"model\":\"ferry\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
-        );
-
-        // Idempotent when already target model
-        let already_ferry = rewritten.clone();
-        let unchanged = rewrite_model_chunk(already_ferry.clone(), "ferry");
-        assert_eq!(unchanged, already_ferry);
-    }
-
-    #[test]
-    fn test_extract_streaming_usage_only_on_end_chunk() {
-        let intermediate = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
-        assert_eq!(extract_streaming_usage(intermediate), None);
-
-        let final_chunk = b"data: {\"id\":\"1\",\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":42}}\n\n";
-        assert_eq!(extract_streaming_usage(final_chunk), Some((120, 42)));
     }
 }
 

@@ -20,6 +20,8 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
+    #[serde(default = "default_local_name")]
+    pub name: String,
     #[serde(default = "default_local_base")]
     pub api_base: String,
     #[serde(default = "default_local_key")]
@@ -48,8 +50,9 @@ pub struct LocalConfig {
     pub queue_timeout_ms: u64,
 }
 
-fn default_local_base() -> String { "http://192.168.9.99:8080/v1".to_string() }
-fn default_local_key() -> String { "sk-strata-stevegaming".to_string() }
+fn default_local_name() -> String { "strata".to_string() }
+fn default_local_base() -> String { "http://127.0.0.1:8080/v1".to_string() }
+fn default_local_key() -> String { String::new() }
 fn default_local_model() -> String { "qwen3.8-flash-next-unsloth-ud-iq4_xs".to_string() }
 pub fn default_max_slots() -> usize { 4 }
 fn default_max_context_tokens() -> usize { 256000 }
@@ -65,6 +68,7 @@ fn default_queue_timeout_ms() -> u64 { 15000 }
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
+            name: default_local_name(),
             api_base: default_local_base(),
             api_key: default_local_key(),
             model: default_local_model(),
@@ -84,6 +88,8 @@ impl Default for LocalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
+    #[serde(default = "default_cloud_name")]
+    pub name: String,
     #[serde(default = "default_cloud_base")]
     pub api_base: String,
     #[serde(default)]
@@ -94,6 +100,7 @@ pub struct CloudConfig {
     pub timeout_secs: u64,
 }
 
+fn default_cloud_name() -> String { "minimax".to_string() }
 fn default_cloud_base() -> String { "https://api.minimax.io/v1".to_string() }
 fn default_cloud_model() -> String { "MiniMax-M3.1-Flash".to_string() }
 fn default_cloud_timeout_secs() -> u64 { 300 }
@@ -101,6 +108,7 @@ fn default_cloud_timeout_secs() -> u64 { 300 }
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
+            name: default_cloud_name(),
             api_base: default_cloud_base(),
             api_key: String::new(),
             model: default_cloud_model(),

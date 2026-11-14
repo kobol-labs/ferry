@@ -33,10 +33,12 @@ mod tests {
         let snap = tracker.snapshot();
         let prom = render_prometheus(&snap);
 
-        assert!(prom.contains("ferry_requests_total 2"));
-        assert!(prom.contains("ferry_requests_total{provider=\"local\"} 1"));
-        assert!(prom.contains("ferry_requests_total{provider=\"cloud\"} 1"));
+        assert!(prom.contains("ferry_requests_dispatched_total 2"));
+        assert!(prom.contains("ferry_provider_requests_total{provider=\"local\"} 1"));
+        assert!(prom.contains("ferry_provider_requests_total{provider=\"cloud\"} 1"));
         assert!(prom.contains("ferry_tokens_estimated 300"));
+        assert!(prom.contains("ferry_provider_tokens_estimated_total{provider=\"local\"} 100"));
+        assert!(prom.contains("ferry_provider_tokens_estimated_total{provider=\"cloud\"} 200"));
     }
 
     #[test]

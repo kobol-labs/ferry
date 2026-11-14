@@ -13,7 +13,7 @@ pub struct TelemetryConfig {
 }
 
 fn default_telemetry_enabled() -> bool { false }
-fn default_pushgateway_url() -> String { "http://10.10.10.101:9091".to_string() }
+fn default_pushgateway_url() -> String { "http://127.0.0.1:9091".to_string() }
 fn default_push_interval_secs() -> u64 { 5 }
 fn default_job_name() -> String { "sentry_ferry".to_string() }
 

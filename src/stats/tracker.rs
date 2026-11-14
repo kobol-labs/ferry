@@ -1,6 +1,15 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+pub const DEFAULT_CIRCUIT_COOLDOWN_SECS: u64 = 30;
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[derive(Debug)]
 pub struct MetricsTracker {
     pub total_requests: AtomicU64,
@@ -29,6 +38,9 @@ pub struct MetricsTracker {
     pub ledger_vetoed_count: AtomicU64,
     pub signals_extracted_count: AtomicU64,
     pub loops_collapsed_count: AtomicU64,
+    pub lockfile_diffs_pruned_count: AtomicU64,
+    pub base64_blobs_suppressed_count: AtomicU64,
+    pub dir_traversals_shielded_count: AtomicU64,
     pub loop_nudges_total: AtomicU64,
 
     // Last request gauges (for real-time Grafana observation)
@@ -46,6 +58,8 @@ pub struct MetricsTracker {
     pub circuit_open: AtomicBool,
     pub consecutive_local_failures: AtomicU32,
     pub circuit_trips_total: AtomicU64,
+    pub circuit_opened_at_ms: AtomicU64,
+    pub last_local_failure_ms: AtomicU64,
     pub cloud_rate_limited_until: AtomicU64,
 
     // Affinity & Rolling Compaction metrics
@@ -97,6 +111,9 @@ impl Default for MetricsTracker {
             ledger_vetoed_count: AtomicU64::new(0),
             signals_extracted_count: AtomicU64::new(0),
             loops_collapsed_count: AtomicU64::new(0),
+            lockfile_diffs_pruned_count: AtomicU64::new(0),
+            base64_blobs_suppressed_count: AtomicU64::new(0),
+            dir_traversals_shielded_count: AtomicU64::new(0),
             loop_nudges_total: AtomicU64::new(0),
 
             last_prompt_tokens_original: AtomicU64::new(0),
@@ -112,6 +129,8 @@ impl Default for MetricsTracker {
             circuit_open: AtomicBool::new(false),
             consecutive_local_failures: AtomicU32::new(0),
             circuit_trips_total: AtomicU64::new(0),
+            circuit_opened_at_ms: AtomicU64::new(0),
+            last_local_failure_ms: AtomicU64::new(0),
             cloud_rate_limited_until: AtomicU64::new(0),
 
             affinity_hits: AtomicU64::new(0),
@@ -162,6 +181,9 @@ pub struct StatsSnapshot {
     pub ledger_vetoed_count: u64,
     pub signals_extracted_count: u64,
     pub loops_collapsed_count: u64,
+    pub lockfile_diffs_pruned_count: u64,
+    pub base64_blobs_suppressed_count: u64,
+    pub dir_traversals_shielded_count: u64,
     pub loop_nudges_total: u64,
 
     pub last_prompt_tokens_original: u64,
@@ -336,15 +358,20 @@ impl MetricsTracker {
 
     pub fn record_local_success(&self) {
         self.consecutive_local_failures.store(0, Ordering::Relaxed);
+        self.circuit_opened_at_ms.store(0, Ordering::Relaxed);
+        self.last_local_failure_ms.store(0, Ordering::Relaxed);
         self.circuit_open.store(false, Ordering::Relaxed);
         self.strata_online.store(true, Ordering::Relaxed);
     }
 
     pub fn record_local_failure(&self, threshold: u32) -> bool {
+        let now = now_epoch_ms();
+        self.last_local_failure_ms.store(now, Ordering::Relaxed);
         let prev = self.consecutive_local_failures.fetch_add(1, Ordering::Relaxed);
         let current = prev + 1;
 
         if current >= threshold {
+            self.circuit_opened_at_ms.store(now, Ordering::Relaxed);
             self.strata_online.store(false, Ordering::Relaxed);
             let was_open = self.circuit_open.swap(true, Ordering::Relaxed);
             if !was_open {
@@ -353,6 +380,34 @@ impl MetricsTracker {
             }
         }
         false
+    }
+
+    /// Marks Strata reachable on `/health` 200 OK. Closes an open circuit breaker only if
+    /// no active inference completion failures occurred within `cooldown_secs`.
+    pub fn record_health_probe_success(&self, cooldown_secs: u64) -> bool {
+        let was_offline = !self.strata_online.swap(true, Ordering::Relaxed);
+        let cooldown_ms = cooldown_secs.saturating_mul(1000);
+        let recent_fail_ts = self
+            .circuit_opened_at_ms
+            .load(Ordering::Relaxed)
+            .max(self.last_local_failure_ms.load(Ordering::Relaxed));
+
+        if recent_fail_ts > 0 && now_epoch_ms().saturating_sub(recent_fail_ts) < cooldown_ms {
+            return false;
+        }
+
+        self.consecutive_local_failures.store(0, Ordering::Relaxed);
+        self.circuit_opened_at_ms.store(0, Ordering::Relaxed);
+        self.last_local_failure_ms.store(0, Ordering::Relaxed);
+        let was_open = self.circuit_open.swap(false, Ordering::Relaxed);
+        was_open || was_offline
+    }
+
+    /// Marks Strata offline when `/health` fails or returns non-2xx.
+    pub fn record_health_probe_failure(&self) -> bool {
+        let was_online = self.strata_online.swap(false, Ordering::Relaxed);
+        self.circuit_open.store(true, Ordering::Relaxed);
+        was_online
     }
 
     pub fn set_strata_status(&self, online: bool) {
@@ -411,6 +466,9 @@ impl MetricsTracker {
         ledger_vetoed: usize,
         signals_extracted: usize,
         loops_collapsed: usize,
+        lockfile_diffs_pruned: usize,
+        base64_blobs_suppressed: usize,
+        dir_traversals_shielded: usize,
     ) {
         self.last_prompt_tokens_original.store(orig_tokens, Ordering::Relaxed);
         self.last_prompt_tokens_condensed.store(cond_tokens, Ordering::Relaxed);
@@ -456,6 +514,15 @@ impl MetricsTracker {
         }
         if loops_collapsed > 0 {
             self.loops_collapsed_count.fetch_add(loops_collapsed as u64, Ordering::Relaxed);
+        }
+        if lockfile_diffs_pruned > 0 {
+            self.lockfile_diffs_pruned_count.fetch_add(lockfile_diffs_pruned as u64, Ordering::Relaxed);
+        }
+        if base64_blobs_suppressed > 0 {
+            self.base64_blobs_suppressed_count.fetch_add(base64_blobs_suppressed as u64, Ordering::Relaxed);
+        }
+        if dir_traversals_shielded > 0 {
+            self.dir_traversals_shielded_count.fetch_add(dir_traversals_shielded as u64, Ordering::Relaxed);
         }
     }
 
@@ -508,6 +575,9 @@ impl MetricsTracker {
             ledger_vetoed_count: self.ledger_vetoed_count.load(Ordering::Relaxed),
             signals_extracted_count: self.signals_extracted_count.load(Ordering::Relaxed),
             loops_collapsed_count: self.loops_collapsed_count.load(Ordering::Relaxed),
+            lockfile_diffs_pruned_count: self.lockfile_diffs_pruned_count.load(Ordering::Relaxed),
+            base64_blobs_suppressed_count: self.base64_blobs_suppressed_count.load(Ordering::Relaxed),
+            dir_traversals_shielded_count: self.dir_traversals_shielded_count.load(Ordering::Relaxed),
             loop_nudges_total: self.loop_nudges_total.load(Ordering::Relaxed),
 
             last_prompt_tokens_original: self.last_prompt_tokens_original.load(Ordering::Relaxed),
