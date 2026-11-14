@@ -52,6 +52,7 @@ pin_project! {
         is_sse: bool,
         keepalive_duration: std::time::Duration,
         ended: bool,
+        sse_tracker: SseFrameTracker,
     }
 }
 
@@ -69,6 +70,7 @@ impl<S> GuardedStream<S> {
             is_sse,
             keepalive_duration,
             ended: false,
+            sse_tracker: SseFrameTracker::new(),
         }
     }
 }
@@ -91,7 +93,7 @@ where
             Poll::Ready(Some(Ok(bytes))) => {
                 this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
                 let bytes = if *this.is_sse {
-                    transform_strata_chunk(bytes)
+                    this.sse_tracker.process_chunk(bytes)
                 } else {
                     bytes
                 };
@@ -101,7 +103,7 @@ where
                 warn!(error = %e, "Upstream stream closed or errored mid-transfer; cleanly terminating SSE stream with [DONE]");
                 *this.ended = true;
                 if *this.is_sse {
-                    Poll::Ready(Some(Ok(bytes::Bytes::from_static(DONE_SSE_CHUNK))))
+                    Poll::Ready(Some(Ok(this.sse_tracker.on_stream_error())))
                 } else {
                     Poll::Ready(None)
                 }
@@ -115,7 +117,12 @@ where
                     match Future::poll(this.sleep.as_mut(), cx) {
                         Poll::Ready(()) => {
                             this.sleep.as_mut().reset(tokio::time::Instant::now() + *this.keepalive_duration);
-                            Poll::Ready(Some(Ok(bytes::Bytes::from_static(KEEPALIVE_SSE_CHUNK))))
+                            if let Some(chunk) = this.sse_tracker.on_keepalive_tick() {
+                                Poll::Ready(Some(Ok(chunk)))
+                            } else {
+                                let _ = Future::poll(this.sleep.as_mut(), cx);
+                                Poll::Pending
+                            }
                         }
                         Poll::Pending => Poll::Pending,
                     }
@@ -228,9 +235,14 @@ impl UpstreamClient {
                     return self
                         .stream_local_response_with_prefill_keepalive(
                             req,
+                            body,
+                            decision,
                             slot_guard,
                             meta,
                             req_id,
+                            chars_saved,
+                            savings_pct,
+                            cache_key,
                             start,
                         )
                         .await;
@@ -530,11 +542,34 @@ impl UpstreamClient {
         // Fast path for non-streaming responses: read bytes directly, release slot immediately, populate cache
         if !_is_stream && !is_sse {
             drop(guard); // Free local slot immediately!
-            let body_bytes = resp.bytes().await.unwrap_or_default();
-            if let Some(key) = cache_key {
-                self.cache.set(key, body_bytes.clone(), status.as_u16(), vec![]).await;
+            match resp.bytes().await {
+                Ok(body_bytes) => {
+                    if status.is_success() {
+                        if let Some(key) = cache_key {
+                            self.cache.set(key, body_bytes.clone(), status.as_u16(), vec![]).await;
+                        }
+                    }
+                    return (status, headers, body_bytes).into_response();
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed reading upstream response body; skipping cache");
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        [
+                            ("access-control-allow-origin", "*"),
+                            ("content-type", "application/json"),
+                        ],
+                        serde_json::json!({
+                            "error": {
+                                "message": format!("Failed reading upstream response body: {}", err),
+                                "type": "upstream_error"
+                            }
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
             }
-            return (status, headers, body_bytes).into_response();
         }
 
         // Streaming SSE path with background keepalive heartbeat (5s heartbeat to prevent client socket drops)
@@ -549,78 +584,75 @@ impl UpstreamClient {
         (status, headers, Body::from_stream(guarded_stream)).into_response()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_local_response_with_prefill_keepalive(
         &self,
         req: reqwest::RequestBuilder,
+        body: Value,
+        decision: RouteDecision,
         guard: Option<crate::router::LocalSlotGuard>,
-        meta: ResponseMeta,
+        mut meta: ResponseMeta,
         req_id: u64,
+        chars_saved: usize,
+        savings_pct: f64,
+        cache_key: Option<String>,
         start: Instant,
     ) -> Response {
+        let cb_threshold = self.config.local.circuit_breaker_threshold;
+        let mut req_fut = Box::pin(req.send());
+        let first_keepalive = tokio::time::sleep(std::time::Duration::from_secs(4));
+        tokio::pin!(first_keepalive);
+
+        // Await upstream headers up to the initial 4s prefill keepalive tick so fast connect/5xx/429
+        // errors fail over cleanly (or return 502/503 if local_only) and fast 4xx errors forward status.
+        let initial_outcome = tokio::select! {
+            res = &mut req_fut => Some(res),
+            _ = &mut first_keepalive => None,
+        };
+
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let metrics = self.metrics.clone();
-        let cb_threshold = self.config.local.circuit_breaker_threshold;
 
-        tokio::spawn(async move {
-            let keepalive_chunk = bytes::Bytes::from_static(KEEPALIVE_SSE_CHUNK);
-
-            // Prefill heartbeat: emit an empty completion delta every 4 seconds while awaiting upstream response headers
-            let mut prefill_interval = tokio::time::interval(std::time::Duration::from_secs(4));
-            prefill_interval.tick().await; // consume immediate first tick
-
-            let mut req_fut = Box::pin(req.send());
-
-            let resp = loop {
-                tokio::select! {
-                    _ = prefill_interval.tick() => {
-                        if tx.send(Ok(keepalive_chunk.clone())).await.is_err() {
-                            warn!(req_id = req_id, "Client disconnected during upstream prefill; dropping turn");
-                            drop(guard);
-                            return;
-                        }
-                    }
-                    res = &mut req_fut => {
-                        break res;
-                    }
-                }
-            };
-
-            match resp {
-                Ok(resp) if resp.status().is_success() => {
-                    metrics.record_local_success();
-                    let duration = start.elapsed();
-                    metrics.record_local_completion(duration.as_millis());
-                    info!(
-                        req_id = req_id,
-                        target = "local",
-                        status = resp.status().as_u16(),
-                        duration_ms = duration.as_millis(),
-                        "Local prefill finished; streaming chunks to client"
-                    );
-
+        match initial_outcome {
+            Some(Ok(resp)) if resp.status().is_success() => {
+                metrics.record_local_success();
+                let duration = start.elapsed();
+                metrics.record_local_completion(duration.as_millis());
+                meta.duration_ms = duration.as_millis();
+                info!(
+                    req_id = req_id,
+                    target = "local",
+                    status = resp.status().as_u16(),
+                    duration_ms = duration.as_millis(),
+                    "Local prefill finished; streaming chunks to client"
+                );
+                tokio::spawn(async move {
                     let mut stream = resp.bytes_stream();
+                    let mut sse_tracker = SseFrameTracker::new();
                     let mut stream_interval = tokio::time::interval(std::time::Duration::from_secs(4));
                     stream_interval.tick().await;
 
                     loop {
                         tokio::select! {
                             _ = stream_interval.tick() => {
-                                if tx.send(Ok(keepalive_chunk.clone())).await.is_err() {
-                                    break;
+                                if let Some(chunk) = sse_tracker.on_keepalive_tick() {
+                                    if tx.send(Ok(chunk)).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                             item = stream.next() => {
                                 match item {
                                     Some(Ok(bytes)) => {
                                         stream_interval.reset();
-                                        let bytes = transform_strata_chunk(bytes);
+                                        let bytes = sse_tracker.process_chunk(bytes);
                                         if tx.send(Ok(bytes)).await.is_err() {
                                             break;
                                         }
                                     }
                                     Some(Err(e)) => {
                                         warn!(req_id = req_id, error = %e, "Upstream stream error; closing client stream");
-                                        let _ = tx.send(Ok(bytes::Bytes::from_static(DONE_SSE_CHUNK))).await;
+                                        let _ = tx.send(Ok(sse_tracker.on_stream_error())).await;
                                         break;
                                     }
                                     None => {
@@ -631,33 +663,216 @@ impl UpstreamClient {
                         }
                     }
                     drop(guard);
-                }
-                Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
-                    metrics.record_local_success();
-                    let status = resp.status();
-                    let err_text = resp.text().await.unwrap_or_default();
-                    warn!(req_id = req_id, status = status.as_u16(), error = %err_text, "Local provider returned client error");
-                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {{\"error\": \"{}\"}}\n\ndata: [DONE]\n\n", err_text)))).await;
-                    drop(guard);
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let err_text = resp.text().await.unwrap_or_default();
-                    warn!(req_id = req_id, status = status.as_u16(), error = %err_text, "Local provider returned server error");
-                    metrics.record_local_failure(cb_threshold);
-                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {{\"error\": \"Local upstream error: {}\"}}\n\ndata: [DONE]\n\n", err_text)))).await;
-                    drop(guard);
-                }
-                Err(e) => {
-                    error!(req_id = req_id, error = %e, "Local stream request failed");
-                    metrics.record_local_failure(cb_threshold);
-                    let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {{\"error\": \"Upstream request failed: {}\"}}\n\ndata: [DONE]\n\n", e)))).await;
-                    drop(guard);
-                }
+                });
             }
-        });
+            Some(Ok(resp)) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
+                metrics.record_local_success();
+                let status = resp.status();
+                let duration = start.elapsed();
+                metrics.record_local_completion(duration.as_millis());
+                meta.duration_ms = duration.as_millis();
+                warn!(
+                    req_id = req_id,
+                    status = status.as_u16(),
+                    duration_ms = duration.as_millis(),
+                    "Local provider returned client error on stream request (forwarding status to client)"
+                );
+                return self.handle_upstream_response(resp, false, guard, meta, None).await;
+            }
+            Some(Ok(resp)) => {
+                let upstream_status = resp.status();
+                let err_text = resp.text().await.unwrap_or_default();
+                warn!(
+                    req_id = req_id,
+                    status = upstream_status.as_u16(),
+                    error = %err_text,
+                    local_only = decision.local_only,
+                    "Local provider returned server/rate-limit error on stream prefill"
+                );
+                let tripped = metrics.record_local_failure(cb_threshold);
+                if tripped {
+                    warn!(
+                        req_id = req_id,
+                        threshold = cb_threshold,
+                        "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
+                    );
+                }
+                drop(guard);
+                if decision.local_only {
+                    let out_status = if upstream_status == StatusCode::SERVICE_UNAVAILABLE
+                        || upstream_status == StatusCode::TOO_MANY_REQUESTS
+                    {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    return (
+                        out_status,
+                        [
+                            ("access-control-allow-origin", "*"),
+                            ("content-type", "application/json"),
+                            ("x-ferry-provider", "local"),
+                            ("x-ferry-failover", "false"),
+                        ],
+                        serde_json::json!({
+                            "error": {
+                                "message": format!("Local upstream error ({}): {}", upstream_status.as_u16(), err_text),
+                                "type": "upstream_error"
+                            }
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
+                metrics.inc_failover();
+                metrics.inc_cloud(decision.est_tokens, false);
+                return self
+                    .dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key)
+                    .await;
+            }
+            Some(Err(err)) => {
+                warn!(
+                    req_id = req_id,
+                    error = %err,
+                    local_only = decision.local_only,
+                    "Local provider stream connection failed"
+                );
+                let tripped = metrics.record_local_failure(cb_threshold);
+                if tripped {
+                    warn!(
+                        req_id = req_id,
+                        threshold = cb_threshold,
+                        "Circuit breaker TRIPPED! Strata marked offline after consecutive failures. Future requests will route directly to Cloud."
+                    );
+                }
+                drop(guard);
+                if decision.local_only {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [
+                            ("access-control-allow-origin", "*"),
+                            ("content-type", "application/json"),
+                            ("x-ferry-provider", "local"),
+                            ("x-ferry-failover", "false"),
+                        ],
+                        serde_json::json!({
+                            "error": {
+                                "message": format!("Local upstream unreachable: {}", err),
+                                "type": "upstream_error"
+                            }
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
+                metrics.inc_failover();
+                metrics.inc_cloud(decision.est_tokens, false);
+                return self
+                    .dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key)
+                    .await;
+            }
+            None => {
+                // Prefill exceeded initial 4s keepalive window: commit 200 OK SSE headers and emit keepalive heartbeat
+                let keepalive_chunk = bytes::Bytes::from_static(KEEPALIVE_SSE_CHUNK);
+                let _ = tx.try_send(Ok(keepalive_chunk.clone()));
 
-        // Assemble immediate 200 OK SSE headers
+                tokio::spawn(async move {
+                    let mut prefill_interval = tokio::time::interval(std::time::Duration::from_secs(4));
+                    prefill_interval.tick().await; // consume immediate first tick
+
+                    let resp = loop {
+                        tokio::select! {
+                            _ = prefill_interval.tick() => {
+                                if tx.send(Ok(keepalive_chunk.clone())).await.is_err() {
+                                    warn!(req_id = req_id, "Client disconnected during upstream prefill; dropping turn");
+                                    drop(guard);
+                                    return;
+                                }
+                            }
+                            res = &mut req_fut => {
+                                break res;
+                            }
+                        }
+                    };
+
+                    match resp {
+                        Ok(resp) if resp.status().is_success() => {
+                            metrics.record_local_success();
+                            let duration = start.elapsed();
+                            metrics.record_local_completion(duration.as_millis());
+                            info!(
+                                req_id = req_id,
+                                target = "local",
+                                status = resp.status().as_u16(),
+                                duration_ms = duration.as_millis(),
+                                "Local prefill finished; streaming chunks to client"
+                            );
+
+                            let mut stream = resp.bytes_stream();
+                            let mut sse_tracker = SseFrameTracker::new();
+                            let mut stream_interval = tokio::time::interval(std::time::Duration::from_secs(4));
+                            stream_interval.tick().await;
+
+                            loop {
+                                tokio::select! {
+                                    _ = stream_interval.tick() => {
+                                        if let Some(chunk) = sse_tracker.on_keepalive_tick() {
+                                            if tx.send(Ok(chunk)).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    item = stream.next() => {
+                                        match item {
+                                            Some(Ok(bytes)) => {
+                                                stream_interval.reset();
+                                                let bytes = sse_tracker.process_chunk(bytes);
+                                                if tx.send(Ok(bytes)).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Some(Err(e)) => {
+                                                warn!(req_id = req_id, error = %e, "Upstream stream error; closing client stream");
+                                                let _ = tx.send(Ok(sse_tracker.on_stream_error())).await;
+                                                break;
+                                            }
+                                            None => {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            drop(guard);
+                        }
+                        Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
+                            metrics.record_local_success();
+                            let status = resp.status();
+                            let err_text = resp.text().await.unwrap_or_default();
+                            warn!(req_id = req_id, status = status.as_u16(), error = %err_text, "Local provider returned client error after prefill commit");
+                            let _ = tx.send(Ok(format_sse_error_frame(&err_text))).await;
+                            drop(guard);
+                        }
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let err_text = resp.text().await.unwrap_or_default();
+                            warn!(req_id = req_id, status = status.as_u16(), error = %err_text, "Local provider returned server error after prefill commit");
+                            metrics.record_local_failure(cb_threshold);
+                            let _ = tx.send(Ok(format_sse_error_frame(&format!("Local upstream error: {}", err_text)))).await;
+                            drop(guard);
+                        }
+                        Err(e) => {
+                            error!(req_id = req_id, error = %e, "Local stream request failed after prefill commit");
+                            metrics.record_local_failure(cb_threshold);
+                            let _ = tx.send(Ok(format_sse_error_frame(&format!("Upstream request failed: {}", e)))).await;
+                            drop(guard);
+                        }
+                    }
+                });
+            }
+        }
+
+        // Assemble 200 OK SSE headers
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
@@ -676,6 +891,9 @@ impl UpstreamClient {
         }
         if let Ok(val) = HeaderValue::from_str(&format!("{:.2}%", meta.savings_pct)) {
             headers.insert(HeaderName::from_static("x-ferry-savings-percent"), val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&meta.duration_ms.to_string()) {
+            headers.insert(HeaderName::from_static("x-ferry-duration-ms"), val);
         }
         headers.insert(HeaderName::from_static("x-ferry-failover"), HeaderValue::from_static("false"));
         if let Some(slot) = meta.slot_id {
@@ -705,19 +923,150 @@ pub fn normalize_wire_format(body: &mut Value, target_model: &str) {
     }
 }
 
-pub fn transform_strata_chunk(bytes: bytes::Bytes) -> bytes::Bytes {
-    let s = bytes.as_ref();
-    let mut trimmed = s;
-    while let Some(rest) = trimmed
-        .strip_prefix(b" ")
-        .or_else(|| trimmed.strip_prefix(b"\t"))
-        .or_else(|| trimmed.strip_prefix(b"\r"))
-        .or_else(|| trimmed.strip_prefix(b"\n"))
-    {
-        trimmed = rest;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseScanState {
+    EventBoundary,
+    AfterSingleNewline,
+    AfterFirstCr,
+    AfterNewlineCr,
+    MidLine,
+}
+
+#[derive(Debug, Clone)]
+struct SseFrameTracker {
+    state: SseScanState,
+    pending_keepalive: bool,
+}
+
+impl SseFrameTracker {
+    fn new() -> Self {
+        Self {
+            state: SseScanState::EventBoundary,
+            pending_keepalive: false,
+        }
     }
 
-    if trimmed.starts_with(b":") && !s.windows(5).any(|w| w == b"data:") {
+    fn at_event_boundary(&self) -> bool {
+        matches!(self.state, SseScanState::EventBoundary)
+    }
+
+    fn advance(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.state = match (self.state, b) {
+                (SseScanState::EventBoundary, b'\n') => SseScanState::EventBoundary,
+                (SseScanState::EventBoundary, b'\r') => SseScanState::AfterNewlineCr,
+                (SseScanState::EventBoundary, _) => SseScanState::MidLine,
+
+                (SseScanState::MidLine, b'\n') => SseScanState::AfterSingleNewline,
+                (SseScanState::MidLine, b'\r') => SseScanState::AfterFirstCr,
+                (SseScanState::MidLine, _) => SseScanState::MidLine,
+
+                (SseScanState::AfterFirstCr, b'\n') => SseScanState::AfterSingleNewline,
+                (SseScanState::AfterFirstCr, b'\r') => SseScanState::AfterNewlineCr,
+                (SseScanState::AfterFirstCr, _) => SseScanState::MidLine,
+
+                (SseScanState::AfterSingleNewline, b'\n') => SseScanState::EventBoundary,
+                (SseScanState::AfterSingleNewline, b'\r') => SseScanState::AfterNewlineCr,
+                (SseScanState::AfterSingleNewline, _) => SseScanState::MidLine,
+
+                (SseScanState::AfterNewlineCr, b'\n') => SseScanState::EventBoundary,
+                (SseScanState::AfterNewlineCr, b'\r') => SseScanState::EventBoundary,
+                (SseScanState::AfterNewlineCr, _) => SseScanState::MidLine,
+            };
+        }
+    }
+
+    fn process_chunk(&mut self, bytes: bytes::Bytes) -> bytes::Bytes {
+        if bytes.is_empty() {
+            return bytes;
+        }
+        let was_at_event_boundary = self.at_event_boundary();
+        self.advance(bytes.as_ref());
+
+        if was_at_event_boundary && is_pure_sse_comment_chunk(bytes.as_ref(), false) {
+            self.state = SseScanState::EventBoundary;
+            self.pending_keepalive = false;
+            return bytes::Bytes::from_static(KEEPALIVE_SSE_CHUNK);
+        }
+
+        if self.pending_keepalive && self.at_event_boundary() {
+            self.pending_keepalive = false;
+            let mut out = bytes::BytesMut::with_capacity(bytes.len() + KEEPALIVE_SSE_CHUNK.len());
+            out.extend_from_slice(bytes.as_ref());
+            out.extend_from_slice(KEEPALIVE_SSE_CHUNK);
+            return out.freeze();
+        }
+
+        bytes
+    }
+
+    fn on_keepalive_tick(&mut self) -> Option<bytes::Bytes> {
+        if self.at_event_boundary() {
+            self.pending_keepalive = false;
+            Some(bytes::Bytes::from_static(KEEPALIVE_SSE_CHUNK))
+        } else {
+            self.pending_keepalive = true;
+            None
+        }
+    }
+
+    fn on_stream_error(&mut self) -> bytes::Bytes {
+        let was_boundary = self.at_event_boundary();
+        self.state = SseScanState::EventBoundary;
+        self.pending_keepalive = false;
+        if was_boundary {
+            bytes::Bytes::from_static(DONE_SSE_CHUNK)
+        } else {
+            bytes::Bytes::from_static(b"\n\ndata: [DONE]\n\n")
+        }
+    }
+}
+
+fn is_pure_sse_comment_chunk(s: &[u8], reject_json_tail: bool) -> bool {
+    if !s.ends_with(b"\n") {
+        return false;
+    }
+    let mut saw_comment_line = false;
+    for raw_line in s.split(|&b| b == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        // SSE comment lines MUST begin with ':' at column 0 (never preceded by space/tab).
+        if !line.starts_with(b":") {
+            return false;
+        }
+        if reject_json_tail && looks_like_json_value_tail(&line[1..]) {
+            return false;
+        }
+        saw_comment_line = true;
+    }
+    saw_comment_line
+}
+
+fn looks_like_json_value_tail(after_colon: &[u8]) -> bool {
+    let mut trimmed = after_colon;
+    while let Some(rest) = trimmed.strip_prefix(b" ").or_else(|| trimmed.strip_prefix(b"\t")) {
+        trimmed = rest;
+    }
+    trimmed.ends_with(b"}")
+        || trimmed.ends_with(b"]")
+        || trimmed.starts_with(b"\"")
+}
+
+pub fn format_sse_error_frame(err_msg: &str) -> bytes::Bytes {
+    let payload = serde_json::json!({
+        "error": {
+            "message": err_msg,
+            "type": "upstream_error"
+        }
+    })
+    .to_string();
+    bytes::Bytes::from(format!("data: {}\n\ndata: [DONE]\n\n", payload))
+}
+
+pub fn transform_strata_chunk(bytes: bytes::Bytes) -> bytes::Bytes {
+    if is_pure_sse_comment_chunk(bytes.as_ref(), true) {
         bytes::Bytes::from_static(KEEPALIVE_SSE_CHUNK)
     } else {
         bytes
