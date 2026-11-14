@@ -408,16 +408,53 @@ impl ContextCondenser {
         // 1.5. Runaway Repetition Folding:
         // Identifies identical tool outputs across historical turns and folds redundant repetitions
         if self.config.fold_repeated_tool_failures && cutoff_index > 1 {
+            let is_foldable_failure = |text: &str| -> bool {
+                if text.starts_with("[... Ferry Proxy: Repeated identical tool failure suppressed") {
+                    return false;
+                }
+                if is_diagnostic_tool_failure(text) {
+                    return true;
+                }
+                for raw_line in text.lines() {
+                    let lower = raw_line.to_ascii_lowercase();
+                    if crate::router::classifier::is_source_code_or_comment_line(&lower) {
+                        continue;
+                    }
+                    if lower.contains("connection refused")
+                        || lower.contains("failed to connect")
+                        || lower.contains("command not found")
+                        || lower.contains("connection timed out")
+                        || lower.contains("access denied")
+                        || lower.contains("cannot find module")
+                        || lower.contains("module not found")
+                        || lower.contains("assertionerror")
+                        || lower.contains("=== failures ===")
+                        || lower.contains("test result: failed")
+                        || lower.trim_start().starts_with("failed ")
+                    {
+                        return true;
+                    }
+                    for marker in ["exit status ", "exit code "] {
+                        if let Some(pos) = lower.find(marker) {
+                            let rest = lower[pos + marker.len()..].trim_start();
+                            if let Some(first) = rest.chars().next() {
+                                if first.is_ascii_digit() && first != '0' {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            };
+
             let mut seen_historical_outputs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-            for idx in 0..cutoff_index {
-                let msg = &messages[idx];
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-                let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-                if role == "tool" || msg_type == "tool_result" {
-                    let content_opt = msg.get("content").and_then(|c| c.as_str()).or_else(|| msg.get("output").and_then(|o| o.as_str()));
-                    if let Some(content) = content_opt {
-                        let trimmed = content.trim();
-                        if trimmed.len() >= 25 {
+            for msg in &messages[0..cutoff_index] {
+                if is_tool_output_message(msg) {
+                    if let Some(raw_content) = extract_tool_output_text(msg) {
+                        let base = raw_content.strip_suffix(LOOP_GUARD_SUFFIX).unwrap_or(&raw_content);
+                        let trimmed = base.trim();
+                        if trimmed.len() >= 25 && is_foldable_failure(trimmed) {
                             *seen_historical_outputs.entry(trimmed.to_string()).or_insert(0) += 1;
                         }
                     }
@@ -426,14 +463,11 @@ impl ContextCondenser {
 
             if seen_historical_outputs.values().any(|&count| count >= 2) {
                 let mut kept_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                for idx in 0..cutoff_index {
-                    let msg = &mut messages[idx];
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default().to_string();
-                    let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
-                    if role == "tool" || msg_type == "tool_result" {
-                        let content_opt = msg.get("content").and_then(|c| c.as_str()).or_else(|| msg.get("output").and_then(|o| o.as_str())).map(|s| s.to_string());
-                        if let Some(content) = content_opt {
-                            let trimmed = content.trim();
+                for msg in &mut messages[0..cutoff_index] {
+                    if is_tool_output_message(msg) {
+                        if let Some(raw_content) = extract_tool_output_text(msg) {
+                            let base = raw_content.strip_suffix(LOOP_GUARD_SUFFIX).unwrap_or(&raw_content);
+                            let trimmed = base.trim();
                             if let Some(&total_count) = seen_historical_outputs.get(trimmed) {
                                 if total_count >= 2 {
                                     let seen_so_far = kept_counts.entry(trimmed.to_string()).or_insert(0);
@@ -444,12 +478,35 @@ impl ContextCondenser {
                                                 "[... Ferry Proxy: Repeated identical tool failure suppressed (attempt #{}); see earlier turn for output ...]",
                                                 *seen_so_far
                                             );
-                                            if obj.contains_key("content") {
+                                            let mut replaced = false;
+                                            if matches!(obj.get("content"), Some(Value::String(_))) {
                                                 obj.insert("content".to_string(), Value::String(folded));
-                                            } else if obj.contains_key("output") {
+                                                replaced = true;
+                                            } else if matches!(obj.get("output"), Some(Value::String(_))) {
                                                 obj.insert("output".to_string(), Value::String(folded));
+                                                replaced = true;
+                                            } else if let Some(Value::Array(parts)) = obj.get_mut("content") {
+                                                let mut placed = false;
+                                                parts.retain_mut(|part| {
+                                                    if part.get("text").and_then(|t| t.as_str()).is_some() {
+                                                        if !placed {
+                                                            if let Some(po) = part.as_object_mut() {
+                                                                po.insert("text".to_string(), Value::String(folded.clone()));
+                                                            }
+                                                            placed = true;
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    } else {
+                                                        true
+                                                    }
+                                                });
+                                                replaced = placed;
                                             }
-                                            stats.loops_collapsed_count += 1;
+                                            if replaced {
+                                                stats.loops_collapsed_count += 1;
+                                            }
                                         }
                                     }
                                 }
@@ -758,8 +815,21 @@ impl ContextCondenser {
             return None;
         }
 
-        let has_system = messages.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system");
-        let start_idx = if has_system { 1 } else { 0 };
+        let mut start_idx = 0;
+        while start_idx < total_msgs {
+            let role = messages[start_idx]
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            if role == "system" || role == "developer" {
+                start_idx += 1;
+            } else {
+                break;
+            }
+        }
+        if start_idx >= total_msgs {
+            return None;
+        }
 
         let conv_chars = count_message_chars(&messages[start_idx..]);
         let conv_tokens = estimate_tokens_from_chars(conv_chars);
@@ -779,19 +849,163 @@ impl ContextCondenser {
             split_idx = start_idx + quantized;
         }
 
-        while split_idx > start_idx {
-            let role = messages[split_idx].get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if role == "tool" {
-                split_idx -= 1;
-            } else {
-                break;
+        let is_compact_tool_output = |msg: &Value| -> bool {
+            if is_tool_output_message(msg) {
+                return true;
             }
-        }
+            msg.get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    !arr.is_empty()
+                        && arr.iter().all(|p| {
+                            p.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                })
+                .unwrap_or(false)
+        };
 
-        if split_idx > start_idx {
-            let prev_role = messages[split_idx - 1].get("role").and_then(|r| r.as_str()).unwrap_or("");
-            if prev_role == "assistant" && messages[split_idx - 1].get("tool_calls").is_some() {
+        let is_compact_tool_call = |msg: &Value| -> bool {
+            let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if matches!(msg_type, "function_call" | "tool_use") {
+                return true;
+            }
+            if msg
+                .get("tool_calls")
+                .and_then(|tc| tc.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if msg.get("function_call").map(|fc| fc.is_object()).unwrap_or(false) {
+                return true;
+            }
+            msg.get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter().any(|p| {
+                        matches!(
+                            p.get("type").and_then(|t| t.as_str()),
+                            Some("tool_use" | "function_call")
+                        )
+                    })
+                })
+                .unwrap_or(false)
+        };
+
+        let collect_output_call_ids = |msg: &Value, out: &mut Vec<String>| {
+            if let Some(id) = extract_tool_output_id(msg) {
+                out.push(id);
+            }
+            if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                for p in arr {
+                    if p.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                        if let Some(id) = p
+                            .get("tool_use_id")
+                            .or_else(|| p.get("call_id"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            out.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        };
+
+        let collect_call_ids_from_msg = |msg: &Value, out: &mut Vec<String>| {
+            let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if matches!(msg_type, "function_call" | "tool_use") {
+                if let Some(id) = msg
+                    .get("call_id")
+                    .or_else(|| msg.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push(id.to_string());
+                }
+            }
+            if let Some(arr) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                for item in arr {
+                    if let Some(id) = item
+                        .get("id")
+                        .or_else(|| item.get("call_id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+            if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                for p in arr {
+                    if matches!(
+                        p.get("type").and_then(|t| t.as_str()),
+                        Some("tool_use" | "function_call")
+                    ) {
+                        if let Some(id) = p
+                            .get("id")
+                            .or_else(|| p.get("call_id"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            out.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        };
+
+        loop {
+            let prev_split = split_idx;
+
+            while split_idx > start_idx
+                && split_idx < total_msgs
+                && is_compact_tool_output(&messages[split_idx])
+            {
                 split_idx -= 1;
+            }
+
+            while split_idx > start_idx && is_compact_tool_call(&messages[split_idx - 1]) {
+                split_idx -= 1;
+            }
+
+            while split_idx > start_idx
+                && split_idx < total_msgs
+                && is_compact_tool_call(&messages[split_idx])
+                && messages[split_idx - 1].get("type").and_then(|t| t.as_str()) == Some("reasoning")
+            {
+                split_idx -= 1;
+            }
+
+            if split_idx > start_idx && split_idx < total_msgs {
+                let mut kept_output_ids = Vec::new();
+                for m in &messages[split_idx..] {
+                    if is_compact_tool_output(m) {
+                        collect_output_call_ids(m, &mut kept_output_ids);
+                    }
+                }
+                if !kept_output_ids.is_empty() {
+                    for idx in start_idx..split_idx {
+                        let mut defined_ids = Vec::new();
+                        collect_call_ids_from_msg(&messages[idx], &mut defined_ids);
+                        if defined_ids
+                            .iter()
+                            .any(|id| kept_output_ids.iter().any(|oid| oid == id))
+                        {
+                            split_idx = idx;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if split_idx == prev_split || split_idx <= start_idx {
+                break;
             }
         }
 
@@ -799,75 +1013,206 @@ impl ContextCondenser {
             return None;
         }
 
+        let extract_compact_text = |msg: &Value| -> Option<String> {
+            let mut parts_buf: Vec<&str> = Vec::new();
+            if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
+                if !c.is_empty() {
+                    parts_buf.push(c);
+                }
+            } else if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                for part in arr {
+                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                        if !t.is_empty() {
+                            parts_buf.push(t);
+                        }
+                    } else if part.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                        if let Some(tc) = part.get("content").and_then(|c| c.as_str()) {
+                            if !tc.is_empty() {
+                                parts_buf.push(tc);
+                            }
+                        } else if let Some(tarr) = part.get("content").and_then(|c| c.as_array()) {
+                            for sub in tarr {
+                                if let Some(st) = sub.get("text").and_then(|t| t.as_str()) {
+                                    if !st.is_empty() {
+                                        parts_buf.push(st);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(o) = msg.get("output").and_then(|o| o.as_str()) {
+                if !o.is_empty() {
+                    parts_buf.push(o);
+                }
+            } else if let Some(arr) = msg.get("output").and_then(|o| o.as_array()) {
+                for part in arr {
+                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                        if !t.is_empty() {
+                            parts_buf.push(t);
+                        }
+                    }
+                }
+            }
+            if parts_buf.is_empty() {
+                None
+            } else {
+                Some(parts_buf.join("\n"))
+            }
+        };
+
         let mut summary_lines = Vec::new();
         let mut preserved_endpoints: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut preserved_auth: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut preserved_anomalies: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let num_compacted = split_idx - start_idx;
 
+        let format_tool_call_line = |name: &str, args: &str| -> String {
+            let args_snippet = if !args.is_empty() {
+                extract_compact_tool_arguments(args)
+            } else {
+                String::new()
+            };
+            if args_snippet.is_empty() {
+                format!("• [Executed Tool]: {}", name)
+            } else {
+                format!("• [Executed Tool]: {}({})", name, args_snippet)
+            }
+        };
+
         for msg in &messages[start_idx..split_idx] {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            if is_compact_tool_output(msg) {
+                let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                if let Some(content) = extract_compact_text(msg) {
+                    collect_discovered_entities(
+                        &content,
+                        &mut preserved_endpoints,
+                        &mut preserved_auth,
+                        &mut preserved_anomalies,
+                    );
+
+                    let signal_line = content.lines().find(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        DIAGNOSTIC_SIGNALS.iter().any(|sig| lower.contains(sig))
+                    });
+
+                    if let Some(sig) = signal_line {
+                        let snippet: String = sig.trim().chars().take(180).collect();
+                        summary_lines.push(format!("  └─ [{name} result]: ⚠️ Signal: {}", snippet));
+                    } else {
+                        let first_line = content.lines().next().unwrap_or("").trim();
+                        let snippet: String = first_line.chars().take(150).collect();
+                        summary_lines.push(format!("  └─ [{name} result]: {}", snippet));
+                    }
+                }
+                continue;
+            }
+
+            if msg_type == "function_call" {
+                let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                let args_owned = normalize_tool_arguments(msg.get("arguments"));
+                summary_lines.push(format_tool_call_line(name, &args_owned));
+                collect_discovered_entities(
+                    &args_owned,
+                    &mut preserved_endpoints,
+                    &mut preserved_auth,
+                    &mut preserved_anomalies,
+                );
+                continue;
+            }
+
             match role {
                 "user" => {
-                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    if let Some(content) = extract_compact_text(msg) {
                         if content.starts_with("[Historical Context Checkpoint:") {
-                            for line in content.lines() {
+                            let (inside_cp, after_cp) = match content.split_once("[End of Historical Checkpoint]") {
+                                Some((before, after)) => (before, Some(after)),
+                                None => (content.as_str(), None),
+                            };
+                            for line in inside_cp.lines() {
                                 let trimmed = line.trim();
+                                if trimmed == "[Preserved Security Discoveries & Entities]" {
+                                    break;
+                                }
                                 if trimmed.starts_with("• ") || trimmed.starts_with("└─ ") {
                                     summary_lines.push(trimmed.to_string());
+                                }
+                            }
+                            if let Some(after) = after_cp {
+                                let trailing = after.trim();
+                                if !trailing.is_empty() {
+                                    let snippet: String = trailing.chars().take(250).collect();
+                                    summary_lines.push(format!("• [User Request]: {}", snippet.trim()));
                                 }
                             }
                         } else {
                             let snippet: String = content.chars().take(250).collect();
                             summary_lines.push(format!("• [User Request]: {}", snippet.trim()));
                         }
-                        collect_discovered_entities(content, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
+                        collect_discovered_entities(
+                            &content,
+                            &mut preserved_endpoints,
+                            &mut preserved_auth,
+                            &mut preserved_anomalies,
+                        );
                     }
                 }
                 "assistant" => {
+                    let mut emitted_tool_call = false;
                     if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
                         for tc in tool_calls {
-                            let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("tool");
-                            let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("");
-
-                            let args_snippet = if !args.is_empty() {
-                                extract_compact_tool_arguments(args)
-                            } else {
-                                String::new()
-                            };
-
-                            if args_snippet.is_empty() {
-                                summary_lines.push(format!("• [Executed Tool]: {}", name));
-                            } else {
-                                summary_lines.push(format!("• [Executed Tool]: {}({})", name, args_snippet));
-                            }
-
-                            collect_discovered_entities(args, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
+                            let func = tc.get("function").unwrap_or(tc);
+                            let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                            let args = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                            summary_lines.push(format_tool_call_line(name, args));
+                            collect_discovered_entities(
+                                args,
+                                &mut preserved_endpoints,
+                                &mut preserved_auth,
+                                &mut preserved_anomalies,
+                            );
+                            emitted_tool_call = true;
                         }
-                    } else if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                        let snippet: String = content.chars().take(250).collect();
-                        summary_lines.push(format!("• [Assistant Finding]: {}", snippet.trim()));
-                        collect_discovered_entities(content, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
+                    }
+                    if let Some(fc) = msg.get("function_call").filter(|v| v.is_object()) {
+                        let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        let args_owned = normalize_tool_arguments(fc.get("arguments"));
+                        summary_lines.push(format_tool_call_line(name, &args_owned));
+                        collect_discovered_entities(
+                            &args_owned,
+                            &mut preserved_endpoints,
+                            &mut preserved_auth,
+                            &mut preserved_anomalies,
+                        );
+                        emitted_tool_call = true;
+                    }
+                    if let Some(content) = extract_compact_text(msg) {
+                        if !emitted_tool_call {
+                            let snippet: String = content.chars().take(250).collect();
+                            summary_lines.push(format!("• [Assistant Finding]: {}", snippet.trim()));
+                        }
+                        collect_discovered_entities(
+                            &content,
+                            &mut preserved_endpoints,
+                            &mut preserved_auth,
+                            &mut preserved_anomalies,
+                        );
                     }
                 }
-                "tool" => {
-                    let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                        collect_discovered_entities(content, &mut preserved_endpoints, &mut preserved_auth, &mut preserved_anomalies);
-
-                        let signal_line = content.lines().find(|l| {
-                            let lower = l.to_ascii_lowercase();
-                            DIAGNOSTIC_SIGNALS.iter().any(|sig| lower.contains(sig))
-                        });
-
-                        if let Some(sig) = signal_line {
-                            let snippet: String = sig.trim().chars().take(180).collect();
-                            summary_lines.push(format!("  └─ [{name} result]: ⚠️ Signal: {}", snippet));
-                        } else {
-                            let first_line = content.lines().next().unwrap_or("").trim();
-                            let snippet: String = first_line.chars().take(150).collect();
-                            summary_lines.push(format!("  └─ [{name} result]: {}", snippet));
-                        }
+                _ if role.is_empty() && msg_type == "message" => {
+                    if let Some(content) = extract_compact_text(msg) {
+                        let snippet: String = content.chars().take(250).collect();
+                        summary_lines.push(format!("• [Assistant Finding]: {}", snippet.trim()));
+                        collect_discovered_entities(
+                            &content,
+                            &mut preserved_endpoints,
+                            &mut preserved_auth,
+                            &mut preserved_anomalies,
+                        );
                     }
                 }
                 _ => {}
@@ -908,17 +1253,78 @@ impl ContextCondenser {
             summary_lines.join("\n")
         );
 
+        let split_is_user = messages
+            .get(split_idx)
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("user")
+            && !is_compact_tool_output(&messages[split_idx]);
+
         let original_range_chars = count_message_chars(&messages[start_idx..split_idx]);
-        if summary_text.len() >= original_range_chars {
+        let added_chars = if split_is_user {
+            summary_text.len() + 2
+        } else {
+            summary_text.len()
+        };
+        if added_chars >= original_range_chars {
             return None;
         }
 
-        let checkpoint_msg = serde_json::json!({
-            "role": "user",
-            "content": summary_text
-        });
-
-        messages.splice(start_idx..split_idx, std::iter::once(checkpoint_msg));
+        if split_is_user {
+            let mut summary_opt = Some(summary_text);
+            if let Some(user_obj) = messages[split_idx].as_object_mut() {
+                match user_obj.get_mut("content") {
+                    Some(Value::String(existing)) => {
+                        let st = summary_opt.take().unwrap_or_default();
+                        if existing.is_empty() {
+                            *existing = st;
+                        } else {
+                            *existing = format!("{st}\n\n{existing}");
+                        }
+                    }
+                    Some(Value::Array(parts)) => {
+                        let st = summary_opt.take().unwrap_or_default();
+                        let mut merged_into_part = false;
+                        for part in parts.iter_mut() {
+                            if let Some(part_obj) = part.as_object_mut() {
+                                if let Some(Value::String(existing_text)) = part_obj.get_mut("text") {
+                                    if existing_text.is_empty() {
+                                        *existing_text = st.clone();
+                                    } else {
+                                        *existing_text = format!("{st}\n\n{existing_text}");
+                                    }
+                                    merged_into_part = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !merged_into_part {
+                            parts.insert(0, serde_json::json!({ "type": "text", "text": st }));
+                        }
+                    }
+                    None => {
+                        let st = summary_opt.take().unwrap_or_default();
+                        user_obj.insert("content".to_string(), Value::String(st));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(unmerged) = summary_opt {
+                let checkpoint_msg = serde_json::json!({
+                    "role": "user",
+                    "content": unmerged
+                });
+                messages.splice(start_idx..split_idx, std::iter::once(checkpoint_msg));
+            } else {
+                messages.drain(start_idx..split_idx);
+            }
+        } else {
+            let checkpoint_msg = serde_json::json!({
+                "role": "user",
+                "content": summary_text
+            });
+            messages.splice(start_idx..split_idx, std::iter::once(checkpoint_msg));
+        }
 
         let new_chars = count_message_chars(messages);
         let chars_saved = orig_chars.saturating_sub(new_chars);
@@ -1159,7 +1565,7 @@ mod tests {
         let last_user = &msgs[msgs.len() - 2];
         let last_asst = &msgs[msgs.len() - 1];
         assert_eq!(last_user["role"], "user");
-        assert_eq!(last_user["content"], "Recent active user request");
+        assert!(last_user["content"].as_str().unwrap().ends_with("Recent active user request"));
         assert_eq!(last_asst["role"], "assistant");
         assert_eq!(last_asst["content"], "Recent active assistant reply");
     }

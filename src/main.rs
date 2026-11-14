@@ -501,7 +501,8 @@ async fn chat_completions_handler(
 
     // 1. Client header control: X-Ferry-Condense (defaults to config setting)
     let condense_enabled = match headers.get("x-ferry-condense").and_then(|h| h.to_str().ok()) {
-        Some("false") | Some("0") | Some("no") => false,
+        Some(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off") => false,
+        Some(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on") => true,
         _ => state.config.condensation.enabled,
     };
 
@@ -617,8 +618,8 @@ async fn chat_completions_handler(
         || requested_cloud_model
         || precomputed_hard_logic.as_ref().map(|(is_hard, _)| *is_hard).unwrap_or(false);
 
-    // Rolling context compaction when context exceeds compact_threshold_tokens (prunes historical turns for local & cloud):
-    if state.config.condensation.rolling_compaction {
+    // Rolling context compaction when context exceeds compact_threshold_tokens (local targets only when condensation is enabled):
+    if condense_enabled && !is_cloud_target && state.config.condensation.rolling_compaction {
         if let Some(compact_stats) = state.condenser.rolling_compact(&mut body) {
             total_chars_saved += compact_stats.chars_saved;
             state.metrics.record_rolling_compaction(compact_stats.chars_saved);
@@ -626,7 +627,7 @@ async fn chat_completions_handler(
                 session = %session_id,
                 turns_compacted = compact_stats.turns_compacted,
                 chars_saved = compact_stats.chars_saved,
-                target = if is_cloud_target { "cloud" } else { "local" },
+                target = "local",
                 "Rolling context compaction pruned historical turns"
             );
         }
@@ -634,13 +635,13 @@ async fn chat_completions_handler(
 
     let mut precomputed_tokens: Option<u64> = None;
 
-    // Apply hardware-specific adaptive squeezing ONLY for local targets:
+    // Apply hardware-specific adaptive squeezing ONLY for local targets when condensation is enabled:
     if !is_cloud_target {
 
         // Adaptive squeezing to fit local context limit:
         let max_context = state.config.local.max_context_tokens as u64;
         let squeeze_ratio = state.config.local.adaptive_squeeze_ratio;
-        if state.config.local.adaptive_squeezing {
+        if condense_enabled && state.config.local.adaptive_squeezing {
             let est_tokens = ferry::router::Router::estimate_tokens(&body);
             precomputed_tokens = Some(est_tokens);
             if est_tokens > max_context && est_tokens <= (max_context as f64 * squeeze_ratio) as u64 {

@@ -216,32 +216,46 @@ pub fn suppress_base64_and_hex_blobs(input: &str) -> (String, usize) {
         }
         processed_line.push_str(remainder);
 
-        let mut line_tokens = Vec::new();
-        let mut current_token = String::new();
         let is_b64_char = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=';
+        let mut token_start: Option<usize> = None;
 
-        for c in processed_line.chars() {
+        for (idx, c) in processed_line.char_indices() {
             if is_b64_char(c) {
-                current_token.push(c);
-            } else {
-                if is_base64_or_hex_payload(&current_token) {
-                    line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
-                    suppressed_count += 1;
-                } else {
-                    line_tokens.push(current_token.clone());
+                if token_start.is_none() {
+                    token_start = Some(idx);
                 }
-                current_token.clear();
-                line_tokens.push(c.to_string());
+            } else {
+                if let Some(start) = token_start.take() {
+                    let token = &processed_line[start..idx];
+                    if is_base64_or_hex_payload(token) {
+                        use std::fmt::Write;
+                        let _ = write!(
+                            out,
+                            "[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]",
+                            token.len()
+                        );
+                        suppressed_count += 1;
+                    } else {
+                        out.push_str(token);
+                    }
+                }
+                out.push(c);
             }
         }
-        if is_base64_or_hex_payload(&current_token) {
-            line_tokens.push(format!("[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]", current_token.len()));
-            suppressed_count += 1;
-        } else {
-            line_tokens.push(current_token);
+        if let Some(start) = token_start {
+            let token = &processed_line[start..];
+            if is_base64_or_hex_payload(token) {
+                use std::fmt::Write;
+                let _ = write!(
+                    out,
+                    "[... Ferry Proxy: base64/hex blob ({} chars) suppressed ...]",
+                    token.len()
+                );
+                suppressed_count += 1;
+            } else {
+                out.push_str(token);
+            }
         }
-
-        out.push_str(&line_tokens.concat());
         out.push('\n');
     }
 

@@ -96,13 +96,60 @@ pub fn estimate_tokens(body: &Value) -> u64 {
                     total_chars += desc.len();
                 }
                 if let Some(params) = func.get("parameters") {
-                    total_chars += params.to_string().len();
+                    total_chars += estimated_json_len(params);
                 }
             }
         }
     }
 
     crate::condenser::estimate_tokens_from_chars(total_chars)
+}
+
+fn json_escaped_str_len(s: &str) -> usize {
+    let mut len = 2;
+    for b in s.bytes() {
+        len += match b {
+            b'"' | b'\\' | 0x08 | 0x09 | 0x0a | 0x0c | 0x0d => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        };
+    }
+    len
+}
+
+fn estimated_json_len(val: &Value) -> usize {
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    match val {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(n) => {
+            let mut counter = ByteCounter(0);
+            let _ = serde_json::to_writer(&mut counter, n);
+            counter.0
+        }
+        Value::String(s) => json_escaped_str_len(s),
+        Value::Array(arr) => {
+            2 + arr.len().saturating_sub(1) + arr.iter().map(estimated_json_len).sum::<usize>()
+        }
+        Value::Object(map) => {
+            2 + map.len().saturating_sub(1)
+                + map
+                    .iter()
+                    .map(|(k, v)| json_escaped_str_len(k) + 1 + estimated_json_len(v))
+                    .sum::<usize>()
+        }
+    }
 }
 
 pub fn detect_orchestrator(body: &Value, session_id: &str, priority_override: Option<&str>) -> bool {
