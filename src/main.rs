@@ -531,7 +531,10 @@ async fn chat_completions_handler(
         };
 
     let cache_key = if cache_allowed {
-        ResponseCache::compute_cache_key(&body)
+        ResponseCache::compute_cache_key_with_route(
+            &body,
+            headers.get("x-ferry-route").and_then(|h| h.to_str().ok()),
+        )
     } else {
         None
     };

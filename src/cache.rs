@@ -36,26 +36,65 @@ impl ResponseCache {
     }
 
     pub fn compute_cache_key(body: &Value) -> Option<String> {
+        Self::compute_cache_key_with_route(body, None)
+    }
+
+    pub fn compute_cache_key_with_route(body: &Value, route_override: Option<&str>) -> Option<String> {
         let is_stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         if is_stream {
             return None; // Don't cache streaming responses
         }
 
-        let temp = body.get("temperature").and_then(|t| t.as_f64()).unwrap_or(0.0);
-        if temp > 0.05 {
+        // Require explicit numeric temperature <= 0.05 (OpenAI omits temperature => default 1.0)
+        let temp = body.get("temperature").and_then(|t| t.as_f64())?;
+        if !temp.is_finite() || !(0.0..=0.05).contains(&temp) {
             return None; // Non-deterministic requests are not cached
         }
 
         let messages = body.get("messages")?;
         let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("default");
-        let tools = body.get("tools");
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         model.hash(&mut hasher);
         hash_json_value(messages, &mut hasher);
-        if let Some(t) = tools {
-            hash_json_value(t, &mut hasher);
+
+        const KEY_FIELDS: &[&str] = &[
+            "tools",
+            "tool_choice",
+            "response_format",
+            "max_tokens",
+            "max_completion_tokens",
+            "stop",
+            "seed",
+            "reasoning_effort",
+            "functions",
+            "function_call",
+        ];
+        for field in KEY_FIELDS {
+            field.hash(&mut hasher);
+            match body.get(*field) {
+                Some(val) => {
+                    1u8.hash(&mut hasher);
+                    hash_json_value(val, &mut hasher);
+                }
+                None => {
+                    0u8.hash(&mut hasher);
+                }
+            }
         }
+
+        let normalized_route = route_override
+            .map(|r| r.trim().to_ascii_lowercase())
+            .filter(|r| !r.is_empty())
+            .map(|r| match crate::router::RoutingMode::parse(&r) {
+                Some(crate::router::RoutingMode::LocalOnly) => "local-only".to_string(),
+                Some(crate::router::RoutingMode::LocalPreferred) => "local-preferred".to_string(),
+                Some(crate::router::RoutingMode::Hybrid) => "hybrid".to_string(),
+                Some(crate::router::RoutingMode::CloudOnly) => "cloud-only".to_string(),
+                None => r,
+            });
+        "route".hash(&mut hasher);
+        normalized_route.hash(&mut hasher);
 
         Some(format!("{:016x}", hasher.finish()))
     }
@@ -77,17 +116,21 @@ impl ResponseCache {
     }
 
     pub async fn set(&self, key: String, body_bytes: bytes::Bytes, status: u16, headers: Vec<(String, String)>) {
-        if !self.enabled {
+        if !self.enabled || self.max_entries == 0 || !(200..300).contains(&status) {
             return;
         }
 
         let mut map = self.store.write().await;
-        if map.len() >= self.max_entries {
+        if !map.contains_key(&key) && map.len() >= self.max_entries {
             let now = Instant::now();
             map.retain(|_, v| now.duration_since(v.created_at) < v.ttl);
             if map.len() >= self.max_entries {
-                if let Some(first_key) = map.keys().next().cloned() {
-                    map.remove(&first_key);
+                if let Some(oldest_key) = map
+                    .iter()
+                    .min_by_key(|(_, v)| v.created_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest_key);
                 }
             }
         }
@@ -120,10 +163,13 @@ fn hash_json_value<H: Hasher>(val: &Value, hasher: &mut H) {
         Value::Number(n) => {
             2u8.hash(hasher);
             if let Some(i) = n.as_i64() {
+                0u8.hash(hasher);
                 i.hash(hasher);
             } else if let Some(u) = n.as_u64() {
+                1u8.hash(hasher);
                 u.hash(hasher);
             } else if let Some(f) = n.as_f64() {
+                2u8.hash(hasher);
                 f.to_bits().hash(hasher);
             }
         }
