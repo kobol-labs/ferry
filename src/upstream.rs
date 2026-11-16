@@ -192,7 +192,30 @@ impl UpstreamClient {
 
     pub async fn forward_chat(
         &self,
+        body: Value,
+        decision: RouteDecision,
+        req_id: u64,
+        chars_saved: usize,
+        savings_pct: f64,
+        cache_key: Option<String>,
+    ) -> Response {
+        self.forward_chat_with_cloud_fallback(
+            body,
+            None,
+            decision,
+            req_id,
+            chars_saved,
+            savings_pct,
+            cache_key,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_chat_with_cloud_fallback(
+        &self,
         mut body: Value,
+        cloud_fallback: Option<(Value, usize, f64)>,
         mut decision: RouteDecision,
         req_id: u64,
         chars_saved: usize,
@@ -252,6 +275,7 @@ impl UpstreamClient {
                         .stream_local_response_with_prefill_keepalive(
                             req,
                             body,
+                            cloud_fallback,
                             decision,
                             slot_guard,
                             meta,
@@ -320,14 +344,12 @@ impl UpstreamClient {
                                                     reason = %reason,
                                                     "Local tool-enabled turn returned invalid/missing tool_calls; failing over to Cloud"
                                                 );
-                                                self.metrics.inc_failover();
-                                                self.metrics.inc_cloud(decision.est_tokens, false);
                                                 return self
-                                                    .dispatch_cloud(
+                                                    .failover_local_to_cloud(
                                                         body,
+                                                        cloud_fallback,
                                                         decision,
                                                         req_id,
-                                                        true,
                                                         chars_saved,
                                                         savings_pct,
                                                         cache_key,
@@ -447,9 +469,16 @@ impl UpstreamClient {
                             error = %error_text,
                             "Local provider returned server error. Failing over to cloud..."
                         );
-                        self.metrics.inc_failover();
-                        self.metrics.inc_cloud(decision.est_tokens, false);
-                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key).await
+                        self.failover_local_to_cloud(
+                            body,
+                            cloud_fallback,
+                            decision,
+                            req_id,
+                            chars_saved,
+                            savings_pct,
+                            cache_key,
+                        )
+                        .await
                     }
                     Err(err) => {
                         let tripped = self.metrics.record_local_failure(self.config.local.circuit_breaker_threshold);
@@ -501,9 +530,16 @@ impl UpstreamClient {
                             error = %err,
                             "Local provider connection failed. Failing over to cloud..."
                         );
-                        self.metrics.inc_failover();
-                        self.metrics.inc_cloud(decision.est_tokens, false);
-                        self.dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key).await
+                        self.failover_local_to_cloud(
+                            body,
+                            cloud_fallback,
+                            decision,
+                            req_id,
+                            chars_saved,
+                            savings_pct,
+                            cache_key,
+                        )
+                        .await
                     }
                 }
             }
@@ -541,6 +577,40 @@ impl UpstreamClient {
                 self.dispatch_cloud(body, decision, req_id, false, chars_saved, savings_pct, cache_key).await
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn failover_local_to_cloud(
+        &self,
+        local_body: Value,
+        cloud_fallback: Option<(Value, usize, f64)>,
+        mut decision: RouteDecision,
+        req_id: u64,
+        local_chars_saved: usize,
+        local_savings_pct: f64,
+        cache_key: Option<String>,
+    ) -> Response {
+        let local_tokens = decision.est_tokens;
+        let (cloud_body, eff_chars_saved, eff_savings_pct) = match cloud_fallback {
+            Some((uncompacted, cs, sp)) => {
+                let cloud_tokens = crate::router::Router::estimate_tokens(&uncompacted);
+                decision.est_tokens = cloud_tokens;
+                (uncompacted, cs, sp)
+            }
+            None => (local_body, local_chars_saved, local_savings_pct),
+        };
+        self.metrics
+            .record_local_to_cloud_failover(local_tokens, decision.est_tokens);
+        self.dispatch_cloud(
+            cloud_body,
+            decision,
+            req_id,
+            true,
+            eff_chars_saved,
+            eff_savings_pct,
+            cache_key,
+        )
+        .await
     }
 
     async fn dispatch_cloud(
@@ -616,15 +686,31 @@ impl UpstreamClient {
                 let status = resp.status();
                 let duration = start.elapsed();
                 self.metrics.record_cloud_completion(duration.as_millis());
-                if status == StatusCode::TOO_MANY_REQUESTS {
-                    warn!(
-                        req_id = req_id,
-                        "Cloud provider returned HTTP 429 (Rate Limit / Quota Exceeded). Activating 60-second local fallback guard."
-                    );
-                    self.metrics.record_cloud_rate_limit(60);
+                let is_cloud_overload_or_unavailable = status == StatusCode::TOO_MANY_REQUESTS
+                    || status.as_u16() == 529
+                    || status == StatusCode::BAD_GATEWAY
+                    || status == StatusCode::SERVICE_UNAVAILABLE
+                    || status == StatusCode::GATEWAY_TIMEOUT;
+                if is_cloud_overload_or_unavailable {
+                    if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
+                        warn!(
+                            req_id = req_id,
+                            status = status.as_u16(),
+                            "Cloud provider returned HTTP {} (Rate Limit / Overloaded). Activating 60-second local fallback guard.",
+                            status.as_u16()
+                        );
+                        self.metrics.record_cloud_rate_limit(60);
+                    } else {
+                        warn!(
+                            req_id = req_id,
+                            status = status.as_u16(),
+                            "Cloud provider returned transient HTTP {} error; attempting in-flight local fallback.",
+                            status.as_u16()
+                        );
+                    }
 
                     // Zero-drop in-flight failover: Attempt local execution ONLY if Strata is healthy,
-                    // prompt fits local context (or after adaptive squeeze), and an actual LocalSlotGuard is acquired.
+                    // prompt fits local context (or after rolling compaction / adaptive squeeze), and an actual LocalSlotGuard is acquired.
                     if !is_failover
                         && decision.reason != "routing mode cloud-only"
                         && !self.metrics.is_circuit_open()
@@ -640,6 +726,18 @@ impl UpstreamClient {
                             crate::router::Router::estimate_tokens(&body)
                         };
                         let mut fallback_chars_saved = chars_saved;
+
+                        if est_tokens > max_context
+                            && self.config.condensation.enabled
+                            && self.config.condensation.rolling_compaction
+                        {
+                            let condenser = crate::condenser::ContextCondenser::new(self.config.condensation.clone());
+                            if let Some(compact_stats) = condenser.rolling_compact(&mut body) {
+                                fallback_chars_saved += compact_stats.chars_saved;
+                                self.metrics.record_rolling_compaction(compact_stats.chars_saved);
+                                est_tokens = crate::router::Router::estimate_tokens(&body);
+                            }
+                        }
 
                         if est_tokens > max_context && self.config.local.adaptive_squeezing {
                             let squeeze_limit = (max_context as f64 * self.config.local.adaptive_squeeze_ratio) as u64;
@@ -675,7 +773,13 @@ impl UpstreamClient {
                                         req_id = req_id,
                                         slot = slot_id,
                                         tokens = est_tokens,
-                                        "Failing over in-flight request to local Strata engine after Cloud HTTP 429"
+                                        status = status.as_u16(),
+                                        "Failing over in-flight request to local Strata engine after Cloud HTTP {}",
+                                        status.as_u16()
+                                    );
+                                    self.metrics.revert_cloud_request_for_local_fallback(
+                                        decision.est_tokens,
+                                        decision.is_spillover,
                                     );
                                     let slot_guard = crate::router::LocalSlotGuard::new(
                                         self.metrics.clone(),
@@ -687,7 +791,7 @@ impl UpstreamClient {
                                         target: TargetProvider::Local,
                                         est_tokens,
                                         is_spillover: false,
-                                        reason: format!("Failover from Cloud HTTP 429 (slot {slot_id})"),
+                                        reason: format!("Failover from Cloud HTTP {} (slot {slot_id})", status.as_u16()),
                                         local_only: true,
                                         slot_guard: Some(slot_guard),
                                         slot_id: Some(slot_id),
@@ -887,6 +991,7 @@ impl UpstreamClient {
         &self,
         req: reqwest::RequestBuilder,
         body: Value,
+        cloud_fallback: Option<(Value, usize, f64)>,
         decision: RouteDecision,
         guard: Option<crate::router::LocalSlotGuard>,
         mut meta: ResponseMeta,
@@ -1022,10 +1127,16 @@ impl UpstreamClient {
                     )
                         .into_response();
                 }
-                metrics.inc_failover();
-                metrics.inc_cloud(decision.est_tokens, false);
                 return self
-                    .dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key)
+                    .failover_local_to_cloud(
+                        body,
+                        cloud_fallback,
+                        decision,
+                        req_id,
+                        chars_saved,
+                        savings_pct,
+                        cache_key,
+                    )
                     .await;
             }
             Some(Err(err)) => {
@@ -1063,10 +1174,16 @@ impl UpstreamClient {
                     )
                         .into_response();
                 }
-                metrics.inc_failover();
-                metrics.inc_cloud(decision.est_tokens, false);
                 return self
-                    .dispatch_cloud(body, decision, req_id, true, chars_saved, savings_pct, cache_key)
+                    .failover_local_to_cloud(
+                        body,
+                        cloud_fallback,
+                        decision,
+                        req_id,
+                        chars_saved,
+                        savings_pct,
+                        cache_key,
+                    )
                     .await;
             }
             None => {
@@ -1649,6 +1766,46 @@ fn tool_choice_requires_tool(req_body: &Value) -> bool {
     }
 }
 
+pub fn strip_think_blocks(s: &str) -> String {
+    let mut out = s.to_string();
+    while let Some(start) = out.find("<think>") {
+        if let Some(end_rel) = out[start..].find("</think>") {
+            let end = start + end_rel + "</think>".len();
+            out.replace_range(start..end, "");
+        } else {
+            out.truncate(start);
+            break;
+        }
+    }
+    while let Some(close_idx) = out.find("</think>") {
+        out.replace_range(..close_idx + "</think>".len(), "");
+    }
+    out
+}
+
+fn extract_assistant_content_str(message: &Value) -> String {
+    if let Some(s) = message.get("content").and_then(|c| c.as_str()) {
+        return s.to_string();
+    }
+    if let Some(parts) = message.get("content").and_then(|c| c.as_array()) {
+        let mut buf = String::new();
+        for part in parts {
+            if let Some(t) = part
+                .get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| part.as_str())
+            {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(t);
+            }
+        }
+        return buf;
+    }
+    String::new()
+}
+
 pub fn inspect_and_repair_local_tool_response(
     req_body: &Value,
     resp_bytes: &[u8],
@@ -1720,29 +1877,67 @@ pub fn inspect_and_repair_local_tool_response(
         return LocalToolInspection::ValidUnchanged;
     }
 
-    let content_str = message
-        .get("content")
-        .and_then(|c| c.as_str())
+    let raw_content_str = extract_assistant_content_str(message);
+    let visible_content = strip_think_blocks(&raw_content_str);
+    let reasoning_str = message
+        .get("reasoning_content")
+        .and_then(|r| r.as_str())
         .unwrap_or("")
         .to_string();
 
     // Step 1: In-place Qwen XML / JSON <tool_call> recovery when structured tool_calls are missing/empty
-    if !has_existing_tool_calls && content_str.contains("<tool_call>") {
-        if let Some((recovered_calls, cleaned_content)) =
-            try_recover_xml_tool_calls(&content_str, req_body, &declared_tools)
-        {
-            if let Some(msg_obj) = message.as_object_mut() {
-                msg_obj.insert("tool_calls".to_string(), Value::Array(recovered_calls));
-                msg_obj.insert("content".to_string(), Value::String(cleaned_content));
+    if !has_existing_tool_calls {
+        if visible_content.contains("<tool_call>") {
+            if let Some((recovered_calls, cleaned_content)) =
+                try_recover_xml_tool_calls(&visible_content, req_body, &declared_tools)
+            {
+                if let Some(msg_obj) = message.as_object_mut() {
+                    msg_obj.insert("tool_calls".to_string(), Value::Array(recovered_calls));
+                    msg_obj.insert("content".to_string(), Value::String(cleaned_content));
+                }
+                if let Some(choice_obj) = choice0.as_object_mut() {
+                    choice_obj.insert(
+                        "finish_reason".to_string(),
+                        Value::String("tool_calls".to_string()),
+                    );
+                }
+                if let Ok(repaired_vec) = serde_json::to_vec(&resp_json) {
+                    return LocalToolInspection::Repaired(bytes::Bytes::from(repaired_vec));
+                }
             }
-            if let Some(choice_obj) = choice0.as_object_mut() {
-                choice_obj.insert(
-                    "finish_reason".to_string(),
-                    Value::String("tool_calls".to_string()),
-                );
-            }
-            if let Ok(repaired_vec) = serde_json::to_vec(&resp_json) {
-                return LocalToolInspection::Repaired(bytes::Bytes::from(repaired_vec));
+        } else if let Some(tc_idx) = reasoning_str.find("<tool_call>") {
+            let reasoning_prefix = reasoning_str[..tc_idx].trim_end().to_string();
+            let reasoning_tc_slice = &reasoning_str[tc_idx..];
+            if let Some((recovered_calls, cleaned_tail)) =
+                try_recover_xml_tool_calls(reasoning_tc_slice, req_body, &declared_tools)
+            {
+                let updated_reasoning = if cleaned_tail.is_empty() {
+                    reasoning_prefix
+                } else if reasoning_prefix.is_empty() {
+                    cleaned_tail
+                } else {
+                    format!("{reasoning_prefix}\n{cleaned_tail}")
+                };
+                if let Some(msg_obj) = message.as_object_mut() {
+                    msg_obj.insert("tool_calls".to_string(), Value::Array(recovered_calls));
+                    msg_obj.insert(
+                        "reasoning_content".to_string(),
+                        Value::String(updated_reasoning),
+                    );
+                    msg_obj.insert(
+                        "content".to_string(),
+                        Value::String(visible_content.trim().to_string()),
+                    );
+                }
+                if let Some(choice_obj) = choice0.as_object_mut() {
+                    choice_obj.insert(
+                        "finish_reason".to_string(),
+                        Value::String("tool_calls".to_string()),
+                    );
+                }
+                if let Ok(repaired_vec) = serde_json::to_vec(&resp_json) {
+                    return LocalToolInspection::Repaired(bytes::Bytes::from(repaired_vec));
+                }
             }
         }
     }
@@ -1755,9 +1950,10 @@ pub fn inspect_and_repair_local_tool_response(
         };
     }
 
-    if content_str.contains("<tool_call")
-        || content_str.contains("</tool_call>")
-        || content_str.contains("<function=")
+    if visible_content.contains("<tool_call")
+        || visible_content.contains("</tool_call>")
+        || visible_content.contains("<function=")
+        || reasoning_str.contains("<tool_call")
     {
         return LocalToolInspection::FailoverRequired {
             reason: "local response contains unparsed or malformed <tool_call>/<function=> tag in content"
@@ -1765,7 +1961,7 @@ pub fn inspect_and_repair_local_tool_response(
         };
     }
 
-    if content_str.trim().is_empty() && !has_existing_tool_calls {
+    if visible_content.trim().is_empty() && !has_existing_tool_calls {
         return LocalToolInspection::FailoverRequired {
             reason: "local response returned empty content and empty tool_calls on tool-enabled turn"
                 .to_string(),
@@ -2074,6 +2270,187 @@ mod tests {
             matches!(outcome, LocalToolInspection::FailoverRequired { .. }),
             "Native tool_calls with truncated JSON arguments must trigger Cloud failover, got: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn test_think_tags_reasoning_content_and_array_content_tool_recovery() {
+        let req_body = json!({
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "execute_bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        // 1. `<think>` block mentioning `<function=undeclared_tool>` before a real `<tool_call>`
+        let think_plus_tool_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>I should not use <function=undeclared_tool> here, I will use execute_bash.</think>\nRunning check:\n<tool_call>\n<function=execute_bash>\n<parameter=command>id</parameter>\n</function>\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let outcome1 = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&think_plus_tool_resp).unwrap(),
+        );
+        let LocalToolInspection::Repaired(bytes1) = outcome1 else {
+            panic!("Expected Repaired when <think> mentions <function=...>, got: {outcome1:?}");
+        };
+        let repaired1: Value = serde_json::from_slice(&bytes1).unwrap();
+        assert_eq!(
+            repaired1["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "execute_bash"
+        );
+        assert_eq!(repaired1["choices"][0]["message"]["content"], "Running check:");
+
+        // 2. `<think>...</think>`-only response with no visible content and no tool_calls triggers FailoverRequired
+        let think_only_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>Thinking about the next step but ran out of budget...</think>"
+                },
+                "finish_reason": "length"
+            }]
+        });
+        assert!(matches!(
+            inspect_and_repair_local_tool_response(
+                &req_body,
+                &serde_json::to_vec(&think_only_resp).unwrap()
+            ),
+            LocalToolInspection::FailoverRequired { .. }
+        ));
+
+        // 3. Array-of-parts `message.content` containing `<tool_call>`
+        let array_parts_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Checking files:" },
+                        { "type": "text", "text": "<tool_call>\n<function=execute_bash>\n<parameter=command>ls</parameter>\n</function>\n</tool_call>" }
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let outcome3 = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&array_parts_resp).unwrap(),
+        );
+        assert!(matches!(outcome3, LocalToolInspection::Repaired(_)));
+
+        // 4. `<tool_call>` emitted inside `reasoning_content` when `content` is empty/null
+        let reasoning_tc_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "I need to run whoami.\n<tool_call>\n<function=execute_bash>\n<parameter=command>whoami</parameter>\n</function>\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let outcome4 = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&reasoning_tc_resp).unwrap(),
+        );
+        let LocalToolInspection::Repaired(bytes4) = outcome4 else {
+            panic!("Expected Repaired from reasoning_content <tool_call>, got: {outcome4:?}");
+        };
+        let repaired4: Value = serde_json::from_slice(&bytes4).unwrap();
+        assert_eq!(
+            repaired4["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "execute_bash"
+        );
+        assert_eq!(
+            repaired4["choices"][0]["message"]["reasoning_content"],
+            "I need to run whoami."
+        );
+        assert_eq!(repaired4["choices"][0]["message"]["content"], "");
+
+        // 5. Orphaned `</think>` prefix (when chat template injects opening `<think>` in prompt)
+        let send_msg_req = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "send_message" } }
+            ]
+        });
+        let orphan_close_think_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Thinking about calling <function=foo>...</think>\n<tool_call>\n<function=send_message>\n<parameter=target_agent_id>a1</parameter>\n<parameter=message>hi</parameter>\n</function>\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let outcome5 = inspect_and_repair_local_tool_response(
+            &send_msg_req,
+            &serde_json::to_vec(&orphan_close_think_resp).unwrap(),
+        );
+        let LocalToolInspection::Repaired(bytes5) = outcome5 else {
+            panic!("Expected Repaired on orphaned </think> prefix, got: {outcome5:?}");
+        };
+        let repaired5: Value = serde_json::from_slice(&bytes5).unwrap();
+        assert_eq!(
+            repaired5["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "send_message"
+        );
+        assert_eq!(repaired5["choices"][0]["message"]["content"], "");
+    }
+
+    #[test]
+    fn test_failover_metrics_do_not_double_count_requests_or_tokens() {
+        let tracker = crate::stats::MetricsTracker::new();
+
+        // 1. Local -> Cloud failover: initial local 500 tokens, fails over to Cloud with 800 tokens (uncompacted)
+        tracker.record_local_request_stats(500);
+        assert_eq!(tracker.total_requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(tracker.local_requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(tracker.total_tokens_est.load(std::sync::atomic::Ordering::Relaxed), 500);
+
+        tracker.record_local_to_cloud_failover(500, 800);
+        let snap1 = tracker.snapshot();
+        assert_eq!(snap1.total_requests, 1, "total_requests must not be double-counted on Local->Cloud failover");
+        assert_eq!(snap1.local_requests, 0);
+        assert_eq!(snap1.cloud_requests, 1);
+        assert_eq!(snap1.failover_requests, 1);
+        assert_eq!(snap1.local_tokens_est, 0);
+        assert_eq!(snap1.cloud_tokens_est, 800);
+        assert_eq!(snap1.total_tokens_est, 800);
+
+        // 2. Cloud -> Local fallback: initial cloud 1000 tokens (spillover), reverts and dispatches local 400 tokens
+        tracker.inc_cloud(1000, true);
+        assert_eq!(tracker.total_requests.load(std::sync::atomic::Ordering::Relaxed), 2);
+        tracker.revert_cloud_request_for_local_fallback(1000, true);
+        tracker.record_local_request_stats(400);
+
+        let snap2 = tracker.snapshot();
+        assert_eq!(snap2.total_requests, 2, "total_requests must not be double-counted on Cloud->Local fallback");
+        assert_eq!(snap2.local_requests, 1);
+        assert_eq!(snap2.cloud_requests, 1);
+        assert_eq!(snap2.spillover_requests, 0);
+        assert_eq!(snap2.failover_requests, 2);
+        assert_eq!(snap2.local_tokens_est, 400);
+        assert_eq!(snap2.cloud_tokens_est, 800);
+        assert_eq!(snap2.total_tokens_est, 1200);
     }
 }
 

@@ -233,9 +233,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_body_bytes = std::env::var("FERRY_MAX_BODY_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32 * 1024 * 1024);
+        .unwrap_or(64 * 1024 * 1024);
 
-    let app = Router::new()
+    let app = build_router(state, max_body_bytes);
+
+    let bind_addr = &config.server.bind;
+    info!(bind = %bind_addr, "Starting Ferry server");
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+fn build_router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
+    Router::new()
         // Universal endpoints
         .route("/health", get(health_handler))
         .route("/stats", get(stats_handler))
@@ -256,14 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(chat_completions_handler).options(cors_options_handler),
         )
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
-        .with_state(state);
-
-    let bind_addr = &config.server.bind;
-    info!(bind = %bind_addr, "Starting Ferry server");
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        .with_state(state)
 }
 
 async fn cors_options_handler() -> impl IntoResponse {
@@ -670,9 +674,25 @@ async fn chat_completions_handler(
         || requested_cloud_model
         || precomputed_hard_logic.as_ref().map(|(is_hard, _)| *is_hard).unwrap_or(false);
 
+    // Preserve post-`condense()` body before local-only `rolling_compact` / `adaptive_squeeze`
+    // so Cloud spillover and Cloud failover always receive uncompacted full-fidelity history.
+    let base_chars_saved = cond_stats.chars_saved;
+    let base_savings_pct = if cond_stats.orig_chars > 0 && base_chars_saved > 0 {
+        (base_chars_saved as f64 / cond_stats.orig_chars as f64) * 100.0
+    } else {
+        0.0
+    };
+    let mut cloud_fidelity_body: Option<Value> = None;
+
     // Rolling context compaction when context exceeds compact_threshold_tokens (local targets only when condensation is enabled):
-    if condense_enabled && !is_cloud_target && state.config.condensation.rolling_compaction {
+    if condense_enabled
+        && !is_cloud_target
+        && state.config.condensation.rolling_compaction
+        && state.condenser.would_rolling_compact(&body)
+    {
+        let snapshot = body.clone();
         if let Some(compact_stats) = state.condenser.rolling_compact(&mut body) {
+            cloud_fidelity_body = Some(snapshot);
             total_chars_saved += compact_stats.chars_saved;
             state.metrics.record_rolling_compaction(compact_stats.chars_saved);
             tracing::info!(
@@ -697,7 +717,15 @@ async fn chat_completions_handler(
             let est_tokens = ferry::router::Router::estimate_tokens(&body);
             precomputed_tokens = Some(est_tokens);
             if est_tokens > max_context && est_tokens <= (max_context as f64 * squeeze_ratio) as u64 {
+                let snapshot = if cloud_fidelity_body.is_none() {
+                    Some(body.clone())
+                } else {
+                    None
+                };
                 if let Some(extra_saved) = state.condenser.adaptive_squeeze(&mut body, max_context) {
+                    if cloud_fidelity_body.is_none() {
+                        cloud_fidelity_body = snapshot;
+                    }
                     total_chars_saved += extra_saved;
                     let new_tokens = ferry::router::Router::estimate_tokens(&body);
                     precomputed_tokens = Some(new_tokens);
@@ -716,13 +744,13 @@ async fn chat_completions_handler(
         }
     }
 
-    let savings_pct = if cond_stats.orig_chars > 0 && total_chars_saved > 0 {
+    let mut savings_pct = if cond_stats.orig_chars > 0 && total_chars_saved > 0 {
         (total_chars_saved as f64 / cond_stats.orig_chars as f64) * 100.0
     } else {
         0.0
     };
 
-    let decision = state
+    let mut decision = state
         .router
         .decide_for_session_with_hints(
             &body,
@@ -752,7 +780,30 @@ async fn chat_completions_handler(
         ).into_response();
     }
 
-    state.upstream.forward_chat(body, decision, req_id, total_chars_saved, savings_pct, cache_key).await
+    let cloud_fallback = if decision.target == ferry::router::TargetProvider::Cloud {
+        if let Some(uncompacted) = cloud_fidelity_body.take() {
+            decision.est_tokens = ferry::router::Router::estimate_tokens(&uncompacted);
+            body = uncompacted;
+            total_chars_saved = base_chars_saved;
+            savings_pct = base_savings_pct;
+        }
+        None
+    } else {
+        cloud_fidelity_body.map(|uncompacted| (uncompacted, base_chars_saved, base_savings_pct))
+    };
+
+    state
+        .upstream
+        .forward_chat_with_cloud_fallback(
+            body,
+            cloud_fallback,
+            decision,
+            req_id,
+            total_chars_saved,
+            savings_pct,
+            cache_key,
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -926,5 +977,166 @@ mod tests {
             Some("HIT")
         );
         assert_eq!(metrics.loop_nudges_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_router_accepts_large_payload_and_preserves_cloud_fidelity_on_failover() {
+        let local_captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let cloud_captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let lc = local_captured.clone();
+        let local_app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(payload): Json<Value>| {
+                    let lc = lc.clone();
+                    async move {
+                        lc.lock().await.push(payload);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": "local failure triggers failover" })),
+                        )
+                    }
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+
+        let cc = cloud_captured.clone();
+        let cloud_app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(payload): Json<Value>| {
+                    let cc = cc.clone();
+                    async move {
+                        cc.fetch_or_push(payload).await;
+                        Json(json!({
+                            "id": "chatcmpl-cloud",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "cloud recovered" },
+                                "finish_reason": "stop"
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+
+        trait PushExt {
+            async fn fetch_or_push(&self, val: Value);
+        }
+        impl PushExt for Arc<Mutex<Vec<Value>>> {
+            async fn fetch_or_push(&self, val: Value) {
+                self.lock().await.push(val);
+            }
+        }
+
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(local_listener, local_app).await;
+        });
+
+        let cloud_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud_addr = cloud_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(cloud_listener, cloud_app).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", local_addr);
+        cfg.cloud.api_base = format!("http://{}/v1", cloud_addr);
+        cfg.routing.default_route = "local-preferred".to_string();
+        cfg.condensation.enabled = true;
+        cfg.condensation.rolling_compaction = true;
+        cfg.condensation.compact_threshold_tokens = 50;
+        cfg.condensation.compact_keep_recent_turns = 1;
+
+        let config = Arc::new(cfg);
+        let metrics = Arc::new(MetricsTracker::new());
+        let affinity = Arc::new(SessionAffinityTracker::with_idle_reclaim(true, 4, 60));
+        let router = HybridRouter::with_affinity(config.clone(), metrics.clone(), affinity);
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(false, 16, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics: metrics.clone(),
+            router,
+            condenser,
+            upstream,
+            cache,
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        let ferry_app = build_router(state, 64 * 1024 * 1024);
+        let ferry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ferry_addr = ferry_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(ferry_listener, ferry_app).await;
+        });
+
+        // Build a >2.2 MB request body with multiple historical turns so:
+        // 1. Axum's old 2 MB DefaultBodyLimit would have rejected it with HTTP 413,
+        // 2. Local receives the rolling-compacted messages,
+        // 3. When Local fails with 500 and fails over to Cloud, Cloud receives the UNCOMPACTED post-condense() messages!
+        let large_padding = "x".repeat(600_000);
+        let req_payload = json!({
+            "model": "ferry",
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "Security scanner system prompt" },
+                { "role": "user", "content": format!("Historical user turn 1: {large_padding}") },
+                { "role": "assistant", "content": format!("Historical assistant turn 1: {large_padding}") },
+                { "role": "user", "content": format!("Historical user turn 2: {large_padding}") },
+                { "role": "assistant", "content": format!("Historical assistant turn 2: {large_padding}") },
+                { "role": "user", "content": "Recent active user turn" },
+                { "role": "assistant", "content": "Recent active assistant turn" }
+            ]
+        });
+
+        let http_client = reqwest::Client::new();
+        let resp = http_client
+            .post(format!("http://{}/v1/chat/completions", ferry_addr))
+            .json(&req_payload)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK, "Expected >2MB payload to be accepted and fail over cleanly to Cloud");
+        assert_eq!(
+            resp.headers().get("x-ferry-provider").and_then(|v| v.to_str().ok()),
+            Some("cloud")
+        );
+        assert_eq!(
+            resp.headers().get("x-ferry-failover").and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+
+        let local_reqs = local_captured.lock().await;
+        let cloud_reqs = cloud_captured.lock().await;
+        assert_eq!(local_reqs.len(), 1);
+        assert_eq!(cloud_reqs.len(), 1);
+
+        let local_msgs = local_reqs[0]["messages"].as_array().unwrap();
+        let cloud_msgs = cloud_reqs[0]["messages"].as_array().unwrap();
+
+        // Local received rolling-compacted checkpoint (fewer messages than uncompacted 7)
+        assert!(
+            local_msgs.len() < cloud_msgs.len(),
+            "Local should receive rolling-compacted messages ({}) while Cloud failover receives uncompacted messages ({})",
+            local_msgs.len(),
+            cloud_msgs.len()
+        );
+        assert_eq!(cloud_msgs.len(), 7, "Cloud failover must preserve all 7 uncompacted turns");
+
+        // Verify metrics did not double-count total_requests
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_requests, 1);
+        assert_eq!(snap.local_requests, 0);
+        assert_eq!(snap.cloud_requests, 1);
+        assert_eq!(snap.failover_requests, 1);
     }
 }

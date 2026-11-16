@@ -346,6 +346,49 @@ impl MetricsTracker {
         self.failover_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Transitions an in-flight Local request to Cloud on failover without double-counting
+    /// `total_requests` or `total_tokens_est`.
+    pub fn record_local_to_cloud_failover(&self, local_tokens: u64, cloud_tokens: u64) {
+        self.failover_requests.fetch_add(1, Ordering::Relaxed);
+        Self::saturating_sub_u64(&self.local_requests, 1);
+        Self::saturating_sub_u64(&self.local_tokens_est, local_tokens);
+        self.cloud_requests.fetch_add(1, Ordering::Relaxed);
+        self.cloud_tokens_est.fetch_add(cloud_tokens, Ordering::Relaxed);
+        if cloud_tokens >= local_tokens {
+            self.total_tokens_est
+                .fetch_add(cloud_tokens - local_tokens, Ordering::Relaxed);
+        } else {
+            Self::saturating_sub_u64(&self.total_tokens_est, local_tokens - cloud_tokens);
+        }
+    }
+
+    /// Reverts the initial Cloud request accounting right before an in-flight Cloud 429/529/5xx
+    /// fallback dispatches into `forward_chat` (`TargetProvider::Local`), preventing double-counting.
+    pub fn revert_cloud_request_for_local_fallback(&self, cloud_tokens: u64, is_spillover: bool) {
+        self.failover_requests.fetch_add(1, Ordering::Relaxed);
+        Self::saturating_sub_u64(&self.total_requests, 1);
+        Self::saturating_sub_u64(&self.cloud_requests, 1);
+        Self::saturating_sub_u64(&self.total_tokens_est, cloud_tokens);
+        Self::saturating_sub_u64(&self.cloud_tokens_est, cloud_tokens);
+        if is_spillover {
+            Self::saturating_sub_u64(&self.spillover_requests, 1);
+        }
+    }
+
+    fn saturating_sub_u64(atom: &AtomicU64, val: u64) {
+        if val == 0 {
+            return;
+        }
+        let mut curr = atom.load(Ordering::Relaxed);
+        while curr > 0 {
+            let next = curr.saturating_sub(val);
+            match atom.compare_exchange_weak(curr, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => curr = actual,
+            }
+        }
+    }
+
     pub fn record_local_completion(&self, duration_ms: u128) {
         self.local_duration_ms.fetch_add(duration_ms as u64, Ordering::Relaxed);
         self.last_duration_ms.store(duration_ms as u64, Ordering::Relaxed);
