@@ -289,6 +289,81 @@ impl UpstreamClient {
                             affinity_type: decision.affinity_type,
                             session_id: decision.session_id.clone(),
                         };
+
+                        if !is_stream && !extract_declared_tools(&body).is_empty() {
+                            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+                            let headers = Self::build_response_headers(resp.headers(), &meta);
+                            drop(slot_guard);
+                            match resp.bytes().await {
+                                Ok(body_bytes) => {
+                                    match inspect_and_repair_local_tool_response(&body, &body_bytes) {
+                                        LocalToolInspection::ValidUnchanged => {
+                                            if let Some(key) = cache_key {
+                                                self.cache.set(key, body_bytes.clone(), status.as_u16(), vec![]).await;
+                                            }
+                                            return (status, headers, body_bytes).into_response();
+                                        }
+                                        LocalToolInspection::Repaired(repaired_bytes) => {
+                                            info!(
+                                                req_id = req_id,
+                                                "Recovered structured OpenAI tool_calls from local XML <tool_call> output"
+                                            );
+                                            if let Some(key) = cache_key {
+                                                self.cache.set(key, repaired_bytes.clone(), status.as_u16(), vec![]).await;
+                                            }
+                                            return (status, headers, repaired_bytes).into_response();
+                                        }
+                                        LocalToolInspection::FailoverRequired { reason } => {
+                                            if !decision.local_only {
+                                                warn!(
+                                                    req_id = req_id,
+                                                    reason = %reason,
+                                                    "Local tool-enabled turn returned invalid/missing tool_calls; failing over to Cloud"
+                                                );
+                                                self.metrics.inc_failover();
+                                                self.metrics.inc_cloud(decision.est_tokens, false);
+                                                return self
+                                                    .dispatch_cloud(
+                                                        body,
+                                                        decision,
+                                                        req_id,
+                                                        true,
+                                                        chars_saved,
+                                                        savings_pct,
+                                                        cache_key,
+                                                    )
+                                                    .await;
+                                            }
+                                            warn!(
+                                                req_id = req_id,
+                                                reason = %reason,
+                                                "Local tool-enabled turn returned invalid/missing tool_calls under local-only routing; returning uncached local response"
+                                            );
+                                            return (status, headers, body_bytes).into_response();
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(req_id = req_id, error = %err, "Failed reading local response body");
+                                    return (
+                                        StatusCode::BAD_GATEWAY,
+                                        [
+                                            ("access-control-allow-origin", "*"),
+                                            ("content-type", "application/json"),
+                                        ],
+                                        serde_json::json!({
+                                            "error": {
+                                                "message": format!("Failed reading upstream response body: {}", err),
+                                                "type": "upstream_error"
+                                            }
+                                        })
+                                        .to_string(),
+                                    )
+                                        .into_response();
+                                }
+                            }
+                        }
+
                         self.handle_upstream_response(resp, is_stream, slot_guard, meta, cache_key).await
                     }
                     Ok(resp) if resp.status().is_client_error() && resp.status() != StatusCode::TOO_MANY_REQUESTS => {
@@ -674,18 +749,13 @@ impl UpstreamClient {
         }
     }
 
-    async fn handle_upstream_response(
-        &self,
-        resp: reqwest::Response,
-        _is_stream: bool,
-        guard: Option<crate::router::LocalSlotGuard>,
-        meta: ResponseMeta,
-        cache_key: Option<String>,
-    ) -> Response {
-        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    fn build_response_headers(
+        upstream_headers: &reqwest::header::HeaderMap,
+        meta: &ResponseMeta,
+    ) -> HeaderMap {
         let mut headers = HeaderMap::new();
 
-        for (k, v) in resp.headers().iter() {
+        for (k, v) in upstream_headers.iter() {
             let key = k.as_str().to_lowercase();
             if key == "content-type" || key == "cache-control" {
                 if let (Ok(hname), Ok(hval)) = (
@@ -744,6 +814,20 @@ impl UpstreamClient {
             HeaderName::from_static("access-control-expose-headers"),
             HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache, x-ferry-slot, x-ferry-affinity, x-ferry-session-id"),
         );
+
+        headers
+    }
+
+    async fn handle_upstream_response(
+        &self,
+        resp: reqwest::Response,
+        _is_stream: bool,
+        guard: Option<crate::router::LocalSlotGuard>,
+        meta: ResponseMeta,
+        cache_key: Option<String>,
+    ) -> Response {
+        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+        let headers = Self::build_response_headers(resp.headers(), &meta);
 
         let is_sse = _is_stream
             || resp
@@ -1287,9 +1371,431 @@ pub fn transform_strata_chunk(bytes: bytes::Bytes) -> bytes::Bytes {
     }
 }
 
+pub const STRIX_LIFECYCLE_TOOLS: &[&str] = &[
+    "finish_scan",
+    "finish_agent",
+    "wait_for_message",
+    "create_vulnerability_report",
+    "record_coverage",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalToolInspection {
+    ValidUnchanged,
+    Repaired(bytes::Bytes),
+    FailoverRequired { reason: String },
+}
+
+pub fn extract_declared_tools(req_body: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(tools) = req_body.get("tools").and_then(|t| t.as_array()) {
+        for tool in tools {
+            if let Some(name) = tool
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .or_else(|| tool.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_valid_tool_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+fn declared_param_type<'a>(req_body: &'a Value, func_name: &str, param_name: &str) -> Option<&'a str> {
+    let tools = req_body.get("tools")?.as_array()?;
+    for tool in tools {
+        let f = tool.get("function").unwrap_or(tool);
+        if f.get("name").and_then(|n| n.as_str()) == Some(func_name) {
+            return f
+                .get("parameters")
+                .and_then(|p| p.get("properties"))
+                .and_then(|props| props.get(param_name))
+                .and_then(|prop| prop.get("type"))
+                .and_then(|t| t.as_str());
+        }
+    }
+    None
+}
+
+fn coerce_xml_param_value(raw_val: &str, expected_type: Option<&str>) -> Value {
+    let clean = raw_val
+        .strip_prefix("\r\n")
+        .or_else(|| raw_val.strip_prefix('\n'))
+        .unwrap_or(raw_val);
+    let clean = clean
+        .strip_suffix("\r\n")
+        .or_else(|| clean.strip_suffix('\n'))
+        .unwrap_or(clean);
+
+    if expected_type == Some("string") {
+        return Value::String(clean.to_string());
+    }
+
+    let trimmed = clean.trim();
+    match expected_type {
+        Some("boolean") => match trimmed {
+            "true" => return Value::Bool(true),
+            "false" => return Value::Bool(false),
+            _ => {}
+        },
+        Some("integer") => {
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return Value::Number(i.into());
+            }
+        }
+        Some("number") => {
+            if let Ok(f) = trimmed.parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(f) {
+                    return Value::Number(num);
+                }
+            }
+        }
+        Some("array" | "object") => {
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                return v;
+            }
+        }
+        _ => {
+            if trimmed == "true" {
+                return Value::Bool(true);
+            }
+            if trimmed == "false" {
+                return Value::Bool(false);
+            }
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return Value::Number(i.into());
+            }
+            if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            {
+                if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                    return v;
+                }
+            }
+        }
+    }
+
+    Value::String(clean.to_string())
+}
+
+fn parse_single_xml_tool_call_block(
+    inner: &str,
+    req_body: &Value,
+    declared_tools: &[String],
+) -> Option<(String, String)> {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() || trimmed.contains("<tool_call") || trimmed.contains("</tool_call>") {
+        return None;
+    }
+
+    // Format 1: JSON-in-XML: `<tool_call>{"name": "...", "arguments": ...}</tool_call>`
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let val = serde_json::from_str::<Value>(trimmed).ok()?;
+        let name = val
+            .get("name")
+            .or_else(|| val.get("function"))
+            .and_then(|v| v.as_str())?
+            .trim();
+        if !is_valid_tool_identifier(name) {
+            return None;
+        }
+        if !declared_tools.is_empty() && !declared_tools.iter().any(|d| d == name) {
+            return None;
+        }
+        let args_str = match val.get("arguments").or_else(|| val.get("parameters")) {
+            Some(Value::String(s)) => {
+                serde_json::from_str::<Value>(s).ok()?;
+                s.clone()
+            }
+            Some(v @ Value::Object(_)) => serde_json::to_string(v).ok()?,
+            None => "{}".to_string(),
+            _ => return None,
+        };
+        return Some((name.to_string(), args_str));
+    }
+
+    // Format 2: Qwen3 XML: `<function=NAME> ... (<parameter=K>V</parameter>)* ... </function>`
+    let after_fn = trimmed.strip_prefix("<function=")?;
+    let gt_idx = after_fn.find('>')?;
+    let func_name = after_fn[..gt_idx].trim();
+    if !is_valid_tool_identifier(func_name) {
+        return None;
+    }
+    if !declared_tools.is_empty() && !declared_tools.iter().any(|d| d == func_name) {
+        return None;
+    }
+
+    let mut body_part = after_fn[gt_idx + 1..].trim();
+    if let Some(stripped) = body_part.strip_suffix("</function>") {
+        body_part = stripped.trim();
+    }
+    if body_part.contains("<function=") || body_part.contains("</function>") {
+        return None;
+    }
+
+    let mut args_map = serde_json::Map::new();
+    let mut p_pos = 0;
+    while p_pos < body_part.len() {
+        let rem = &body_part[p_pos..];
+        let trimmed_rem = rem.trim_start();
+        p_pos += rem.len() - trimmed_rem.len();
+        if p_pos >= body_part.len() {
+            break;
+        }
+
+        let after_param = body_part[p_pos..].strip_prefix("<parameter=")?;
+        let p_gt = after_param.find('>')?;
+        let param_name = after_param[..p_gt].trim();
+        if !is_valid_tool_identifier(param_name) {
+            return None;
+        }
+
+        let val_start = p_pos + "<parameter=".len() + p_gt + 1;
+        let val_end_rel = body_part[val_start..].find("</parameter>")?;
+        let raw_val = &body_part[val_start..val_start + val_end_rel];
+        if raw_val.contains("<parameter=") {
+            return None;
+        }
+
+        let expected_type = declared_param_type(req_body, func_name, param_name);
+        let coerced = coerce_xml_param_value(raw_val, expected_type);
+        args_map.insert(param_name.to_string(), coerced);
+
+        p_pos = val_start + val_end_rel + "</parameter>".len();
+    }
+
+    let args_str = serde_json::to_string(&Value::Object(args_map)).ok()?;
+    Some((func_name.to_string(), args_str))
+}
+
+fn try_recover_xml_tool_calls(
+    content: &str,
+    req_body: &Value,
+    declared_tools: &[String],
+) -> Option<(Vec<Value>, String)> {
+    if !content.contains("<tool_call>") {
+        return None;
+    }
+
+    let mut cleaned_content = String::new();
+    let mut recovered_calls = Vec::new();
+    let mut pos = 0;
+
+    while let Some(rel_start) = content[pos..].find("<tool_call>") {
+        let block_start = pos + rel_start;
+        cleaned_content.push_str(&content[pos..block_start]);
+
+        let inner_start = block_start + "<tool_call>".len();
+        let rel_end = content[inner_start..].find("</tool_call>")?;
+        let block_end = inner_start + rel_end;
+        let inner = &content[inner_start..block_end];
+
+        let (func_name, args_json_str) =
+            parse_single_xml_tool_call_block(inner, req_body, declared_tools)?;
+        let idx = recovered_calls.len();
+        recovered_calls.push(serde_json::json!({
+            "id": format!("call_ferry_{idx}"),
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": args_json_str
+            }
+        }));
+
+        pos = block_end + "</tool_call>".len();
+    }
+
+    cleaned_content.push_str(&content[pos..]);
+
+    if recovered_calls.is_empty()
+        || cleaned_content.contains("<tool_call")
+        || cleaned_content.contains("</tool_call>")
+        || cleaned_content.contains("<function=")
+        || cleaned_content.contains("</function>")
+    {
+        return None;
+    }
+
+    Some((recovered_calls, cleaned_content.trim().to_string()))
+}
+
+fn tool_choice_is_none(req_body: &Value) -> bool {
+    matches!(
+        req_body
+            .get("tool_choice")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("none")
+    )
+}
+
+fn tool_choice_requires_tool(req_body: &Value) -> bool {
+    match req_body.get("tool_choice") {
+        Some(Value::String(s)) => matches!(s.trim().to_ascii_lowercase().as_str(), "required" | "any"),
+        Some(Value::Object(_)) => true,
+        _ => false,
+    }
+}
+
+pub fn inspect_and_repair_local_tool_response(
+    req_body: &Value,
+    resp_bytes: &[u8],
+) -> LocalToolInspection {
+    if tool_choice_is_none(req_body) {
+        return LocalToolInspection::ValidUnchanged;
+    }
+
+    let declared_tools = extract_declared_tools(req_body);
+    if declared_tools.is_empty() {
+        return LocalToolInspection::ValidUnchanged;
+    }
+
+    let Ok(mut resp_json) = serde_json::from_slice::<Value>(resp_bytes) else {
+        return LocalToolInspection::ValidUnchanged;
+    };
+
+    let Some(choice0) = resp_json
+        .get_mut("choices")
+        .and_then(|c| c.as_array_mut())
+        .and_then(|arr| arr.first_mut())
+    else {
+        return LocalToolInspection::ValidUnchanged;
+    };
+
+    let Some(message) = choice0.get_mut("message") else {
+        return LocalToolInspection::ValidUnchanged;
+    };
+
+    let has_existing_tool_calls = message
+        .get("tool_calls")
+        .and_then(|tc| tc.as_array())
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+
+    let existing_tool_calls_valid = message
+        .get("tool_calls")
+        .and_then(|tc| tc.as_array())
+        .map(|arr| {
+            !arr.is_empty()
+                && arr.iter().all(|call| {
+                    let name = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .or_else(|| call.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let args_valid = match call
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .or_else(|| call.get("arguments"))
+                    {
+                        Some(Value::Object(_)) => true,
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                            .ok()
+                            .map(|v| v.is_object())
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    is_valid_tool_identifier(name)
+                        && declared_tools.iter().any(|d| d == name)
+                        && args_valid
+                })
+        })
+        .unwrap_or(false);
+
+    if existing_tool_calls_valid {
+        return LocalToolInspection::ValidUnchanged;
+    }
+
+    let content_str = message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Step 1: In-place Qwen XML / JSON <tool_call> recovery when structured tool_calls are missing/empty
+    if !has_existing_tool_calls && content_str.contains("<tool_call>") {
+        if let Some((recovered_calls, cleaned_content)) =
+            try_recover_xml_tool_calls(&content_str, req_body, &declared_tools)
+        {
+            if let Some(msg_obj) = message.as_object_mut() {
+                msg_obj.insert("tool_calls".to_string(), Value::Array(recovered_calls));
+                msg_obj.insert("content".to_string(), Value::String(cleaned_content));
+            }
+            if let Some(choice_obj) = choice0.as_object_mut() {
+                choice_obj.insert(
+                    "finish_reason".to_string(),
+                    Value::String("tool_calls".to_string()),
+                );
+            }
+            if let Ok(repaired_vec) = serde_json::to_vec(&resp_json) {
+                return LocalToolInspection::Repaired(bytes::Bytes::from(repaired_vec));
+            }
+        }
+    }
+
+    // Step 2: Failover to Cloud on invalid/missing tool_calls when a tool call is mandatory
+    if has_existing_tool_calls && !existing_tool_calls_valid {
+        return LocalToolInspection::FailoverRequired {
+            reason: "local response contains undeclared/malformed tool_calls function name or invalid JSON arguments"
+                .to_string(),
+        };
+    }
+
+    if content_str.contains("<tool_call")
+        || content_str.contains("</tool_call>")
+        || content_str.contains("<function=")
+    {
+        return LocalToolInspection::FailoverRequired {
+            reason: "local response contains unparsed or malformed <tool_call>/<function=> tag in content"
+                .to_string(),
+        };
+    }
+
+    if content_str.trim().is_empty() && !has_existing_tool_calls {
+        return LocalToolInspection::FailoverRequired {
+            reason: "local response returned empty content and empty tool_calls on tool-enabled turn"
+                .to_string(),
+        };
+    }
+
+    if tool_choice_requires_tool(req_body) {
+        return LocalToolInspection::FailoverRequired {
+            reason: "local response omitted tool_calls when tool_choice requires a tool".to_string(),
+        };
+    }
+
+    if let Some(lifecycle_tool) = declared_tools
+        .iter()
+        .find(|d| STRIX_LIFECYCLE_TOOLS.contains(&d.as_str()))
+    {
+        return LocalToolInspection::FailoverRequired {
+            reason: format!(
+                "local response emitted text-only completion without tool_calls on Strix lifecycle turn ('{lifecycle_tool}')"
+            ),
+        };
+    }
+
+    LocalToolInspection::ValidUnchanged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_zero_allocation_keepalive_and_done() {
@@ -1308,6 +1814,266 @@ mod tests {
         let data_chunk = bytes::Bytes::from("data: {\"choices\":[]}\n\n");
         let untransformed = transform_strata_chunk(data_chunk.clone());
         assert_eq!(untransformed, data_chunk);
+    }
+
+    #[test]
+    fn test_recover_qwen_xml_tool_call_single_and_multi_parameter() {
+        let req_body = json!({
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "execute_bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": { "type": "string" },
+                                "timeout": { "type": "integer" }
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "finish_scan"
+                    }
+                }
+            ]
+        });
+
+        let resp_body = json!({
+            "id": "chatcmpl-123",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me run a quick check first.\n<tool_call>\n<function=execute_bash>\n<parameter=command>\ncurl -s http://localhost:3000/api/health\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let outcome = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&resp_body).unwrap(),
+        );
+        let LocalToolInspection::Repaired(repaired_bytes) = outcome else {
+            panic!("Expected Repaired outcome, got: {outcome:?}");
+        };
+
+        let repaired: Value = serde_json::from_slice(&repaired_bytes).unwrap();
+        assert_eq!(repaired["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            repaired["choices"][0]["message"]["content"],
+            "Let me run a quick check first."
+        );
+        let tcs = repaired["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0]["function"]["name"], "execute_bash");
+        let args: Value =
+            serde_json::from_str(tcs[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["command"], "curl -s http://localhost:3000/api/health");
+        assert_eq!(args["timeout"], 30);
+    }
+
+    #[test]
+    fn test_recover_json_in_xml_tool_call() {
+        let req_body = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "finish_scan" } }
+            ]
+        });
+
+        let resp_body = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>\n{\"name\": \"finish_scan\", \"arguments\": {\"summary\": \"All checks complete\"}}\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let outcome = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&resp_body).unwrap(),
+        );
+        let LocalToolInspection::Repaired(repaired_bytes) = outcome else {
+            panic!("Expected Repaired outcome, got: {outcome:?}");
+        };
+
+        let repaired: Value = serde_json::from_slice(&repaired_bytes).unwrap();
+        assert_eq!(repaired["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(repaired["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            repaired["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "finish_scan"
+        );
+    }
+
+    #[test]
+    fn test_malformed_or_truncated_tool_call_triggers_cloud_failover() {
+        let req_body = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "send_message" } }
+            ]
+        });
+
+        // 1. Malformed `<function=send_message_to=message>`
+        let malformed_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>\n<function=send_message_to=message>\n<parameter=text>hello</parameter>\n</function>\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(matches!(
+            inspect_and_repair_local_tool_response(
+                &req_body,
+                &serde_json::to_vec(&malformed_resp).unwrap()
+            ),
+            LocalToolInspection::FailoverRequired { .. }
+        ));
+
+        // 2. Truncated `<tool_call>` without closing `</tool_call>`
+        let truncated_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>\n<function=send_message>\n<parameter=text>cut off mid stream"
+                },
+                "finish_reason": "length"
+            }]
+        });
+        assert!(matches!(
+            inspect_and_repair_local_tool_response(
+                &req_body,
+                &serde_json::to_vec(&truncated_resp).unwrap()
+            ),
+            LocalToolInspection::FailoverRequired { .. }
+        ));
+
+        // 3. Empty `content` + empty `tool_calls`
+        let empty_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "   \n  ",
+                    "reasoning_content": "Thinking about calling a tool..."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(matches!(
+            inspect_and_repair_local_tool_response(
+                &req_body,
+                &serde_json::to_vec(&empty_resp).unwrap()
+            ),
+            LocalToolInspection::FailoverRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn test_text_only_response_with_finish_scan_triggers_failover_but_normal_tools_do_not() {
+        // When `finish_scan` is in `tools`, a text-only response without `tool_calls` would cause
+        // `strix.core.runner` to abort with `ended without calling finish_scan` -> must failover!
+        let strix_req = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "execute_bash" } },
+                { "type": "function", "function": { "name": "finish_scan" } }
+            ]
+        });
+        let text_only_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "I have completed the scan and verified all endpoints."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let strix_outcome = inspect_and_repair_local_tool_response(
+            &strix_req,
+            &serde_json::to_vec(&text_only_resp).unwrap(),
+        );
+        assert!(
+            matches!(strix_outcome, LocalToolInspection::FailoverRequired { .. }),
+            "Text-only response when finish_scan is declared must trigger Cloud failover, got: {strix_outcome:?}"
+        );
+
+        // When no lifecycle tools are present and `tool_choice` is not required, a normal text response stays local.
+        let standard_req = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "read_file" } },
+                { "type": "function", "function": { "name": "execute_bash" } }
+            ]
+        });
+        let standard_outcome = inspect_and_repair_local_tool_response(
+            &standard_req,
+            &serde_json::to_vec(&text_only_resp).unwrap(),
+        );
+        assert_eq!(standard_outcome, LocalToolInspection::ValidUnchanged);
+
+        // When `tool_choice` is explicitly `"none"`, text-only responses must NOT failover even if lifecycle tools are in `tools`.
+        let strix_tool_choice_none_req = json!({
+            "tool_choice": "none",
+            "tools": [
+                { "type": "function", "function": { "name": "execute_bash" } },
+                { "type": "function", "function": { "name": "finish_scan" } }
+            ]
+        });
+        let none_outcome = inspect_and_repair_local_tool_response(
+            &strix_tool_choice_none_req,
+            &serde_json::to_vec(&text_only_resp).unwrap(),
+        );
+        assert_eq!(none_outcome, LocalToolInspection::ValidUnchanged);
+    }
+
+    #[test]
+    fn test_native_tool_calls_with_truncated_or_malformed_json_arguments_triggers_failover() {
+        let req_body = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "execute_bash" } }
+            ]
+        });
+
+        let truncated_args_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "execute_bash",
+                            "arguments": "{\"command\": \"curl -s http://localhost:3000/api/items"
+                        }
+                    }]
+                },
+                "finish_reason": "length"
+            }]
+        });
+
+        let outcome = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&truncated_args_resp).unwrap(),
+        );
+        assert!(
+            matches!(outcome, LocalToolInspection::FailoverRequired { .. }),
+            "Native tool_calls with truncated JSON arguments must trigger Cloud failover, got: {outcome:?}"
+        );
     }
 }
 

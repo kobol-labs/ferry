@@ -31,6 +31,17 @@ pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
     "failed (",
     "build failed",
     "compilation failed",
+    "sql syntax",
+    "sqlite3.",
+    "syntax error at or near",
+    "syntax error near",
+    "unterminated quoted string",
+    "unterminated quotation",
+    "permission denied for",
+    "row-level security",
+    "security definer",
+    "operator does not exist",
+    "invalid input syntax for type",
 ];
 
 pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
@@ -728,6 +739,24 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
                 return (true, format!("complex stack trace ({lines} lines) in tool output"));
             }
 
+            let text_lower = text.to_lowercase();
+            if matches!(
+                tool_name.as_str(),
+                "wait_for_message"
+                    | "list_reports"
+                    | "create_vulnerability_report"
+                    | "finish_agent"
+                    | "finish_scan"
+            ) || text_lower.contains("create_vulnerability_report")
+                || text_lower.contains("confirmed vulnerable")
+                || text_lower.contains("outcome=reported")
+            {
+                return (
+                    true,
+                    format!("security coordination/reporting tool turn: '{tool_name}'"),
+                );
+            }
+
             (false, "mechanical tool execution".to_string())
         }
         "user" => {
@@ -869,6 +898,57 @@ mod tests {
             });
             let (is_hard, reason) = is_hard_logic_turn(&body);
             assert!(!is_hard, "Affirmation '{word}' must stay local, got: {reason}");
+        }
+    }
+
+    #[test]
+    fn test_sql_errors_and_strix_coordination_reporting_tools_escalate() {
+        // 1. SQL syntax / database errors in tool output escalate
+        for sql_err in &[
+            "ERROR: syntax error at or near \"UNION\"",
+            "sqlite3.OperationalError: near \"'\": syntax error",
+            "ERROR: permission denied for table tenant_secrets (row-level security policy)",
+            "ERROR: unterminated quoted string at or near \"' OR 1=1\"",
+        ] {
+            let body = json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            { "id": "c_sql", "type": "function", "function": { "name": "execute_bash", "arguments": "{\"command\":\"curl http://localhost:3000/api/items?id=1'\"}" } }
+                        ]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "c_sql",
+                        "content": *sql_err
+                    }
+                ]
+            });
+            let (is_hard, reason) = is_hard_logic_turn(&body);
+            assert!(is_hard, "SQL error '{sql_err}' must escalate to Cloud, got: {reason}");
+        }
+
+        // 2. Strix coordination/reporting lifecycle tools escalate
+        for tool_name in &["wait_for_message", "list_reports", "create_vulnerability_report", "finish_scan"] {
+            let body = json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            { "id": "c_strix", "type": "function", "function": { "name": *tool_name, "arguments": "{}" } }
+                        ]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "c_strix",
+                        "content": "{\"status\": \"ok\"}"
+                    }
+                ]
+            });
+            let (is_hard, reason) = is_hard_logic_turn(&body);
+            assert!(is_hard, "Strix lifecycle tool '{tool_name}' must escalate, got: {reason}");
+            assert!(reason.contains("security coordination/reporting tool turn"));
         }
     }
 }
