@@ -1630,6 +1630,17 @@ fn try_recover_xml_tool_calls(
     Some((recovered_calls, cleaned_content.trim().to_string()))
 }
 
+fn tool_choice_is_none(req_body: &Value) -> bool {
+    matches!(
+        req_body
+            .get("tool_choice")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("none")
+    )
+}
+
 fn tool_choice_requires_tool(req_body: &Value) -> bool {
     match req_body.get("tool_choice") {
         Some(Value::String(s)) => matches!(s.trim().to_ascii_lowercase().as_str(), "required" | "any"),
@@ -1642,6 +1653,10 @@ pub fn inspect_and_repair_local_tool_response(
     req_body: &Value,
     resp_bytes: &[u8],
 ) -> LocalToolInspection {
+    if tool_choice_is_none(req_body) {
+        return LocalToolInspection::ValidUnchanged;
+    }
+
     let declared_tools = extract_declared_tools(req_body);
     if declared_tools.is_empty() {
         return LocalToolInspection::ValidUnchanged;
@@ -1682,8 +1697,21 @@ pub fn inspect_and_repair_local_tool_response(
                         .and_then(|n| n.as_str())
                         .map(str::trim)
                         .unwrap_or("");
+                    let args_valid = match call
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .or_else(|| call.get("arguments"))
+                    {
+                        Some(Value::Object(_)) => true,
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                            .ok()
+                            .map(|v| v.is_object())
+                            .unwrap_or(false),
+                        _ => false,
+                    };
                     is_valid_tool_identifier(name)
                         && declared_tools.iter().any(|d| d == name)
+                        && args_valid
                 })
         })
         .unwrap_or(false);
@@ -1722,7 +1750,7 @@ pub fn inspect_and_repair_local_tool_response(
     // Step 2: Failover to Cloud on invalid/missing tool_calls when a tool call is mandatory
     if has_existing_tool_calls && !existing_tool_calls_valid {
         return LocalToolInspection::FailoverRequired {
-            reason: "local response contains undeclared or malformed tool_calls function name"
+            reason: "local response contains undeclared/malformed tool_calls function name or invalid JSON arguments"
                 .to_string(),
         };
     }
@@ -1995,6 +2023,57 @@ mod tests {
             &serde_json::to_vec(&text_only_resp).unwrap(),
         );
         assert_eq!(standard_outcome, LocalToolInspection::ValidUnchanged);
+
+        // When `tool_choice` is explicitly `"none"`, text-only responses must NOT failover even if lifecycle tools are in `tools`.
+        let strix_tool_choice_none_req = json!({
+            "tool_choice": "none",
+            "tools": [
+                { "type": "function", "function": { "name": "execute_bash" } },
+                { "type": "function", "function": { "name": "finish_scan" } }
+            ]
+        });
+        let none_outcome = inspect_and_repair_local_tool_response(
+            &strix_tool_choice_none_req,
+            &serde_json::to_vec(&text_only_resp).unwrap(),
+        );
+        assert_eq!(none_outcome, LocalToolInspection::ValidUnchanged);
+    }
+
+    #[test]
+    fn test_native_tool_calls_with_truncated_or_malformed_json_arguments_triggers_failover() {
+        let req_body = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "execute_bash" } }
+            ]
+        });
+
+        let truncated_args_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "execute_bash",
+                            "arguments": "{\"command\": \"curl -s http://localhost:3000/api/items"
+                        }
+                    }]
+                },
+                "finish_reason": "length"
+            }]
+        });
+
+        let outcome = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&truncated_args_resp).unwrap(),
+        );
+        assert!(
+            matches!(outcome, LocalToolInspection::FailoverRequired { .. }),
+            "Native tool_calls with truncated JSON arguments must trigger Cloud failover, got: {outcome:?}"
+        );
     }
 }
 

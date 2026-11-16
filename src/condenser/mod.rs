@@ -644,8 +644,9 @@ impl ContextCondenser {
         } else {
             let mut p = self.clean_tool_text_with_stats(base_text, stats);
 
-            // Truncation logic
-            if self.config.truncate_tool_outputs {
+            // Truncation logic (skip if already truncated on an earlier pass for idempotency)
+            let already_truncated = p.contains("[... Ferry Proxy: truncated ");
+            if self.config.truncate_tool_outputs && !already_truncated {
                 if is_historical {
                     if p.len() > self.config.max_tool_chars {
                         let hist_head = if self.config.max_tool_chars >= 8000 {
@@ -690,7 +691,7 @@ impl ContextCondenser {
                     stats.ledger_checks_passed += 1;
                 }
             } else {
-                if p.len() < base_text.len() {
+                if p.len() < base_text.len() && !p.contains("[Preserved Anchors:") {
                     let anchors = extract_tool_anchors(base_text);
                     let mut missing_anchors = Vec::new();
                     let p_upper = p.to_ascii_uppercase();
@@ -2225,11 +2226,18 @@ mod tests {
         assert!(stats.tool_outputs_truncated >= 1);
         assert!(stats.ledger_checks_passed >= 1);
 
-        let condensed_hist = body["messages"][3]["content"].as_str().unwrap();
+        let condensed_hist = body["messages"][3]["content"].as_str().unwrap().to_string();
         assert!(condensed_hist.len() < hist_output.len());
-        assert!(condensed_hist.contains("[Preserved Anchors:"));
+        assert_eq!(condensed_hist.matches("[Preserved Anchors:").count(), 1);
         assert!(condensed_hist.contains("/api/v2/internal/export"));
         assert!(condensed_hist.contains("https://target.local:8443/admin"));
         assert!(condensed_hist.contains("src/routes/admin.ts"));
+
+        // Second pass must be 100% byte-for-byte idempotent (never re-truncating or duplicating [Preserved Anchors: ...])
+        let stats_second = condenser.condense(&mut body);
+        assert_eq!(stats_second.tool_outputs_truncated, 0);
+        let condensed_hist_second = body["messages"][3]["content"].as_str().unwrap();
+        assert_eq!(condensed_hist_second, condensed_hist);
+        assert_eq!(condensed_hist_second.matches("[Preserved Anchors:").count(), 1);
     }
 }
