@@ -526,6 +526,26 @@ async fn chat_completions_handler(
         .and_then(|h| h.to_str().ok())
     {
         state.metrics.record_pillar(pillar);
+    } else if body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools.iter().any(|tool| {
+                let name = tool
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| tool.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                matches!(
+                    name,
+                    "create_vulnerability_report" | "record_coverage" | "finish_scan"
+                )
+            })
+        })
+        .unwrap_or(false)
+    {
+        state.metrics.record_pillar("security");
     }
 
     // 1. Client header control: X-Ferry-Condense (defaults to config setting)

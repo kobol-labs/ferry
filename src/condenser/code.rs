@@ -86,8 +86,8 @@ pub fn extract_anchors_internal(text: &str, include_prose_imperatives: bool) -> 
             continue;
         }
 
-        // 2. CVE & Advisory identifiers (e.g., CVE-2024-1234, GHSA-xxxx-xxxx)
-        if upper.starts_with("CVE-") || upper.starts_with("GHSA-") {
+        // 2. CVE, CWE & Advisory identifiers (e.g., CVE-2024-1234, CWE-89, GHSA-xxxx-xxxx)
+        if upper.starts_with("CVE-") || upper.starts_with("CWE-") || upper.starts_with("GHSA-") {
             anchors.push(clean.to_string());
             continue;
         }

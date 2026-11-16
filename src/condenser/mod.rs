@@ -690,6 +690,30 @@ impl ContextCondenser {
                     stats.ledger_checks_passed += 1;
                 }
             } else {
+                if p.len() < base_text.len() {
+                    let anchors = extract_tool_anchors(base_text);
+                    let mut missing_anchors = Vec::new();
+                    let p_upper = p.to_ascii_uppercase();
+                    for anchor in anchors {
+                        let is_missing = if anchor.starts_with('/') {
+                            !p.contains(&anchor)
+                        } else {
+                            !p.contains(&anchor) && !p_upper.contains(&anchor.to_ascii_uppercase())
+                        };
+                        if is_missing && !missing_anchors.contains(&anchor) {
+                            missing_anchors.push(anchor);
+                            if missing_anchors.len() >= 15 {
+                                break;
+                            }
+                        }
+                    }
+                    if !missing_anchors.is_empty() {
+                        p.push_str(&format!(
+                            "\n[Preserved Anchors: {}]",
+                            missing_anchors.join(", ")
+                        ));
+                    }
+                }
                 stats.ledger_checks_passed += 1;
             }
             p
@@ -2155,5 +2179,57 @@ mod tests {
         let orig_ws = body_ws.clone();
         assert!(!nudge_repeated_tool_failure(&mut body_ws));
         assert_eq!(body_ws, orig_ws);
+    }
+
+    #[test]
+    fn test_historical_tool_truncation_preserves_missing_constraint_ledger_anchors() {
+        let config = CondenserConfig {
+            enabled: true,
+            truncate_tool_outputs: true,
+            keep_recent_turns: 1,
+            max_tool_chars: 200,
+            head_lines: 3,
+            tail_lines: 3,
+            ..Default::default()
+        };
+        let condenser = ContextCondenser::new(config);
+
+        let mut lines = Vec::new();
+        for i in 0..5 {
+            lines.push(format!("Header log line {i}"));
+        }
+        for i in 0..20 {
+            lines.push(format!("Verbose intermediate output line {i} with padding text"));
+        }
+        lines.push("Discovered route /api/v2/internal/export and https://target.local:8443/admin in src/routes/admin.ts".to_string());
+        for i in 0..20 {
+            lines.push(format!("More verbose output line {i} with padding text"));
+        }
+        for i in 0..5 {
+            lines.push(format!("Footer log line {i}"));
+        }
+        let hist_output = lines.join("\n");
+
+        let mut body = json!({
+            "messages": [
+                { "role": "system", "content": "Security scanner" },
+                { "role": "user", "content": "Step 1" },
+                { "role": "assistant", "tool_calls": [{ "id": "h1", "type": "function", "function": { "name": "scan", "arguments": "{}" } }] },
+                { "role": "tool", "tool_call_id": "h1", "content": hist_output },
+                { "role": "user", "content": "Step 2 (recent)" },
+                { "role": "assistant", "content": "Recent reply" }
+            ]
+        });
+
+        let stats = condenser.condense(&mut body);
+        assert!(stats.tool_outputs_truncated >= 1);
+        assert!(stats.ledger_checks_passed >= 1);
+
+        let condensed_hist = body["messages"][3]["content"].as_str().unwrap();
+        assert!(condensed_hist.len() < hist_output.len());
+        assert!(condensed_hist.contains("[Preserved Anchors:"));
+        assert!(condensed_hist.contains("/api/v2/internal/export"));
+        assert!(condensed_hist.contains("https://target.local:8443/admin"));
+        assert!(condensed_hist.contains("src/routes/admin.ts"));
     }
 }
