@@ -824,6 +824,44 @@ impl ContextCondenser {
         }
     }
 
+    /// Fast O(N) read-only check for whether `rolling_compact` is eligible to run on `body`,
+    /// avoiding unnecessary deep clones on turns below the compaction threshold.
+    pub fn would_rolling_compact(&self, body: &Value) -> bool {
+        if !self.config.rolling_compaction {
+            return false;
+        }
+        let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+            return false;
+        };
+        let total_msgs = messages.len();
+        let keep_recent = self.config.compact_keep_recent_turns * 2;
+        if total_msgs <= keep_recent + 2 {
+            return false;
+        }
+        let mut start_idx = 0;
+        while start_idx < total_msgs {
+            let role = messages[start_idx]
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            if role == "system" || role == "developer" {
+                start_idx += 1;
+            } else {
+                break;
+            }
+        }
+        if start_idx >= total_msgs {
+            return false;
+        }
+        let split_idx = total_msgs.saturating_sub(keep_recent);
+        if split_idx <= start_idx + 1 {
+            return false;
+        }
+        let conv_chars = count_message_chars(&messages[start_idx..]);
+        let conv_tokens = estimate_tokens_from_chars(conv_chars);
+        conv_tokens > self.config.compact_threshold_tokens
+    }
+
     /// Rolling Context Compaction:
     /// Compacts older historical turns into a structured checkpoint block, leaving system prompt and recent turns intact.
     pub fn rolling_compact(&self, body: &mut Value) -> Option<RollingCompactionStats> {
@@ -2239,5 +2277,6 @@ mod tests {
         let condensed_hist_second = body["messages"][3]["content"].as_str().unwrap();
         assert_eq!(condensed_hist_second, condensed_hist);
         assert_eq!(condensed_hist_second.matches("[Preserved Anchors:").count(), 1);
+        assert!(!condenser.would_rolling_compact(&body));
     }
 }

@@ -1777,6 +1777,9 @@ pub fn strip_think_blocks(s: &str) -> String {
             break;
         }
     }
+    while let Some(close_idx) = out.find("</think>") {
+        out.replace_range(..close_idx + "</think>".len(), "");
+    }
     out
 }
 
@@ -1921,9 +1924,10 @@ pub fn inspect_and_repair_local_tool_response(
                         "reasoning_content".to_string(),
                         Value::String(updated_reasoning),
                     );
-                    if !msg_obj.contains_key("content") || msg_obj.get("content") == Some(&Value::Null) {
-                        msg_obj.insert("content".to_string(), Value::String(String::new()));
-                    }
+                    msg_obj.insert(
+                        "content".to_string(),
+                        Value::String(visible_content.trim().to_string()),
+                    );
                 }
                 if let Some(choice_obj) = choice0.as_object_mut() {
                     choice_obj.insert(
@@ -2379,6 +2383,37 @@ mod tests {
             repaired4["choices"][0]["message"]["reasoning_content"],
             "I need to run whoami."
         );
+        assert_eq!(repaired4["choices"][0]["message"]["content"], "");
+
+        // 5. Orphaned `</think>` prefix (when chat template injects opening `<think>` in prompt)
+        let send_msg_req = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "send_message" } }
+            ]
+        });
+        let orphan_close_think_resp = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Thinking about calling <function=foo>...</think>\n<tool_call>\n<function=send_message>\n<parameter=target_agent_id>a1</parameter>\n<parameter=message>hi</parameter>\n</function>\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let outcome5 = inspect_and_repair_local_tool_response(
+            &send_msg_req,
+            &serde_json::to_vec(&orphan_close_think_resp).unwrap(),
+        );
+        let LocalToolInspection::Repaired(bytes5) = outcome5 else {
+            panic!("Expected Repaired on orphaned </think> prefix, got: {outcome5:?}");
+        };
+        let repaired5: Value = serde_json::from_slice(&bytes5).unwrap();
+        assert_eq!(
+            repaired5["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "send_message"
+        );
+        assert_eq!(repaired5["choices"][0]["message"]["content"], "");
     }
 
     #[test]

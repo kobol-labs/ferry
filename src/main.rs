@@ -685,7 +685,11 @@ async fn chat_completions_handler(
     let mut cloud_fidelity_body: Option<Value> = None;
 
     // Rolling context compaction when context exceeds compact_threshold_tokens (local targets only when condensation is enabled):
-    if condense_enabled && !is_cloud_target && state.config.condensation.rolling_compaction {
+    if condense_enabled
+        && !is_cloud_target
+        && state.config.condensation.rolling_compaction
+        && state.condenser.would_rolling_compact(&body)
+    {
         let snapshot = body.clone();
         if let Some(compact_stats) = state.condenser.rolling_compact(&mut body) {
             cloud_fidelity_body = Some(snapshot);
