@@ -756,12 +756,12 @@ async fn test_4mib_payload_accepted_and_condensed_by_ferry_router() {
     assert_ne!(sid1, "session-default");
     assert_eq!(sid3, "session-default", "Empty messages array must fall back to session-default");
 
-    // Upper-bound check 1: Payload exceeding default 32 MiB limit returns HTTP 413 Payload Too Large.
-    // Use TcpStream so early 413 response + close (before server drains 33 MiB) never races client BodyWrite on macOS loopback.
+    // Upper-bound check 1: Payload exceeding default 64 MiB limit returns HTTP 413 Payload Too Large.
+    // Use TcpStream so early 413 response + close (before server drains 65 MiB) never races client BodyWrite on macOS loopback.
     {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(ferry_addr).await.unwrap();
-        let oversized_len = 33 * 1024 * 1024 + 128;
+        let oversized_len = 65 * 1024 * 1024 + 128;
         let req_head = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"messages\":[{{\"role\":\"user\",\"content\":\"",
             ferry_addr, oversized_len
