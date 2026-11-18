@@ -824,6 +824,129 @@ impl ContextCondenser {
         }
     }
 
+    /// Guaranteed local rescue compaction: progressively compacts `body` until estimated
+    /// tokens <= `target_max_tokens` (or no further historical turns can be dropped).
+    /// Stage 1: rolling compaction (if enabled)
+    /// Stage 2: aggressive squeeze of historical tool/function outputs (5/5 lines) and oversized
+    ///          assistant/user messages (> 1200 chars -> 400 head + 400 tail chars)
+    /// Stage 3: drop oldest non-system historical turns while preserving system/developer prompts,
+    ///          any rolling compaction checkpoint, and the final user/tool turn.
+    pub fn emergency_compact_to_fit(&self, body: &mut Value, target_max_tokens: u64) -> Option<usize> {
+        let orig_chars = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|m| count_message_chars(m))?;
+
+        if crate::router::classifier::estimate_tokens(body) <= target_max_tokens {
+            return None;
+        }
+
+        // Stage 1: Rolling compaction
+        if self.config.rolling_compaction {
+            self.rolling_compact(body);
+        }
+
+        if crate::router::classifier::estimate_tokens(body) <= target_max_tokens {
+            let new_chars = body
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .map(|m| count_message_chars(m))
+                .unwrap_or(orig_chars);
+            let saved = orig_chars.saturating_sub(new_chars);
+            return (saved > 0).then_some(saved);
+        }
+
+        // Stage 2: Aggressive squeeze of historical messages older than the final 2 messages
+        if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            let recent_boundary = messages.len().saturating_sub(2);
+            for msg in messages.iter_mut().take(recent_boundary) {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "system" || role == "developer" || is_rolling_checkpoint_message(msg) {
+                    continue;
+                }
+                if role == "tool" || role == "function" {
+                    squeeze_text_in_message(msg, |s| {
+                        let mut dummy_signals = 0;
+                        let squeezed = truncate_tool_content_smart(s, 5, 5, &mut dummy_signals);
+                        if squeezed.len() < s.len() {
+                            Some(squeezed)
+                        } else {
+                            None
+                        }
+                    });
+                } else if role == "assistant" || role == "user" {
+                    squeeze_text_in_message(msg, |s| {
+                        if s.len() > 1200 {
+                            let squeezed = head_tail_chars(s, 400, 400);
+                            if squeezed.len() < s.len() {
+                                return Some(squeezed);
+                            }
+                        }
+                        None
+                    });
+                }
+            }
+        }
+
+        // Stage 3: Drop oldest non-system historical turns until estimate_tokens(body) <= target_max_tokens
+        while crate::router::classifier::estimate_tokens(body) > target_max_tokens {
+            let dropped = if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                let preserved_tail_start = find_preserved_tail_start(messages);
+                let mut drop_idx = None;
+                for (idx, msg) in messages.iter().enumerate().take(preserved_tail_start) {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                    if role != "system" && role != "developer" && !is_rolling_checkpoint_message(msg) {
+                        drop_idx = Some(idx);
+                        break;
+                    }
+                }
+                if let Some(idx) = drop_idx {
+                    let mut drop_end = idx + 1;
+                    let is_assistant_with_tools = messages[idx]
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        == Some("assistant")
+                        && messages[idx]
+                            .get("tool_calls")
+                            .and_then(|tc| tc.as_array())
+                            .map(|arr| !arr.is_empty())
+                            .unwrap_or(false);
+                    if is_assistant_with_tools {
+                        while drop_end < preserved_tail_start {
+                            let next_role = messages[drop_end]
+                                .get("role")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("");
+                            if next_role == "tool" || next_role == "function" {
+                                drop_end += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    messages.drain(idx..drop_end);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !dropped {
+                break;
+            }
+        }
+
+        let new_chars = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|m| count_message_chars(m))
+            .unwrap_or(orig_chars);
+        let total_chars_saved = orig_chars.saturating_sub(new_chars);
+        (total_chars_saved > 0).then_some(total_chars_saved)
+    }
+
     /// Fast O(N) read-only check for whether `rolling_compact` is eligible to run on `body`,
     /// avoiding unnecessary deep clones on turns below the compaction threshold.
     pub fn would_rolling_compact(&self, body: &Value) -> bool {
@@ -1478,6 +1601,88 @@ impl ContextCondenser {
 
         text
     }
+}
+
+fn is_rolling_checkpoint_message(msg: &Value) -> bool {
+    if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+        return s.contains("[Historical Context Checkpoint:");
+    }
+    if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+        return parts.iter().any(|p| {
+            p.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.contains("[Historical Context Checkpoint:"))
+                .unwrap_or(false)
+        });
+    }
+    false
+}
+
+fn head_tail_chars(s: &str, head: usize, tail: usize) -> String {
+    let head_end = safe_floor_char_boundary(s, head);
+    let tail_start = safe_ceil_char_boundary(s, s.len().saturating_sub(tail));
+    if head_end >= tail_start {
+        return s.to_string();
+    }
+    format!(
+        "{}\n\n... [{} chars omitted] ...\n\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
+}
+
+fn squeeze_text_in_message<F>(msg: &mut Value, mut transform: F)
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if let Some(content) = msg.get_mut("content") {
+        match content {
+            Value::String(s) => {
+                if let Some(next) = transform(s) {
+                    *s = next;
+                }
+            }
+            Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    if let Some(Value::String(s)) = part.get_mut("text") {
+                        if let Some(next) = transform(s) {
+                            *s = next;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn find_preserved_tail_start(messages: &[Value]) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+    let mut tail = messages.len() - 1;
+    let last_role = messages[tail]
+        .get("role")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    if last_role == "tool" || last_role == "function" {
+        while tail > 0 {
+            let prev_role = messages[tail - 1]
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            if prev_role == "tool" || prev_role == "function" {
+                tail -= 1;
+            } else {
+                if prev_role == "assistant" {
+                    tail -= 1;
+                }
+                break;
+            }
+        }
+    }
+    tail
 }
 
 #[cfg(test)]
@@ -2278,5 +2483,69 @@ mod tests {
         assert_eq!(condensed_hist_second, condensed_hist);
         assert_eq!(condensed_hist_second.matches("[Preserved Anchors:").count(), 1);
         assert!(!condenser.would_rolling_compact(&body));
+    }
+
+    #[test]
+    fn test_emergency_compact_to_fit_450k_to_256k() {
+        let mut cfg = CondenserConfig::default();
+        cfg.rolling_compaction = true;
+        cfg.compact_threshold_tokens = 100_000;
+        cfg.compact_keep_recent_turns = 2;
+        let condenser = ContextCondenser::new(cfg);
+
+        let mut messages = vec![json!({
+            "role": "system",
+            "content": "You are an autonomous security auditor."
+        })];
+
+        // Build ~460k+ tokens (~1,650,000 chars) across historical turns
+        let big_tool_output = "INFO: scanning endpoint /api/v1/item\n".repeat(1500);
+        let big_assistant_msg = "Analysis detail: ".to_string() + &"x".repeat(4000);
+        for i in 0..30 {
+            messages.push(json!({
+                "role": "user",
+                "content": format!("Investigate target step {i}")
+            }));
+            messages.push(json!({
+                "role": "assistant",
+                "content": big_assistant_msg,
+                "tool_calls": [{
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": { "name": "run_command", "arguments": "{}" }
+                }]
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": big_tool_output
+            }));
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": "Final user prompt that must be preserved."
+        }));
+
+        let mut body = json!({ "messages": messages });
+        let initial_tokens = crate::router::classifier::estimate_tokens(&body);
+        assert!(
+            initial_tokens > 450_000,
+            "expected > 450k initial tokens, got {initial_tokens}"
+        );
+
+        let saved = condenser.emergency_compact_to_fit(&mut body, 256_000);
+        assert!(saved.is_some(), "expected emergency compaction to save chars");
+        let final_tokens = crate::router::classifier::estimate_tokens(&body);
+        assert!(
+            final_tokens <= 256_000,
+            "expected <= 256k tokens after emergency compaction, got {final_tokens}"
+        );
+
+        let final_msgs = body["messages"].as_array().unwrap();
+        assert_eq!(final_msgs[0]["role"], "system");
+        assert_eq!(
+            final_msgs.last().unwrap()["content"],
+            "Final user prompt that must be preserved."
+        );
     }
 }

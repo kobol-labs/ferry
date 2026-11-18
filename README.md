@@ -14,7 +14,11 @@ When running autonomous multi-agent swarms (e.g., Strix, Cursor agents, AutoGen)
 
 **Ferry** solves this by acting as an ultra-lean, OpenAI-compatible proxy between your clients and your models:
 * **Elastic KV Token-Budget Routing & Atomic Slot Guards**: Allocates GPU capacity based on an aggregate concurrent token pool (`total_kv_token_budget`) rather than naive integer slot counts. Dynamic requests share the hardware pool smoothly (e.g. 2 x 128k, or 1 x 220k + 1 x 40k). Atomic Compare-And-Swap (CAS) and RAII slot guards ensure memory is never overcommitted and tokens are instantly freed upon completion or client disconnect.
-* **Adaptive "Fit-to-Local" Squeezing**: When an agent's prompt size slightly exceeds the local context limit (e.g. 130k–160k tokens vs 128k limit), Ferry dynamically applies a secondary compression pass on older historical turns, squeezing 20k–40k extra tokens so the request can execute locally instead of falling back to cloud APIs.
+* **Adaptive "Fit-to-Local" Squeezing & Guaranteed Local Rescue (`#26`)**: When an agent's prompt size exceeds the local context limit, Ferry applies a secondary `adaptive_squeeze` pass on older historical turns, and during Cloud `429`/`529`/`5xx` backoff or failover, `emergency_compact_to_fit` progressively compacts (`rolling_compact` -> aggressive historical squeeze -> oldest-turn pruning) while preserving system/developer prompts, rolling checkpoints, and the final turn, paired with bounded slot contention waiting so oversized prompts land cleanly on local Strata.
+* **Hybrid Cognitive & Security-Aware Escalation (`#22`)**: In `hybrid` mode, routine/mechanical tool turns execute $0 locally while hard-logic diagnostics, SQL/auth/server anomalies (`databasecode`, `pt401`, `pt403`, `pgrst`, `http/1.1 500`, `violates row-level security`), and security reporting tools (`create_vulnerability_report`, `finish_scan`) escalate to Cloud (gated by `security_escalation`), with `ferry-security` model alias and `X-Sentinel-Pillar` telemetry.
+* **Quota-Paced, Affinity-Aware Fast Spillover (`#23`)**: Under local slot saturation in `hybrid` mode, cold turns (`NewSlot`) spill to Cloud after `cold_spill_wait_ms` (default 2s) while warm affinity turns (`SessionHit`/`PrefixHit`) wait up to `warm_affinity_wait_ms` (default 15s) to reclaim their KV cache slot—automatically throttling fast spillover when Cloud window usage reaches the 35% `cognitive_reserve_ratio`.
+* **Local Qwen `<tool_call>` XML Recovery & Strix Lifecycle Failover (`#24`)**: Recovers single/multi-parameter Qwen XML `<tool_call>` blocks and JSON-in-XML tool calls on local Strata, and fails over malformed/truncated tool calls or premature text-only `finish_scan` turns to Cloud.
+* **Full-Fidelity Cloud Spillover & 64 MB Body Limit (`#25`)**: Accepts up to 64 MB request payloads, snapshots uncompacted `cloud_fidelity_body` before local-only `rolling_compact` / `adaptive_squeeze` so Cloud spillover and failover receive full-fidelity context, and treats `HTTP 529` alongside `429`/`502`/`503`/`504` as local-rescue eligible.
 * **Extended Contention Hold-and-Wait Queue**: Instead of immediately dumping bursts to expensive cloud APIs when all local slots or token budgets are momentarily occupied, Ferry holds requests in a lightweight polling queue (up to 3.5s) to capture freeing GPU slots locally.
 * **Transparent Context Condensation**: Strips historical `<think>` reasoning blocks and safely truncates stale tool outputs from older turns in $<0.01\text{ ms}$, saving 30%–60% of tokens before routing.
 * **Built-in Safety & Cache Invariants**:
@@ -79,6 +83,15 @@ timeout_secs = 300
 [routing]
 # Default routing mode: "local-preferred" (default), "local-only", "hybrid", "cloud-only"
 default_route = "local-preferred"
+# Escalate security anomalies and reporting tools in hybrid mode (default: true)
+security_escalation = true
+# Quota-paced, affinity-aware fast spillover in hybrid mode (default: true)
+fast_spillover_enabled = true
+cloud_window_request_budget = 1500
+cloud_window_secs = 18000
+cognitive_reserve_ratio = 0.35
+cold_spill_wait_ms = 2000
+warm_affinity_wait_ms = 15000
 
 [condensation]
 # Enable transparent prompt context condensation before routing
@@ -142,7 +155,8 @@ Clients can customize routing and condensation behavior on a per-request basis:
 | Header | Values | Description |
 | :--- | :--- | :--- |
 | `X-Ferry-Condense` | `true` \| `false` | Bypasses prompt condensation when set to `false`, `0`, or `no`. |
-| `X-Ferry-Route` | `local-preferred` \| `local-only` \| `hybrid` \| `cloud-only` | Controls routing tier. `local-preferred` (default) routes 100% locally with cloud spillover on queue timeout. `local-only` guarantees $0 spend by fast-failing with HTTP 503 if unavailable. `hybrid` segregates cognitive turns: routine/mechanical commands stay local, while hard logic / diagnostic failures escalate to Cloud and immediately revert to Local. `cloud-only` bypasses local hardware entirely. |
+| `X-Ferry-Route` | `local-preferred` \| `local-only` \| `hybrid` \| `cloud-only` | Controls routing tier. `local-preferred` (default) routes 100% locally with cloud spillover on queue timeout. `local-only` guarantees $0 spend by fast-failing with HTTP 503 if unavailable. `hybrid` segregates cognitive turns: routine/mechanical commands stay local, while hard logic / diagnostic & security failures escalate to Cloud and immediately revert to Local. `cloud-only` bypasses local hardware entirely. |
+| `X-Sentinel-Pillar` | `security` \| `fuzzer` \| `explorer` | Attributes request telemetry to a Sentinel pipeline pillar (also auto-detected via `model: "ferry-security"` or security tools). |
 
 #### Observability Response Headers
 Every response includes detailed routing metrics and CORS exposure headers:
@@ -290,7 +304,14 @@ curl -s http://127.0.0.1:4000/stats | jq
   "signals_extracted_count": 36,
   "loops_collapsed_count": 14,
   "strata_online": true,
-  "circuit_breaker_open": false
+  "circuit_open": false,
+  "cloud_rate_limited": false,
+  "security_requests_total": 18,
+  "fuzzer_requests_total": 0,
+  "explorer_requests_total": 0,
+  "window_cloud_requests": 42,
+  "fast_spillover_requests": 12,
+  "fast_spillover_throttled_skips": 0
 }
 ```
 
@@ -337,6 +358,24 @@ ferry_request_duration_ms_total{provider="cloud"} 1105400
 # HELP ferry_last_request_duration_ms Latency of most recent completed request in milliseconds
 # TYPE ferry_last_request_duration_ms gauge
 ferry_last_request_duration_ms 822
+
+# HELP ferry_pillar_requests_total Total requests processed per sentinel pipeline pillar
+# TYPE ferry_pillar_requests_total counter
+ferry_pillar_requests_total{pillar="security"} 18
+ferry_pillar_requests_total{pillar="fuzzer"} 0
+ferry_pillar_requests_total{pillar="explorer"} 0
+
+# HELP ferry_fast_spillover_requests_total Total requests fast-spilled to cloud under healthy quota
+# TYPE ferry_fast_spillover_requests_total counter
+ferry_fast_spillover_requests_total 12
+
+# HELP ferry_fast_spillover_throttled_skips_total Total fast-spillover attempts throttled to protect cognitive reserve
+# TYPE ferry_fast_spillover_throttled_skips_total counter
+ferry_fast_spillover_throttled_skips_total 0
+
+# HELP ferry_cloud_window_requests Cloud requests used in the current quota window
+# TYPE ferry_cloud_window_requests gauge
+ferry_cloud_window_requests 42
 ```
 
 ### 4. Grafana Integration & Dashboard

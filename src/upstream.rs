@@ -727,30 +727,35 @@ impl UpstreamClient {
                         };
                         let mut fallback_chars_saved = chars_saved;
 
-                        if est_tokens > max_context
-                            && self.config.condensation.enabled
-                            && self.config.condensation.rolling_compaction
-                        {
+                        if est_tokens > max_context {
                             let condenser = crate::condenser::ContextCondenser::new(self.config.condensation.clone());
-                            if let Some(compact_stats) = condenser.rolling_compact(&mut body) {
-                                fallback_chars_saved += compact_stats.chars_saved;
-                                self.metrics.record_rolling_compaction(compact_stats.chars_saved);
-                                est_tokens = crate::router::Router::estimate_tokens(&body);
-                            }
-                        }
-
-                        if est_tokens > max_context && self.config.local.adaptive_squeezing {
-                            let squeeze_limit = (max_context as f64 * self.config.local.adaptive_squeeze_ratio) as u64;
-                            if est_tokens <= squeeze_limit {
-                                let condenser = crate::condenser::ContextCondenser::new(self.config.condensation.clone());
-                                if let Some(extra_saved) = condenser.adaptive_squeeze(&mut body, max_context) {
-                                    fallback_chars_saved += extra_saved;
+                            if self.config.condensation.enabled && self.config.condensation.rolling_compaction {
+                                if let Some(compact_stats) = condenser.rolling_compact(&mut body) {
+                                    fallback_chars_saved += compact_stats.chars_saved;
+                                    self.metrics.record_rolling_compaction(compact_stats.chars_saved);
                                     est_tokens = crate::router::Router::estimate_tokens(&body);
-                                    if est_tokens <= max_context {
-                                        self.metrics
-                                            .adaptive_squeezed_count
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+
+                            if est_tokens > max_context && self.config.local.adaptive_squeezing {
+                                let squeeze_limit = (max_context as f64 * self.config.local.adaptive_squeeze_ratio) as u64;
+                                if est_tokens <= squeeze_limit {
+                                    if let Some(extra_saved) = condenser.adaptive_squeeze(&mut body, max_context) {
+                                        fallback_chars_saved += extra_saved;
+                                        est_tokens = crate::router::Router::estimate_tokens(&body);
+                                        if est_tokens <= max_context {
+                                            self.metrics
+                                                .adaptive_squeezed_count
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                     }
+                                }
+                            }
+
+                            if est_tokens > max_context {
+                                if let Some(emergency_saved) = condenser.emergency_compact_to_fit(&mut body, max_context) {
+                                    fallback_chars_saved += emergency_saved;
+                                    est_tokens = crate::router::Router::estimate_tokens(&body);
                                 }
                             }
                         }
@@ -761,56 +766,55 @@ impl UpstreamClient {
                                 .and_then(|m| m.as_array())
                                 .map(|arr| crate::affinity::compute_prefix_hash(arr))
                                 .unwrap_or(0);
+                            let wait_limit_ms = self.config.local.queue_timeout_ms.min(30_000);
 
-                            if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(
+                            if let Some((slot_id, aff_type, slot_guard)) = crate::router::acquire_local_slot_with_wait(
+                                &self.metrics,
+                                &self.affinity_tracker,
+                                max_slots,
+                                total_kv_budget,
                                 &decision.session_id,
                                 prefix_hash,
+                                est_tokens,
                                 true,
-                            ) {
-                                if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
-                                    self.metrics.record_affinity(aff_type.is_hit());
-                                    warn!(
-                                        req_id = req_id,
-                                        slot = slot_id,
-                                        tokens = est_tokens,
-                                        status = status.as_u16(),
-                                        "Failing over in-flight request to local Strata engine after Cloud HTTP {}",
-                                        status.as_u16()
-                                    );
-                                    self.metrics.revert_cloud_request_for_local_fallback(
-                                        decision.est_tokens,
-                                        decision.is_spillover,
-                                    );
-                                    let slot_guard = crate::router::LocalSlotGuard::new(
-                                        self.metrics.clone(),
-                                        Some(self.affinity_tracker.clone()),
-                                        Some(slot_id),
-                                        est_tokens,
-                                    );
-                                    let local_decision = RouteDecision {
-                                        target: TargetProvider::Local,
-                                        est_tokens,
-                                        is_spillover: false,
-                                        reason: format!("Failover from Cloud HTTP {} (slot {slot_id})", status.as_u16()),
-                                        local_only: true,
-                                        slot_guard: Some(slot_guard),
-                                        slot_id: Some(slot_id),
-                                        is_affinity_hit: aff_type.is_hit(),
-                                        affinity_type: aff_type,
-                                        session_id: decision.session_id.clone(),
-                                    };
-                                    return Box::pin(self.forward_chat(
-                                        body,
-                                        local_decision,
-                                        req_id,
-                                        fallback_chars_saved,
-                                        savings_pct,
-                                        cache_key,
-                                    ))
-                                    .await;
-                                } else {
-                                    self.affinity_tracker.release_slot(slot_id);
-                                }
+                                false,
+                                wait_limit_ms,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    req_id = req_id,
+                                    slot = slot_id,
+                                    tokens = est_tokens,
+                                    status = status.as_u16(),
+                                    "Failing over in-flight request to local Strata engine after Cloud HTTP {}",
+                                    status.as_u16()
+                                );
+                                self.metrics.revert_cloud_request_for_local_fallback(
+                                    decision.est_tokens,
+                                    decision.is_spillover,
+                                );
+                                let local_decision = RouteDecision {
+                                    target: TargetProvider::Local,
+                                    est_tokens,
+                                    is_spillover: false,
+                                    reason: format!("Failover from Cloud HTTP {} (slot {slot_id})", status.as_u16()),
+                                    local_only: true,
+                                    slot_guard: Some(slot_guard),
+                                    slot_id: Some(slot_id),
+                                    is_affinity_hit: aff_type.is_hit(),
+                                    affinity_type: aff_type,
+                                    session_id: decision.session_id.clone(),
+                                };
+                                return Box::pin(self.forward_chat(
+                                    body,
+                                    local_decision,
+                                    req_id,
+                                    fallback_chars_saved,
+                                    savings_pct,
+                                    cache_key,
+                                ))
+                                .await;
                             }
                         }
                     }

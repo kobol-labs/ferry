@@ -129,6 +129,30 @@ impl SessionAffinityTracker {
         self.try_acquire_slot_opt(session_id, prefix_hash, true)
     }
 
+    /// Read-only affinity check: returns whether `session_id` has an active/warm slot
+    /// (`SessionHit`), or `prefix_hash` matches a warm slot (`PrefixHit`), or `NewSlot`,
+    /// without mutating or acquiring any slots.
+    pub fn peek_affinity(&self, session_id: &str, prefix_hash: u64) -> AffinityType {
+        if !self.enabled || self.max_slots == 0 {
+            return AffinityType::NewSlot;
+        }
+        if let Ok(read) = self.sessions.read() {
+            if let Some(entry) = read.get(session_id) {
+                if entry.slot_id < self.max_slots {
+                    return AffinityType::SessionHit;
+                }
+            }
+        }
+        if prefix_hash != 0 {
+            if let Ok(p_read) = self.slot_prefix.read() {
+                if p_read.iter().take(self.max_slots).any(|p| *p == Some(prefix_hash)) {
+                    return AffinityType::PrefixHit;
+                }
+            }
+        }
+        AffinityType::NewSlot
+    }
+
     /// Attempts to acquire an execution slot for a session with optional eviction.
     /// If session has a preferred slot that is idle, acquires it (SessionHit).
     /// If session is new or preferred slot is busy, looks for an idle slot with matching prefix_hash (PrefixHit).

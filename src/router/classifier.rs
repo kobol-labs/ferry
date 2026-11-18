@@ -42,7 +42,34 @@ pub const HARD_LOGIC_DIAGNOSTIC_SIGNALS: &[&str] = &[
     "security definer",
     "operator does not exist",
     "invalid input syntax for type",
+    "databasecode",
+    "pt401",
+    "pt403",
+    "pgrst",
+    "http/1.1 500",
+    "http/2 500",
+    "internal server error",
+    "violates row-level security",
 ];
+
+fn is_security_diagnostic_signal(signal: &str) -> bool {
+    matches!(
+        signal,
+        "cwe-"
+            | "cve-"
+            | "security alert"
+            | "injection vulnerability"
+            | "buffer overflow"
+            | "use-after-free"
+            | "row-level security"
+            | "security definer"
+            | "databasecode"
+            | "pt401"
+            | "pt403"
+            | "pgrst"
+            | "violates row-level security"
+    )
+}
 
 pub const HARD_LOGIC_USER_KEYWORDS: &[&str] = &[
     "threat model",
@@ -591,6 +618,13 @@ pub fn is_source_code_or_comment_line(line_lower: &str) -> bool {
 }
 
 pub fn has_real_diagnostic_signal(text: &str) -> Option<&'static str> {
+    has_real_diagnostic_signal_with_options(text, true)
+}
+
+pub fn has_real_diagnostic_signal_with_options(
+    text: &str,
+    security_escalation: bool,
+) -> Option<&'static str> {
     for raw_line in text.lines() {
         let line_lower = raw_line.to_lowercase();
         if is_source_code_or_comment_line(&line_lower) {
@@ -599,6 +633,9 @@ pub fn has_real_diagnostic_signal(text: &str) -> Option<&'static str> {
 
         // Check each high-confidence signal on non-source-code lines
         for &signal in HARD_LOGIC_DIAGNOSTIC_SIGNALS {
+            if !security_escalation && is_security_diagnostic_signal(signal) {
+                continue;
+            }
             if line_lower.contains(signal) {
                 return Some(signal);
             }
@@ -662,6 +699,13 @@ pub fn has_real_diagnostic_signal(text: &str) -> Option<&'static str> {
 }
 
 pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
+    is_hard_logic_turn_with_options(body, true)
+}
+
+pub fn is_hard_logic_turn_with_options(
+    body: &Value,
+    security_escalation: bool,
+) -> (bool, String) {
     let messages = match body.get("messages").and_then(|m| m.as_array()) {
         Some(m) if !m.is_empty() => m,
         _ => return (false, "no messages in request body".to_string()),
@@ -706,9 +750,11 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
                             }
                         }
 
-                        for kw in COGNITIVE_TOOL_CONTEXT_KEYWORDS {
-                            if user_lower.contains(kw) {
-                                return (true, format!("info gathering for cognitive task: '{kw}'"));
+                        if security_escalation {
+                            for kw in COGNITIVE_TOOL_CONTEXT_KEYWORDS {
+                                if user_lower.contains(kw) {
+                                    return (true, format!("info gathering for cognitive task: '{kw}'"));
+                                }
                             }
                         }
 
@@ -729,7 +775,7 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
             }
 
             // For active execution tools (run_command, test runners, etc.):
-            if let Some(sig) = has_real_diagnostic_signal(&text) {
+            if let Some(sig) = has_real_diagnostic_signal_with_options(&text, security_escalation) {
                 return (true, format!("diagnostic signal detected in tool output: '{sig}'"));
             }
 
@@ -739,22 +785,24 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
                 return (true, format!("complex stack trace ({lines} lines) in tool output"));
             }
 
-            let text_lower = text.to_lowercase();
-            if matches!(
-                tool_name.as_str(),
-                "wait_for_message"
-                    | "list_reports"
-                    | "create_vulnerability_report"
-                    | "finish_agent"
-                    | "finish_scan"
-            ) || text_lower.contains("create_vulnerability_report")
-                || text_lower.contains("confirmed vulnerable")
-                || text_lower.contains("outcome=reported")
-            {
-                return (
-                    true,
-                    format!("security coordination/reporting tool turn: '{tool_name}'"),
-                );
+            if security_escalation {
+                let text_lower = text.to_lowercase();
+                if matches!(
+                    tool_name.as_str(),
+                    "wait_for_message"
+                        | "list_reports"
+                        | "create_vulnerability_report"
+                        | "finish_agent"
+                        | "finish_scan"
+                ) || text_lower.contains("create_vulnerability_report")
+                    || text_lower.contains("confirmed vulnerable")
+                    || text_lower.contains("outcome=reported")
+                {
+                    return (
+                        true,
+                        format!("security coordination/reporting tool turn: '{tool_name}'"),
+                    );
+                }
             }
 
             (false, "mechanical tool execution".to_string())
@@ -814,7 +862,7 @@ pub fn is_hard_logic_turn(body: &Value) -> (bool, String) {
                 let prev_role = prev_msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
                 if prev_role == "tool" {
                     let prev_text = extract_message_text(prev_msg);
-                    if let Some(sig) = has_real_diagnostic_signal(&prev_text) {
+                    if let Some(sig) = has_real_diagnostic_signal_with_options(&prev_text, security_escalation) {
                         return (true, format!("diagnostic signal in prior tool output: '{sig}'"));
                     }
                 }
@@ -950,5 +998,74 @@ mod tests {
             assert!(is_hard, "Strix lifecycle tool '{tool_name}' must escalate, got: {reason}");
             assert!(reason.contains("security coordination/reporting tool turn"));
         }
+    }
+
+    #[test]
+    fn test_security_anomaly_signals_escalate_and_respect_security_escalation_flag() {
+        for sig in &[
+            "Response: DatabaseCode=42P01",
+            "HTTP status PT401 unauthorized token",
+            "HTTP status PT403 forbidden resource",
+            "PGRST301 JWT expired",
+            "HTTP/1.1 500 Internal Server Error",
+            "HTTP/2 500 response from backend",
+            "500 Internal Server Error on /admin",
+            "new row violates row-level security policy for table users",
+        ] {
+            let body = json!({
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            { "id": "c_sec", "type": "function", "function": { "name": "execute_bash", "arguments": "{}" } }
+                        ]
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "c_sec",
+                        "content": *sig
+                    }
+                ]
+            });
+            let (is_hard, reason) = is_hard_logic_turn_with_options(&body, true);
+            assert!(is_hard, "Security signal '{sig}' must escalate when enabled, got: {reason}");
+        }
+
+        // When security_escalation is disabled, security-specific signals & reporting tools stay local
+        let rls_body = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "c_rls", "type": "function", "function": { "name": "execute_bash", "arguments": "{}" } }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c_rls",
+                    "content": "new row violates row-level security policy for table users"
+                }
+            ]
+        });
+        let (is_hard_disabled, _) = is_hard_logic_turn_with_options(&rls_body, false);
+        assert!(!is_hard_disabled, "Security signal must not escalate when security_escalation=false");
+
+        let report_body = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "id": "c_rep", "type": "function", "function": { "name": "create_vulnerability_report", "arguments": "{}" } }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c_rep",
+                    "content": "{\"status\": \"ok\"}"
+                }
+            ]
+        });
+        let (is_report_disabled, _) = is_hard_logic_turn_with_options(&report_body, false);
+        assert!(!is_report_disabled, "Security reporting tool must not escalate when security_escalation=false");
     }
 }
