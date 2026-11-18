@@ -4,16 +4,43 @@ use serde::{Deserialize, Serialize};
 pub struct RoutingConfig {
     #[serde(default = "default_default_route")]
     pub default_route: String,
+    #[serde(default = "default_true")]
+    pub security_escalation: bool,
+    #[serde(default = "default_true")]
+    pub fast_spillover_enabled: bool,
+    #[serde(default = "default_cloud_window_request_budget")]
+    pub cloud_window_request_budget: u64,
+    #[serde(default = "default_cloud_window_secs")]
+    pub cloud_window_secs: u64,
+    #[serde(default = "default_cognitive_reserve_ratio")]
+    pub cognitive_reserve_ratio: f64,
+    #[serde(default = "default_cold_spill_wait_ms")]
+    pub cold_spill_wait_ms: u64,
+    #[serde(default = "default_warm_affinity_wait_ms")]
+    pub warm_affinity_wait_ms: u64,
 }
 
 fn default_default_route() -> String {
     "local-preferred".to_string()
 }
+fn default_true() -> bool { true }
+fn default_cloud_window_request_budget() -> u64 { 1500 }
+fn default_cloud_window_secs() -> u64 { 18000 }
+fn default_cognitive_reserve_ratio() -> f64 { 0.35 }
+fn default_cold_spill_wait_ms() -> u64 { 2000 }
+fn default_warm_affinity_wait_ms() -> u64 { 15000 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             default_route: default_default_route(),
+            security_escalation: default_true(),
+            fast_spillover_enabled: default_true(),
+            cloud_window_request_budget: default_cloud_window_request_budget(),
+            cloud_window_secs: default_cloud_window_secs(),
+            cognitive_reserve_ratio: default_cognitive_reserve_ratio(),
+            cold_spill_wait_ms: default_cold_spill_wait_ms(),
+            warm_affinity_wait_ms: default_warm_affinity_wait_ms(),
         }
     }
 }

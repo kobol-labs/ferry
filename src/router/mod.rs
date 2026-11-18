@@ -86,6 +86,33 @@ impl Router {
         classifier::is_hard_logic_turn(body)
     }
 
+    pub fn is_hard_logic_turn_with_options(body: &Value, security_escalation: bool) -> (bool, String) {
+        classifier::is_hard_logic_turn_with_options(body, security_escalation)
+    }
+
+    pub async fn acquire_local_slot_with_wait(
+        &self,
+        session_id: &str,
+        prefix_hash: u64,
+        est_tokens: u64,
+        is_orchestrator: bool,
+        wait_limit_ms: u64,
+    ) -> Option<(usize, AffinityType, LocalSlotGuard)> {
+        acquire_local_slot_with_wait(
+            &self.metrics,
+            &self.affinity_tracker,
+            self.config.local.max_slots,
+            self.config.local.total_kv_token_budget as u64,
+            session_id,
+            prefix_hash,
+            est_tokens,
+            is_orchestrator,
+            false,
+            wait_limit_ms,
+        )
+        .await
+    }
+
     pub async fn decide(&self, body: &Value, route_override: Option<&str>) -> RouteDecision {
         self.decide_for_session(body, route_override, None, "default").await
     }
@@ -200,7 +227,9 @@ impl Router {
 
         // 4. Hybrid cognitive turn routing (escalate hard logic / diagnostics to Cloud; revert to Local for mechanical)
         if effective_mode == RoutingMode::Hybrid {
-            let (is_hard, reason) = precomputed_hard_logic.unwrap_or_else(|| Self::is_hard_logic_turn(body));
+            let (is_hard, reason) = precomputed_hard_logic.unwrap_or_else(|| {
+                classifier::is_hard_logic_turn_with_options(body, self.config.routing.security_escalation)
+            });
             if is_hard {
                 if self.metrics.is_cloud_rate_limited() && self.metrics.is_strata_online() {
                     tracing::warn!(
@@ -251,41 +280,36 @@ impl Router {
             self.metrics.orchestrator_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, is_orchestrator) {
-            let is_hit = aff_type.is_hit();
-            if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
-                self.metrics.record_affinity(is_hit);
-                let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
-                let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
-                let aff_desc = match aff_type {
-                    AffinityType::SessionHit => "session affinity hit",
-                    AffinityType::PrefixHit => "prefix cache affinity hit",
-                    AffinityType::NewSlot => "new slot assigned",
-                };
-                return RouteDecision {
-                    target: TargetProvider::Local,
-                    est_tokens,
-                    is_spillover: false,
-                    reason: format!("local slot {slot_id} acquired ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
-                    local_only,
-                    slot_guard: Some(LocalSlotGuard::new(
-                        self.metrics.clone(),
-                        Some(self.affinity_tracker.clone()),
-                        Some(slot_id),
-                        est_tokens,
-                    )),
-                    slot_id: Some(slot_id),
-                    is_affinity_hit: is_hit,
-                    affinity_type: aff_type,
-                    session_id: session_id.to_string(),
-                };
-            } else {
-                self.affinity_tracker.release_slot(slot_id);
-            }
+        if let Some((slot_id, aff_type, slot_guard)) = try_acquire_local_slot_now(
+            &self.metrics,
+            &self.affinity_tracker,
+            max_slots,
+            total_kv_budget,
+            session_id,
+            prefix_hash,
+            est_tokens,
+            is_orchestrator,
+        ) {
+            let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+            let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            let aff_desc = affinity_desc(aff_type);
+            return RouteDecision {
+                target: TargetProvider::Local,
+                est_tokens,
+                is_spillover: false,
+                reason: format!("local slot {slot_id} acquired ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
+                local_only,
+                slot_guard: Some(slot_guard),
+                slot_id: Some(slot_id),
+                is_affinity_hit: aff_type.is_hit(),
+                affinity_type: aff_type,
+                session_id: session_id.to_string(),
+            };
         }
 
-        // Adaptive Queueing: Determine wait limit based on client hints and token size
+        // Adaptive Queueing & Quota-Paced Fast Spillover:
         let queue_timeout_ms = self.config.local.queue_timeout_ms;
+        let mut fast_spillover_paced = false;
         let effective_wait_ms = if let Some(ms) = explicit_timeout_ms {
             ms
         } else if fast_mode {
@@ -294,9 +318,28 @@ impl Router {
             60000
         } else if queue_timeout_ms == 0 {
             0
+        } else if effective_mode == RoutingMode::Hybrid && self.config.routing.fast_spillover_enabled {
+            if self.metrics.can_fast_spillover(
+                self.config.routing.cloud_window_request_budget,
+                self.config.routing.cloud_window_secs,
+                self.config.routing.cognitive_reserve_ratio,
+            ) {
+                fast_spillover_paced = true;
+                let peeked = self.affinity_tracker.peek_affinity(session_id, prefix_hash);
+                if peeked.is_hit() {
+                    self.config.routing.warm_affinity_wait_ms.min(queue_timeout_ms)
+                } else {
+                    self.config.routing.cold_spill_wait_ms.min(queue_timeout_ms)
+                }
+            } else {
+                self.metrics
+                    .fast_spillover_throttled_skips
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if is_orchestrator { 30000 } else { queue_timeout_ms }
+            }
         } else if is_orchestrator {
             30000 // 30s queue wait for orchestrators: balances swarm responsiveness with local GPU utilization
-        } else if local_prefer || effective_mode == RoutingMode::Hybrid {
+        } else if local_prefer {
             queue_timeout_ms
         } else if est_tokens <= max_context {
             queue_timeout_ms.clamp(5000, 120000)
@@ -304,74 +347,35 @@ impl Router {
             queue_timeout_ms
         };
 
-        if effective_wait_ms > 0 {
-            let start = std::time::Instant::now();
-            let wait_limit = std::time::Duration::from_millis(effective_wait_ms);
-            let poll_interval = if is_orchestrator || fast_mode { 5 } else { 25 };
-            let mut logged_queue_entry = false;
-            let mut last_queue_heartbeat = start;
-            while start.elapsed() < wait_limit {
-                if !logged_queue_entry {
-                    let prio_label = if is_orchestrator { "orchestrator" } else { "standard" };
-                    tracing::info!(
-                        session = %session_id,
-                        est_tokens,
-                        timeout_ms = effective_wait_ms,
-                        priority = prio_label,
-                        "Local slots saturated; request entered contention queue waiting for available slot"
-                    );
-                    logged_queue_entry = true;
-                } else if last_queue_heartbeat.elapsed() >= std::time::Duration::from_secs(10) {
-                    tracing::info!(
-                        session = %session_id,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        timeout_ms = effective_wait_ms,
-                        "Request waiting in contention queue"
-                    );
-                    last_queue_heartbeat = std::time::Instant::now();
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(poll_interval)).await;
-                // Allow eviction for orchestrators immediately, or for workers after waiting 70% of timeout (capped at 15s)
-                let allow_eviction = is_orchestrator || (start.elapsed().as_millis() >= (effective_wait_ms as u128 * 7 / 10).min(15000));
-                if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, allow_eviction) {
-                    let is_hit = aff_type.is_hit();
-                    if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
-                        let wait_ms = start.elapsed().as_millis() as u64;
-                        self.metrics.record_queue_wait(wait_ms);
-                        self.metrics.record_affinity(is_hit);
-                        let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
-                        let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
-                        let aff_desc = match aff_type {
-                            AffinityType::SessionHit => "session affinity hit",
-                            AffinityType::PrefixHit => "prefix cache affinity hit",
-                            AffinityType::NewSlot => "new slot assigned",
-                        };
-                        return RouteDecision {
-                            target: TargetProvider::Local,
-                            est_tokens,
-                            is_spillover: false,
-                            reason: format!("local slot {slot_id} acquired from contention queue after {wait_ms}ms ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
-                            local_only,
-                            slot_guard: Some(LocalSlotGuard::new(
-                                self.metrics.clone(),
-                                Some(self.affinity_tracker.clone()),
-                                Some(slot_id),
-                                est_tokens,
-                            )),
-                            slot_id: Some(slot_id),
-                            is_affinity_hit: is_hit,
-                            affinity_type: aff_type,
-                            session_id: session_id.to_string(),
-                        };
-                    } else {
-                        self.affinity_tracker.release_slot(slot_id);
-                    }
-                }
-            }
-            if logged_queue_entry {
-                let wait_ms = start.elapsed().as_millis() as u64;
-                self.metrics.record_queue_wait(wait_ms);
-            }
+        if let Some((slot_id, aff_type, slot_guard, wait_ms)) = poll_local_slot_with_wait(
+            &self.metrics,
+            &self.affinity_tracker,
+            max_slots,
+            total_kv_budget,
+            session_id,
+            prefix_hash,
+            est_tokens,
+            is_orchestrator,
+            fast_mode,
+            effective_wait_ms,
+        )
+        .await
+        {
+            let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
+            let active_tokens = self.metrics.active_local_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            let aff_desc = affinity_desc(aff_type);
+            return RouteDecision {
+                target: TargetProvider::Local,
+                est_tokens,
+                is_spillover: false,
+                reason: format!("local slot {slot_id} acquired from contention queue after {wait_ms}ms ({aff_desc}, {active}/{max_slots} slots, {active_tokens}/{total_kv_budget} tokens)"),
+                local_only,
+                slot_guard: Some(slot_guard),
+                slot_id: Some(slot_id),
+                is_affinity_hit: aff_type.is_hit(),
+                affinity_type: aff_type,
+                session_id: session_id.to_string(),
+            };
         }
 
         if is_orchestrator {
@@ -383,31 +387,35 @@ impl Router {
                 session = %session_id,
                 "Queue wait expired ({effective_wait_ms}ms), but Cloud is currently rate-limited (429 backoff). Attempting emergency slot eviction..."
             );
-            if let Some((slot_id, aff_type)) = self.affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, true) {
-                if self.metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
-                    self.metrics.record_affinity(aff_type.is_hit());
-                    let slot_guard = LocalSlotGuard::new(
-                        self.metrics.clone(),
-                        Some(self.affinity_tracker.clone()),
-                        Some(slot_id),
-                        est_tokens,
-                    );
-                    return RouteDecision {
-                        target: TargetProvider::Local,
-                        est_tokens,
-                        is_spillover: false,
-                        reason: format!("rescued from cloud 429: acquired slot {slot_id} via emergency eviction"),
-                        local_only,
-                        slot_guard: Some(slot_guard),
-                        slot_id: Some(slot_id),
-                        is_affinity_hit: aff_type.is_hit(),
-                        affinity_type: aff_type,
-                        session_id: session_id.to_string(),
-                    };
-                } else {
-                    self.affinity_tracker.release_slot(slot_id);
-                }
+            if let Some((slot_id, aff_type, slot_guard)) = try_acquire_local_slot_now(
+                &self.metrics,
+                &self.affinity_tracker,
+                max_slots,
+                total_kv_budget,
+                session_id,
+                prefix_hash,
+                est_tokens,
+                true,
+            ) {
+                return RouteDecision {
+                    target: TargetProvider::Local,
+                    est_tokens,
+                    is_spillover: false,
+                    reason: format!("rescued from cloud 429: acquired slot {slot_id} via emergency eviction"),
+                    local_only,
+                    slot_guard: Some(slot_guard),
+                    slot_id: Some(slot_id),
+                    is_affinity_hit: aff_type.is_hit(),
+                    affinity_type: aff_type,
+                    session_id: session_id.to_string(),
+                };
             }
+        }
+
+        if fast_spillover_paced {
+            self.metrics
+                .fast_spillover_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let active = self.metrics.active_local_slots.load(std::sync::atomic::Ordering::Relaxed);
@@ -425,6 +433,154 @@ impl Router {
             session_id: session_id.to_string(),
         }
     }
+}
+
+fn affinity_desc(aff_type: AffinityType) -> &'static str {
+    match aff_type {
+        AffinityType::SessionHit => "session affinity hit",
+        AffinityType::PrefixHit => "prefix cache affinity hit",
+        AffinityType::NewSlot => "new slot assigned",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_acquire_local_slot_now(
+    metrics: &Arc<MetricsTracker>,
+    affinity_tracker: &Arc<SessionAffinityTracker>,
+    max_slots: usize,
+    total_kv_budget: u64,
+    session_id: &str,
+    prefix_hash: u64,
+    est_tokens: u64,
+    allow_eviction: bool,
+) -> Option<(usize, AffinityType, LocalSlotGuard)> {
+    if let Some((slot_id, aff_type)) = affinity_tracker.try_acquire_slot_opt(session_id, prefix_hash, allow_eviction) {
+        if metrics.try_acquire_local_capacity(est_tokens, max_slots, total_kv_budget) {
+            metrics.record_affinity(aff_type.is_hit());
+            return Some((
+                slot_id,
+                aff_type,
+                LocalSlotGuard::new(
+                    metrics.clone(),
+                    Some(affinity_tracker.clone()),
+                    Some(slot_id),
+                    est_tokens,
+                ),
+            ));
+        } else {
+            affinity_tracker.release_slot(slot_id);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_local_slot_with_wait(
+    metrics: &Arc<MetricsTracker>,
+    affinity_tracker: &Arc<SessionAffinityTracker>,
+    max_slots: usize,
+    total_kv_budget: u64,
+    session_id: &str,
+    prefix_hash: u64,
+    est_tokens: u64,
+    is_orchestrator: bool,
+    fast_mode: bool,
+    wait_limit_ms: u64,
+) -> Option<(usize, AffinityType, LocalSlotGuard, u64)> {
+    if wait_limit_ms == 0 {
+        return None;
+    }
+    let start = std::time::Instant::now();
+    let wait_limit = std::time::Duration::from_millis(wait_limit_ms);
+    let poll_interval = if is_orchestrator || fast_mode { 5 } else { 25 };
+    let mut logged_queue_entry = false;
+    let mut last_queue_heartbeat = start;
+    while start.elapsed() < wait_limit {
+        if !logged_queue_entry {
+            let prio_label = if is_orchestrator { "orchestrator" } else { "standard" };
+            tracing::info!(
+                session = %session_id,
+                est_tokens,
+                timeout_ms = wait_limit_ms,
+                priority = prio_label,
+                "Local slots saturated; request entered contention queue waiting for available slot"
+            );
+            logged_queue_entry = true;
+        } else if last_queue_heartbeat.elapsed() >= std::time::Duration::from_secs(10) {
+            tracing::info!(
+                session = %session_id,
+                elapsed_ms = start.elapsed().as_millis(),
+                timeout_ms = wait_limit_ms,
+                "Request waiting in contention queue"
+            );
+            last_queue_heartbeat = std::time::Instant::now();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(poll_interval)).await;
+        // Allow eviction for orchestrators immediately, or for workers after waiting 70% of timeout (capped at 15s)
+        let allow_eviction = is_orchestrator || (start.elapsed().as_millis() >= (wait_limit_ms as u128 * 7 / 10).min(15000));
+        if let Some((slot_id, aff_type, slot_guard)) = try_acquire_local_slot_now(
+            metrics,
+            affinity_tracker,
+            max_slots,
+            total_kv_budget,
+            session_id,
+            prefix_hash,
+            est_tokens,
+            allow_eviction,
+        ) {
+            let wait_ms = start.elapsed().as_millis() as u64;
+            metrics.record_queue_wait(wait_ms);
+            return Some((slot_id, aff_type, slot_guard, wait_ms));
+        }
+    }
+    if logged_queue_entry {
+        let wait_ms = start.elapsed().as_millis() as u64;
+        metrics.record_queue_wait(wait_ms);
+    }
+    None
+}
+
+/// Shared bounded local slot acquisition helper used by both `Router` and `UpstreamClient`
+/// during Cloud 429/5xx local failover.
+#[allow(clippy::too_many_arguments)]
+pub async fn acquire_local_slot_with_wait(
+    metrics: &Arc<MetricsTracker>,
+    affinity_tracker: &Arc<SessionAffinityTracker>,
+    max_slots: usize,
+    total_kv_budget: u64,
+    session_id: &str,
+    prefix_hash: u64,
+    est_tokens: u64,
+    is_orchestrator: bool,
+    fast_mode: bool,
+    wait_limit_ms: u64,
+) -> Option<(usize, AffinityType, LocalSlotGuard)> {
+    if let Some(acquired) = try_acquire_local_slot_now(
+        metrics,
+        affinity_tracker,
+        max_slots,
+        total_kv_budget,
+        session_id,
+        prefix_hash,
+        est_tokens,
+        is_orchestrator,
+    ) {
+        return Some(acquired);
+    }
+    poll_local_slot_with_wait(
+        metrics,
+        affinity_tracker,
+        max_slots,
+        total_kv_budget,
+        session_id,
+        prefix_hash,
+        est_tokens,
+        is_orchestrator,
+        fast_mode,
+        wait_limit_ms,
+    )
+    .await
+    .map(|(slot_id, aff_type, guard, _wait_ms)| (slot_id, aff_type, guard))
 }
 
 #[cfg(test)]
@@ -625,5 +781,141 @@ mod tests {
         let dec2 = router.decide_with_session(&hard_body, None, None, "test-sess-2").await;
         assert_eq!(dec2.target, TargetProvider::Local);
         assert!(dec2.slot_guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_fast_spillover_cold_vs_warm_affinity_pacing() {
+        let mut config = Config::default();
+        config.routing.default_route = "hybrid".to_string();
+        config.routing.fast_spillover_enabled = true;
+        config.routing.cloud_window_request_budget = 1000;
+        config.routing.cognitive_reserve_ratio = 0.35;
+        config.routing.cold_spill_wait_ms = 30;
+        config.routing.warm_affinity_wait_ms = 120;
+        config.local.max_slots = 1;
+        config.local.queue_timeout_ms = 5000;
+        let config = Arc::new(config);
+        let metrics = Arc::new(MetricsTracker::default());
+        let router = Router::new(config, metrics.clone());
+
+        let routine_body = json!({
+            "messages": [
+                { "role": "user", "content": "ok" }
+            ]
+        });
+
+        // Establish warm affinity for "warm-session" on slot 0, then release it
+        let warm_init = router
+            .decide_with_session(&routine_body, None, None, "warm-session")
+            .await;
+        assert_eq!(warm_init.target, TargetProvider::Local);
+        drop(warm_init);
+
+        // Occupy slot 0 with a different session ("holder")
+        let holder = router
+            .decide_with_session(&routine_body, None, None, "holder-session")
+            .await;
+        assert_eq!(holder.target, TargetProvider::Local);
+
+        //Wait: "holder-session" overwrote slot 0's session mapping in `sessions`,
+        // so let's re-verify: if "warm-session" had its own slot (e.g. max_slots=2),
+        // or if we test PrefixHit! Let's use `peek_affinity` with PrefixHit or 2 slots.
+        // Actually, let's keep `holder` holding slot 0, and check a cold session first:
+        let cold_body = json!({
+            "messages": [
+                { "role": "user", "content": "continue" }
+            ]
+        });
+        let t_cold = std::time::Instant::now();
+        let cold_dec = router
+            .decide_with_session(&cold_body, None, None, "cold-session")
+            .await;
+        let cold_elapsed = t_cold.elapsed();
+        assert_eq!(cold_dec.target, TargetProvider::Cloud);
+        assert!(cold_dec.is_spillover);
+        assert!(
+            cold_elapsed.as_millis() < 90,
+            "cold turn should spill within ~cold_spill_wait_ms (30ms), took {:?}",
+            cold_elapsed
+        );
+        assert_eq!(
+            metrics.fast_spillover_requests.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Now test warm affinity turn (via PrefixHit since slot 0 has `routine_body` prefix):
+        let t_warm = std::time::Instant::now();
+        let warm_dec = router
+            .decide_with_session(&routine_body, None, None, "warm-prefix-session")
+            .await;
+        let warm_elapsed = t_warm.elapsed();
+        assert_eq!(warm_dec.target, TargetProvider::Cloud);
+        assert!(warm_dec.is_spillover);
+        assert!(
+            warm_elapsed.as_millis() >= 100,
+            "warm affinity turn should wait ~warm_affinity_wait_ms (120ms), took {:?}",
+            warm_elapsed
+        );
+        drop(holder);
+    }
+
+    #[tokio::test]
+    async fn test_fast_spillover_throttled_at_35_percent_reserve() {
+        let mut config = Config::default();
+        config.routing.default_route = "hybrid".to_string();
+        config.routing.fast_spillover_enabled = true;
+        config.routing.cloud_window_request_budget = 100;
+        config.routing.cloud_window_secs = 18000;
+        config.routing.cognitive_reserve_ratio = 0.35;
+        config.routing.cold_spill_wait_ms = 20;
+        config.routing.warm_affinity_wait_ms = 150;
+        config.local.max_slots = 1;
+        config.local.queue_timeout_ms = 110;
+        let config = Arc::new(config);
+        let metrics = Arc::new(MetricsTracker::default());
+        let router = Router::new(config, metrics.clone());
+
+        // Exhaust 65% of the 100-request budget, leaving only the 35% cognitive reserve
+        for _ in 0..65 {
+            metrics.inc_cloud(100, true);
+        }
+        assert!(!metrics.can_fast_spillover(100, 18000, 0.35));
+
+        let routine_body = json!({
+            "messages": [
+                { "role": "user", "content": "ok" }
+            ]
+        });
+
+        let holder = router
+            .decide_with_session(&routine_body, None, None, "holder-session")
+            .await;
+        assert_eq!(holder.target, TargetProvider::Local);
+
+        // Cold session should NOT fast-spill in 20ms; it must throttle and fall back to queue_timeout_ms (110ms)
+        let t0 = std::time::Instant::now();
+        let dec = router
+            .decide_with_session(&routine_body, None, None, "throttled-cold-session")
+            .await;
+        let elapsed = t0.elapsed();
+        assert_eq!(dec.target, TargetProvider::Cloud);
+        assert!(
+            elapsed.as_millis() >= 95,
+            "throttled turn should wait full queue_timeout_ms (110ms), took {:?}",
+            elapsed
+        );
+        assert_eq!(
+            metrics
+                .fast_spillover_throttled_skips
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .fast_spillover_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        drop(holder);
     }
 }

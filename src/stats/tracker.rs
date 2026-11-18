@@ -81,6 +81,12 @@ pub struct MetricsTracker {
     pub security_requests: AtomicU64,
     pub fuzzer_requests: AtomicU64,
     pub explorer_requests: AtomicU64,
+
+    // Quota-paced fast spillover metrics
+    pub window_start_epoch_secs: AtomicU64,
+    pub window_cloud_requests: AtomicU64,
+    pub fast_spillover_requests: AtomicU64,
+    pub fast_spillover_throttled_skips: AtomicU64,
 }
 
 impl Default for MetricsTracker {
@@ -148,6 +154,11 @@ impl Default for MetricsTracker {
             security_requests: AtomicU64::new(0),
             fuzzer_requests: AtomicU64::new(0),
             explorer_requests: AtomicU64::new(0),
+
+            window_start_epoch_secs: AtomicU64::new(Self::current_epoch_secs()),
+            window_cloud_requests: AtomicU64::new(0),
+            fast_spillover_requests: AtomicU64::new(0),
+            fast_spillover_throttled_skips: AtomicU64::new(0),
         }
     }
 }
@@ -217,6 +228,10 @@ pub struct StatsSnapshot {
     pub security_requests_total: u64,
     pub fuzzer_requests_total: u64,
     pub explorer_requests_total: u64,
+
+    pub window_cloud_requests: u64,
+    pub fast_spillover_requests: u64,
+    pub fast_spillover_throttled_skips: u64,
 }
 
 impl MetricsTracker {
@@ -335,6 +350,7 @@ impl MetricsTracker {
     pub fn inc_cloud(&self, tokens: u64, is_spillover: bool) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.cloud_requests.fetch_add(1, Ordering::Relaxed);
+        self.window_cloud_requests.fetch_add(1, Ordering::Relaxed);
         self.total_tokens_est.fetch_add(tokens, Ordering::Relaxed);
         self.cloud_tokens_est.fetch_add(tokens, Ordering::Relaxed);
         if is_spillover {
@@ -353,6 +369,7 @@ impl MetricsTracker {
         Self::saturating_sub_u64(&self.local_requests, 1);
         Self::saturating_sub_u64(&self.local_tokens_est, local_tokens);
         self.cloud_requests.fetch_add(1, Ordering::Relaxed);
+        self.window_cloud_requests.fetch_add(1, Ordering::Relaxed);
         self.cloud_tokens_est.fetch_add(cloud_tokens, Ordering::Relaxed);
         if cloud_tokens >= local_tokens {
             self.total_tokens_est
@@ -368,6 +385,7 @@ impl MetricsTracker {
         self.failover_requests.fetch_add(1, Ordering::Relaxed);
         Self::saturating_sub_u64(&self.total_requests, 1);
         Self::saturating_sub_u64(&self.cloud_requests, 1);
+        Self::saturating_sub_u64(&self.window_cloud_requests, 1);
         Self::saturating_sub_u64(&self.total_tokens_est, cloud_tokens);
         Self::saturating_sub_u64(&self.cloud_tokens_est, cloud_tokens);
         if is_spillover {
@@ -468,11 +486,15 @@ impl MetricsTracker {
         self.strata_online.load(Ordering::Relaxed)
     }
 
-    pub fn record_cloud_rate_limit(&self, backoff_secs: u64) {
-        let now = std::time::SystemTime::now()
+    fn current_epoch_secs() -> u64 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_secs()
+    }
+
+    pub fn record_cloud_rate_limit(&self, backoff_secs: u64) {
+        let now = Self::current_epoch_secs();
         self.cloud_rate_limited_until.store(now + backoff_secs, Ordering::Relaxed);
     }
 
@@ -481,15 +503,34 @@ impl MetricsTracker {
         if until == 0 {
             return false;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now < until
+        Self::current_epoch_secs() < until
     }
 
     pub fn clear_cloud_rate_limit(&self) {
         self.cloud_rate_limited_until.store(0, Ordering::Relaxed);
+    }
+
+    /// Returns `true` when Cloud spillover quota is healthy:
+    /// `budget > 0`, Cloud is not rate-limited, and `used < budget * (1.0 - reserve_ratio)`.
+    /// Resets `window_cloud_requests` when `now - window_start >= window_secs`.
+    pub fn can_fast_spillover(&self, budget: u64, window_secs: u64, reserve_ratio: f64) -> bool {
+        if budget == 0 || self.is_cloud_rate_limited() {
+            return false;
+        }
+        let now = Self::current_epoch_secs();
+        let start = self.window_start_epoch_secs.load(Ordering::Relaxed);
+        if window_secs > 0 && now.saturating_sub(start) >= window_secs {
+            if self
+                .window_start_epoch_secs
+                .compare_exchange(start, now, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.window_cloud_requests.store(0, Ordering::Relaxed);
+            }
+        }
+        let used = self.window_cloud_requests.load(Ordering::Relaxed) as f64;
+        let allowed = (budget as f64) * (1.0 - reserve_ratio.clamp(0.0, 1.0));
+        used < allowed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -654,6 +695,10 @@ impl MetricsTracker {
             security_requests_total: self.security_requests.load(Ordering::Relaxed),
             fuzzer_requests_total: self.fuzzer_requests.load(Ordering::Relaxed),
             explorer_requests_total: self.explorer_requests.load(Ordering::Relaxed),
+
+            window_cloud_requests: self.window_cloud_requests.load(Ordering::Relaxed),
+            fast_spillover_requests: self.fast_spillover_requests.load(Ordering::Relaxed),
+            fast_spillover_throttled_skips: self.fast_spillover_throttled_skips.load(Ordering::Relaxed),
         }
     }
 

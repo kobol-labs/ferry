@@ -120,7 +120,16 @@ pub fn render_prometheus(s: &StatsSnapshot) -> String {
          # TYPE ferry_pillar_requests_total counter\n\
          ferry_pillar_requests_total{{pillar=\"security\"}} {sec_reqs}\n\
          ferry_pillar_requests_total{{pillar=\"fuzzer\"}} {fuzz_reqs}\n\
-         ferry_pillar_requests_total{{pillar=\"explorer\"}} {exp_reqs}\n",
+         ferry_pillar_requests_total{{pillar=\"explorer\"}} {exp_reqs}\n\
+         # HELP ferry_fast_spillover_requests_total Total requests fast-spilled to cloud under healthy quota\n\
+         # TYPE ferry_fast_spillover_requests_total counter\n\
+         ferry_fast_spillover_requests_total {fast_spill}\n\
+         # HELP ferry_fast_spillover_throttled_skips_total Total fast-spillover attempts throttled to protect cognitive reserve\n\
+         # TYPE ferry_fast_spillover_throttled_skips_total counter\n\
+         ferry_fast_spillover_throttled_skips_total {fast_spill_skips}\n\
+         # HELP ferry_cloud_window_requests Cloud requests used in the current quota window\n\
+         # TYPE ferry_cloud_window_requests gauge\n\
+         ferry_cloud_window_requests {window_cloud}\n",
         total = s.total_requests,
         local = s.local_requests,
         cloud = s.cloud_requests,
@@ -172,5 +181,8 @@ pub fn render_prometheus(s: &StatsSnapshot) -> String {
         sec_reqs = s.security_requests_total,
         fuzz_reqs = s.fuzzer_requests_total,
         exp_reqs = s.explorer_requests_total,
+        fast_spill = s.fast_spillover_requests,
+        fast_spill_skips = s.fast_spillover_throttled_skips,
+        window_cloud = s.window_cloud_requests,
     )
 }

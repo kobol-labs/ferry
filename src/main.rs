@@ -345,6 +345,15 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             "parent": null
         }),
         json!({
+            "id": "ferry-security",
+            "object": "model",
+            "created": 1735689600,
+            "owned_by": "kobol-labs",
+            "permission": [],
+            "root": "ferry-security",
+            "parent": null
+        }),
+        json!({
             "id": local_model,
             "object": "model",
             "created": 1735689600,
@@ -530,24 +539,25 @@ async fn chat_completions_handler(
         .and_then(|h| h.to_str().ok())
     {
         state.metrics.record_pillar(pillar);
-    } else if body
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map(|tools| {
-            tools.iter().any(|tool| {
-                let name = tool
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .or_else(|| tool.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                matches!(
-                    name,
-                    "create_vulnerability_report" | "record_coverage" | "finish_scan"
-                )
+    } else if body.get("model").and_then(|m| m.as_str()) == Some("ferry-security")
+        || body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|tools| {
+                tools.iter().any(|tool| {
+                    let name = tool
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .or_else(|| tool.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("");
+                    matches!(
+                        name,
+                        "create_vulnerability_report" | "record_coverage" | "finish_scan"
+                    )
+                })
             })
-        })
-        .unwrap_or(false)
+            .unwrap_or(false)
     {
         state.metrics.record_pillar("security");
     }
@@ -665,7 +675,10 @@ async fn chat_completions_handler(
         .unwrap_or(false);
 
     let precomputed_hard_logic = if effective_mode == ferry::router::RoutingMode::Hybrid {
-        Some(ferry::router::Router::is_hard_logic_turn(&body))
+        Some(ferry::router::Router::is_hard_logic_turn_with_options(
+            &body,
+            state.config.routing.security_escalation,
+        ))
     } else {
         None
     };
@@ -740,6 +753,36 @@ async fn chat_completions_handler(
                         );
                     }
                 }
+            }
+        }
+    }
+
+    // Preemptive Local Strata Rescue (#26): when Cloud is rate-limited (429 backoff),
+    // compact oversized prompts before routing so they land directly on local Strata.
+    if state.metrics.is_cloud_rate_limited()
+        && !state.metrics.is_circuit_open()
+        && state.metrics.is_strata_online()
+        && effective_mode != ferry::router::RoutingMode::CloudOnly
+    {
+        let max_context = state.config.local.max_context_tokens as u64;
+        let current_tokens = precomputed_tokens
+            .unwrap_or_else(|| ferry::router::Router::estimate_tokens(&body));
+        if current_tokens > max_context {
+            if cloud_fidelity_body.is_none() {
+                cloud_fidelity_body = Some(body.clone());
+            }
+            if let Some(emergency_saved) = state.condenser.emergency_compact_to_fit(&mut body, max_context) {
+                total_chars_saved += emergency_saved;
+                let new_tokens = ferry::router::Router::estimate_tokens(&body);
+                precomputed_tokens = Some(new_tokens);
+                tracing::info!(
+                    session = %session_id,
+                    before = current_tokens,
+                    after = new_tokens,
+                    max = max_context,
+                    emergency_saved,
+                    "Preemptive emergency compaction fit oversized prompt into local Strata during Cloud 429 backoff"
+                );
             }
         }
     }
@@ -1138,5 +1181,151 @@ mod tests {
         assert_eq!(snap.local_requests, 0);
         assert_eq!(snap.cloud_requests, 1);
         assert_eq!(snap.failover_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn test_preemptive_rescue_routes_oversized_to_local_when_cloud_rate_limited() {
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let local_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": "chatcmpl-local-rescue",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "rescued locally" },
+                            "finish_reason": "stop"
+                        }]
+                    })),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(local_listener, local_app).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", local_addr);
+        cfg.local.max_context_tokens = 2_000;
+        cfg.local.total_kv_token_budget = 16_000;
+        cfg.local.adaptive_squeezing = false;
+        cfg.condensation.rolling_compaction = false;
+        cfg.routing.default_route = "hybrid".to_string();
+        let config = Arc::new(cfg);
+
+        let metrics = Arc::new(MetricsTracker::new());
+        metrics.record_cloud_rate_limit(120);
+        assert!(metrics.is_cloud_rate_limited());
+
+        let router = HybridRouter::new(config.clone(), metrics.clone());
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(false, 10, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics: metrics.clone(),
+            router,
+            condenser,
+            upstream,
+            cache,
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        // Oversized (> 2000 tokens) prompt across multiple historical turns
+        let padding = "history ".repeat(400);
+        let body = json!({
+            "model": "ferry",
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "System prompt" },
+                { "role": "user", "content": format!("Turn 1: {padding}") },
+                { "role": "assistant", "content": format!("Reply 1: {padding}") },
+                { "role": "user", "content": format!("Turn 2: {padding}") },
+                { "role": "assistant", "content": format!("Reply 2: {padding}") },
+                { "role": "user", "content": "Final turn" }
+            ]
+        });
+        assert!(HybridRouter::estimate_tokens(&body) > 2_000);
+
+        let resp = chat_completions_handler(State(state), HeaderMap::new(), Json(body)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-ferry-provider").and_then(|v| v.to_str().ok()),
+            Some("local")
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.local_requests, 1);
+        assert_eq!(snap.cloud_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ferry_security_model_alias_and_pillar_telemetry() {
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let local_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": "chatcmpl-sec",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "ok" },
+                            "finish_reason": "stop"
+                        }]
+                    })),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(local_listener, local_app).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", local_addr);
+        let config = Arc::new(cfg);
+        let metrics = Arc::new(MetricsTracker::new());
+        let router = HybridRouter::new(config.clone(), metrics.clone());
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(false, 10, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics: metrics.clone(),
+            router,
+            condenser,
+            upstream,
+            cache,
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        // 1. /v1/models lists ferry-security
+        let models_resp = models_handler(State(state.clone())).await.into_response();
+        let bytes = axum::body::to_bytes(models_resp.into_body(), usize::MAX).await.unwrap();
+        let models_json: Value = serde_json::from_slice(&bytes).unwrap();
+        let has_ferry_security = models_json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "ferry-security");
+        assert!(has_ferry_security, "/v1/models must expose ferry-security alias");
+
+        // 2. Sending model: "ferry-security" auto-records security pillar telemetry
+        let body = json!({
+            "model": "ferry-security",
+            "stream": false,
+            "messages": [{ "role": "user", "content": "ok" }]
+        });
+        let resp = chat_completions_handler(State(state), HeaderMap::new(), Json(body)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(metrics.snapshot().security_requests_total, 1);
     }
 }
