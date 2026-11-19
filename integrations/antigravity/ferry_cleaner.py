@@ -15,6 +15,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -102,8 +103,18 @@ def record_stats(command_str: str, raw_text: str, cleaned_text: str) -> None:
         if len(history) >= MAX_STATS_HISTORY:
             history = history[-(MAX_STATS_HISTORY - 1) :]
         history.append(entry)
-        with open(stats_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        stats_dir = os.path.dirname(os.path.abspath(stats_path)) or "/tmp"
+        fd, tmp_path = tempfile.mkstemp(prefix=".ferry_cleaner_stats_", suffix=".tmp", dir=stats_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+            os.replace(tmp_path, stats_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
     except Exception:
         pass
 

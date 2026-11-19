@@ -120,7 +120,7 @@ pub fn shield_directory_traversals(input: &str) -> (String, usize) {
         let mut matched_cat = None;
 
         for (pattern, cat) in DIR_SHIELD_PATTERNS {
-            if is_directory_listing_line(line, pattern) {
+            if is_directory_listing_line(line, pattern) || is_directory_listing_line(line, cat) {
                 matched_cat = Some(*cat);
                 break;
             }

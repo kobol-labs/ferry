@@ -173,6 +173,47 @@ class TestFerryCleanerDirect(unittest.TestCase):
         condensed = ferry_cleaner.condense_output(raw)
         self.assertIn("```json\n{\n  \"title\": \"sample\"\n}\n```", condensed)
 
+    def test_strip_progress_artifacts_newline_and_cr(self):
+        raw = "\n".join([
+            "Starting download...",
+            "[=====>    ] 50%",
+            "|███--| 50%",
+            "Downloading package.tar.gz 50%",
+            "Fetch: dependencies 75%",
+            "Step 1/4\rStep 2/4\rStep 4/4",
+            "Completed.",
+        ])
+        cleaned = ferry_cleaner.strip_progress_artifacts(raw)
+        self.assertIn("Starting download...", cleaned)
+        self.assertIn("Step 4/4", cleaned)
+        self.assertIn("Completed.", cleaned)
+        self.assertNotIn("[=====>    ] 50%", cleaned)
+        self.assertNotIn("|███--| 50%", cleaned)
+        self.assertNotIn("Downloading package.tar.gz 50%", cleaned)
+        self.assertNotIn("Fetch: dependencies 75%", cleaned)
+
+    def test_record_stats_atomic_write(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stats_file = os.path.join(tmpdir, "ferry_stats.json")
+            prev = os.environ.get("FERRY_CLEANER_STATS_FILE")
+            os.environ["FERRY_CLEANER_STATS_FILE"] = stats_file
+            try:
+                ferry_cleaner.record_stats("cargo test", "raw output", "cleaned")
+                self.assertTrue(os.path.exists(stats_file))
+                with open(stats_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(len(data), 1)
+                self.assertEqual(data[0]["command"], "cargo test")
+                # Ensure no leftover temporary files remain in tmpdir
+                leftovers = [name for name in os.listdir(tmpdir) if name != "ferry_stats.json"]
+                self.assertEqual(leftovers, [])
+            finally:
+                if prev is None:
+                    os.environ.pop("FERRY_CLEANER_STATS_FILE", None)
+                else:
+                    os.environ["FERRY_CLEANER_STATS_FILE"] = prev
+
 
 class TestFerryCleanerSubprocess(unittest.TestCase):
     """End-to-end integration tests executing ferry_cleaner.py as a CLI process."""

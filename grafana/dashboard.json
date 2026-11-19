@@ -193,7 +193,7 @@
       "fieldConfig": {
         "defaults": {
           "min": 0,
-          "max": 3,
+          "max": 4,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -202,11 +202,11 @@
                 "color": "green"
               },
               {
-                "value": 2,
+                "value": 3,
                 "color": "orange"
               },
               {
-                "value": 3,
+                "value": 4,
                 "color": "red"
               }
             ]
@@ -225,7 +225,7 @@
       "targets": [
         {
           "expr": "ferry_active_slots",
-          "legendFormat": "Slots In-Use (Max 3)",
+          "legendFormat": "Slots In-Use (Max 4)",
           "refId": "A"
         }
       ]
@@ -578,7 +578,7 @@
     },
     {
       "id": 11,
-      "title": "Hardware Slot Saturation (Max 3 Slots)",
+      "title": "Hardware Slot Saturation (Max 4 Slots)",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -593,7 +593,7 @@
       "fieldConfig": {
         "defaults": {
           "min": 0,
-          "max": 3.5,
+          "max": 4.5,
           "custom": {
             "drawStyle": "line",
             "lineInterpolation": "stepAfter",
@@ -608,16 +608,42 @@
                 "color": "green"
               },
               {
-                "value": 2,
+                "value": 3,
                 "color": "orange"
               },
               {
-                "value": 3,
+                "value": 4,
                 "color": "red"
               }
             ]
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Active KV Tokens Reserved"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": null
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {

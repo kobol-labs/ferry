@@ -268,4 +268,77 @@ fn test_config_hygiene_no_dead_keys_no_lan_secrets_and_dockerfile_locked() {
         dockerfile.contains("cargo build --release --locked"),
         "Dockerfile must build with --locked"
     );
+    assert!(
+        dockerfile.contains("adduser -D -u 10001 ferry") && dockerfile.contains("USER ferry"),
+        "Dockerfile must create and run as non-root user ferry"
+    );
+}
+
+#[test]
+fn test_issue_32_env_overrides_routing_condenser_and_grafana_4_slots() {
+    // 1. Verify relative venv/ on line 1 is shielded by Rust condenser
+    let venv_listing = (0..6)
+        .map(|i| format!("venv/lib/python3.11/site-packages/pkg_{i}/__init__.py"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (shielded, count) = ferry::condenser::directory::shield_directory_traversals(&venv_listing);
+    assert_eq!(count, 6);
+    assert!(shielded.contains("6 directory entries in venv/ suppressed"));
+
+    // 2. Verify all 10 new FERRY_* env overrides work on Config::load_from_file_or_default
+    let env_vars = [
+        ("FERRY_PRUNE_LOCKFILE_DIFFS", "false"),
+        ("FERRY_SUPPRESS_BASE64_BLOBS", "false"),
+        ("FERRY_SHIELD_DIR_TRAVERSALS", "false"),
+        ("FERRY_SECURITY_ESCALATION", "false"),
+        ("FERRY_FAST_SPILLOVER_ENABLED", "false"),
+        ("FERRY_CLOUD_WINDOW_REQUEST_BUDGET", "900"),
+        ("FERRY_CLOUD_WINDOW_SECS", "7200"),
+        ("FERRY_COGNITIVE_RESERVE_RATIO", "0.5"),
+        ("FERRY_COLD_SPILL_WAIT_MS", "3500"),
+        ("FERRY_WARM_AFFINITY_WAIT_MS", "25000"),
+    ];
+    for (k, v) in &env_vars {
+        std::env::set_var(k, v);
+    }
+    let cfg = Config::load_from_file_or_default("/nonexistent/ferry.toml");
+    for (k, _) in &env_vars {
+        std::env::remove_var(k);
+    }
+
+    assert!(!cfg.condensation.prune_lockfile_diffs);
+    assert!(!cfg.condensation.suppress_base64_blobs);
+    assert!(!cfg.condensation.shield_dir_traversals);
+    assert!(!cfg.routing.security_escalation);
+    assert!(!cfg.routing.fast_spillover_enabled);
+    assert_eq!(cfg.routing.cloud_window_request_budget, 900);
+    assert_eq!(cfg.routing.cloud_window_secs, 7200);
+    assert!((cfg.routing.cognitive_reserve_ratio - 0.5).abs() < 1e-6);
+    assert_eq!(cfg.routing.cold_spill_wait_ms, 3500);
+    assert_eq!(cfg.routing.warm_affinity_wait_ms, 25000);
+
+    // 3. Verify grafana/dashboard.json Panel 3 and Panel 11 4-slot scale and right-axis token override
+    let raw = std::fs::read_to_string(repo_root().join("grafana/dashboard.json"))
+        .expect("grafana/dashboard.json must be readable");
+    let dash: Value = serde_json::from_str(&raw).expect("valid JSON");
+    let panels = dash["panels"].as_array().expect("panels array");
+
+    let panel3 = panels
+        .iter()
+        .find(|p| p["id"] == 3)
+        .expect("Panel 3 Active GPU Slots must exist");
+    assert_eq!(panel3["fieldConfig"]["defaults"]["max"], json!(4));
+
+    let panel11 = panels
+        .iter()
+        .find(|p| p["id"] == 11)
+        .expect("Panel 11 Hardware Slot Saturation must exist");
+    assert_eq!(panel11["fieldConfig"]["defaults"]["max"], json!(4.5));
+    let overrides = panel11["fieldConfig"]["overrides"]
+        .as_array()
+        .expect("Panel 11 must have fieldConfig.overrides");
+    assert!(!overrides.is_empty());
+    let ov_str = serde_json::to_string(overrides).unwrap();
+    assert!(ov_str.contains("Active KV Tokens Reserved"));
+    assert!(ov_str.contains("axisPlacement") && ov_str.contains("right"));
 }

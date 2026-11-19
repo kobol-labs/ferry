@@ -8,11 +8,12 @@ RUN cargo build --release --locked
 
 # Stage 2: Minimal runtime image (<20MB)
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 ferry
 WORKDIR /app
 COPY --from=builder /app/target/release/ferry /usr/local/bin/ferry
 COPY ferry.example.toml /app/ferry.toml
 
+USER ferry
 EXPOSE 4000
 ENV FERRY_CONFIG=/app/ferry.toml
 CMD ["ferry"]
