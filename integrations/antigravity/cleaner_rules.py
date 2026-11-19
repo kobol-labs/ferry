@@ -109,15 +109,21 @@ def strip_ansi(text: str) -> str:
 
 
 def strip_progress_artifacts(text: str) -> str:
-    """Cleans up carriage return progress bar overwrites (e.g. download % lines)."""
-    if "\r" not in text:
-        return text
+    """Cleans up carriage return progress bar overwrites and newline-delimited progress bar lines."""
     lines = []
     for line in text.split("\n"):
         if "\r" in line:
-            parts = line.split("\r")
-            line = parts[-1] if parts[-1].strip() else parts[0]
-        lines.append(line)
+            non_empty = [s for s in line.split("\r") if s.strip()]
+            line = non_empty[-1] if non_empty else ""
+        trimmed = line.strip()
+        is_progress = (
+            ("[" in trimmed and "]" in trimmed and "%" in trimmed and ("=" in trimmed or ">" in trimmed))
+            or ("|" in trimmed and ("█" in trimmed or "#" in trimmed) and "%" in trimmed)
+            or (trimmed.startswith("Downloading ") and trimmed.endswith("%"))
+            or (trimmed.startswith("Fetch: ") and trimmed.endswith("%"))
+        )
+        if not is_progress:
+            lines.append(line)
     return "\n".join(lines)
 
 

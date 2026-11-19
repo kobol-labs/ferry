@@ -31,6 +31,13 @@ timeout_secs = 300
 # - "hybrid": Segregates turns based on cognitive complexity. Mechanical commands stay local; hard logic/diagnostic failures escalate to cloud, then immediately revert to local.
 # - "cloud-only": Bypasses local hardware entirely and routes directly to cloud.
 default_route = "hybrid"
+security_escalation = true
+fast_spillover_enabled = true
+cloud_window_request_budget = 1500
+cloud_window_secs = 18000
+cognitive_reserve_ratio = 0.35
+cold_spill_wait_ms = 2000
+warm_affinity_wait_ms = 15000
 
 [affinity]
 enabled = true

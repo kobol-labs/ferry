@@ -143,6 +143,15 @@ impl Config {
         if let Ok(v) = std::env::var("FERRY_MINIFY_JSON") {
             if let Some(b) = parse_bool(&v) { self.condensation.minify_json_outputs = b; }
         }
+        if let Ok(v) = std::env::var("FERRY_PRUNE_LOCKFILE_DIFFS") {
+            if let Some(b) = parse_bool(&v) { self.condensation.prune_lockfile_diffs = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_SUPPRESS_BASE64_BLOBS") {
+            if let Some(b) = parse_bool(&v) { self.condensation.suppress_base64_blobs = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_SHIELD_DIR_TRAVERSALS") {
+            if let Some(b) = parse_bool(&v) { self.condensation.shield_dir_traversals = b; }
+        }
         if let Ok(v) = std::env::var("FERRY_FOLD_REPEATED_TOOL_FAILURES") {
             if let Some(b) = parse_bool(&v) { self.condensation.fold_repeated_tool_failures = b; }
         }
@@ -169,6 +178,27 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FERRY_DEFAULT_ROUTE") {
             if !v.trim().is_empty() { self.routing.default_route = v; }
+        }
+        if let Ok(v) = std::env::var("FERRY_SECURITY_ESCALATION") {
+            if let Some(b) = parse_bool(&v) { self.routing.security_escalation = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_FAST_SPILLOVER_ENABLED") {
+            if let Some(b) = parse_bool(&v) { self.routing.fast_spillover_enabled = b; }
+        }
+        if let Ok(v) = std::env::var("FERRY_CLOUD_WINDOW_REQUEST_BUDGET") {
+            if let Ok(n) = v.parse() { self.routing.cloud_window_request_budget = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_CLOUD_WINDOW_SECS") {
+            if let Ok(n) = v.parse() { self.routing.cloud_window_secs = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_COGNITIVE_RESERVE_RATIO") {
+            if let Ok(f) = v.parse() { self.routing.cognitive_reserve_ratio = f; }
+        }
+        if let Ok(v) = std::env::var("FERRY_COLD_SPILL_WAIT_MS") {
+            if let Ok(n) = v.parse() { self.routing.cold_spill_wait_ms = n; }
+        }
+        if let Ok(v) = std::env::var("FERRY_WARM_AFFINITY_WAIT_MS") {
+            if let Ok(n) = v.parse() { self.routing.warm_affinity_wait_ms = n; }
         }
         if let Ok(v) = std::env::var("FERRY_AFFINITY_ENABLED") {
             if let Some(b) = parse_bool(&v) { self.affinity.enabled = b; }
