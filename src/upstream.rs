@@ -665,9 +665,15 @@ impl UpstreamClient {
             "Routing to Cloud Provider"
         );
 
-        // Strip local-specific id_slot parameter before sending to Cloud
+        let condense_allowed = self.config.condensation.enabled
+            && !body
+                .get("__ferry_no_condense")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        // Strip local-specific id_slot parameter and internal markers before sending to Cloud
         if let Some(obj) = body.as_object_mut() {
             obj.remove("id_slot");
+            obj.remove("__ferry_no_condense");
         }
 
         let cloud_url = format!("{}/chat/completions", self.config.cloud.api_base.trim_end_matches('/'));
@@ -709,114 +715,21 @@ impl UpstreamClient {
                         );
                     }
 
-                    // Zero-drop in-flight failover: Attempt local execution ONLY if Strata is healthy,
-                    // prompt fits local context (or after rolling compaction / adaptive squeeze), and an actual LocalSlotGuard is acquired.
-                    if !is_failover
-                        && decision.reason != "routing mode cloud-only"
-                        && !self.metrics.is_circuit_open()
-                        && self.metrics.is_strata_online()
+                    if let Some(rescued_resp) = self
+                        .try_inflight_local_rescue(
+                            &mut body,
+                            &decision,
+                            req_id,
+                            is_failover,
+                            chars_saved,
+                            savings_pct,
+                            &cache_key,
+                            condense_allowed,
+                            &format!("HTTP {}", status.as_u16()),
+                        )
+                        .await
                     {
-                        let max_context = self.config.local.max_context_tokens as u64;
-                        let max_slots = self.config.local.max_slots;
-                        let total_kv_budget = self.config.local.total_kv_token_budget as u64;
-
-                        let mut est_tokens = if decision.est_tokens > 0 {
-                            decision.est_tokens
-                        } else {
-                            crate::router::Router::estimate_tokens(&body)
-                        };
-                        let mut fallback_chars_saved = chars_saved;
-
-                        if est_tokens > max_context {
-                            let condenser = crate::condenser::ContextCondenser::new(self.config.condensation.clone());
-                            if self.config.condensation.enabled && self.config.condensation.rolling_compaction {
-                                if let Some(compact_stats) = condenser.rolling_compact(&mut body) {
-                                    fallback_chars_saved += compact_stats.chars_saved;
-                                    self.metrics.record_rolling_compaction(compact_stats.chars_saved);
-                                    est_tokens = crate::router::Router::estimate_tokens(&body);
-                                }
-                            }
-
-                            if est_tokens > max_context && self.config.local.adaptive_squeezing {
-                                let squeeze_limit = (max_context as f64 * self.config.local.adaptive_squeeze_ratio) as u64;
-                                if est_tokens <= squeeze_limit {
-                                    if let Some(extra_saved) = condenser.adaptive_squeeze(&mut body, max_context) {
-                                        fallback_chars_saved += extra_saved;
-                                        est_tokens = crate::router::Router::estimate_tokens(&body);
-                                        if est_tokens <= max_context {
-                                            self.metrics
-                                                .adaptive_squeezed_count
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        }
-                                    }
-                                }
-                            }
-
-                            if est_tokens > max_context {
-                                if let Some(emergency_saved) = condenser.emergency_compact_to_fit(&mut body, max_context) {
-                                    fallback_chars_saved += emergency_saved;
-                                    est_tokens = crate::router::Router::estimate_tokens(&body);
-                                }
-                            }
-                        }
-
-                        if est_tokens <= max_context {
-                            let prefix_hash = body
-                                .get("messages")
-                                .and_then(|m| m.as_array())
-                                .map(|arr| crate::affinity::compute_prefix_hash(arr))
-                                .unwrap_or(0);
-                            let wait_limit_ms = self.config.local.queue_timeout_ms.min(30_000);
-
-                            if let Some((slot_id, aff_type, slot_guard)) = crate::router::acquire_local_slot_with_wait(
-                                &self.metrics,
-                                &self.affinity_tracker,
-                                max_slots,
-                                total_kv_budget,
-                                &decision.session_id,
-                                prefix_hash,
-                                est_tokens,
-                                true,
-                                false,
-                                wait_limit_ms,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    req_id = req_id,
-                                    slot = slot_id,
-                                    tokens = est_tokens,
-                                    status = status.as_u16(),
-                                    "Failing over in-flight request to local Strata engine after Cloud HTTP {}",
-                                    status.as_u16()
-                                );
-                                self.metrics.revert_cloud_request_for_local_fallback(
-                                    decision.est_tokens,
-                                    decision.is_spillover,
-                                );
-                                let local_decision = RouteDecision {
-                                    target: TargetProvider::Local,
-                                    est_tokens,
-                                    is_spillover: false,
-                                    reason: format!("Failover from Cloud HTTP {} (slot {slot_id})", status.as_u16()),
-                                    local_only: true,
-                                    slot_guard: Some(slot_guard),
-                                    slot_id: Some(slot_id),
-                                    is_affinity_hit: aff_type.is_hit(),
-                                    affinity_type: aff_type,
-                                    session_id: decision.session_id.clone(),
-                                };
-                                return Box::pin(self.forward_chat(
-                                    body,
-                                    local_decision,
-                                    req_id,
-                                    fallback_chars_saved,
-                                    savings_pct,
-                                    cache_key,
-                                ))
-                                .await;
-                            }
-                        }
+                        return rescued_resp;
                     }
                 }
                 info!(
@@ -843,7 +756,25 @@ impl UpstreamClient {
                 self.handle_upstream_response(resp, is_stream, None, meta, effective_cache_key).await
             }
             Err(err) => {
+                let duration = start.elapsed();
+                self.metrics.record_cloud_completion(duration.as_millis());
                 error!(req_id = req_id, error = %err, "Cloud request failed");
+                if let Some(rescued_resp) = self
+                    .try_inflight_local_rescue(
+                        &mut body,
+                        &decision,
+                        req_id,
+                        is_failover,
+                        chars_saved,
+                        savings_pct,
+                        &cache_key,
+                        condense_allowed,
+                        "transport error",
+                    )
+                    .await
+                {
+                    return rescued_resp;
+                }
                 (
                     StatusCode::BAD_GATEWAY,
                     [
@@ -855,6 +786,157 @@ impl UpstreamClient {
                     .into_response()
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_inflight_local_rescue(
+        &self,
+        body: &mut Value,
+        decision: &RouteDecision,
+        req_id: u64,
+        is_failover: bool,
+        chars_saved: usize,
+        savings_pct: f64,
+        cache_key: &Option<String>,
+        condense_allowed: bool,
+        failure_label: &str,
+    ) -> Option<Response> {
+        // Zero-drop in-flight failover: Attempt local execution ONLY if Strata is healthy,
+        // prompt fits local context (or after rolling compaction / adaptive squeeze), and an actual LocalSlotGuard is acquired.
+        if is_failover
+            || decision.reason == "routing mode cloud-only"
+            || self.metrics.is_circuit_open()
+            || !self.metrics.is_strata_online()
+        {
+            return None;
+        }
+
+        let max_context = self.config.local.max_context_tokens as u64;
+        let max_slots = self.config.local.max_slots;
+        let total_kv_budget = self.config.local.total_kv_token_budget as u64;
+
+        let mut est_tokens = if decision.est_tokens > 0 {
+            decision.est_tokens
+        } else {
+            crate::router::Router::estimate_tokens(body)
+        };
+        let pre_rescue_chars: usize = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|msg| msg.to_string().len())
+                    .sum::<usize>()
+            })
+            .unwrap_or_else(|| body.to_string().len());
+        let mut fallback_chars_saved = chars_saved;
+
+        if est_tokens > max_context && condense_allowed {
+            let condenser = crate::condenser::ContextCondenser::new(self.config.condensation.clone());
+            if self.config.condensation.rolling_compaction {
+                if let Some(compact_stats) = condenser.rolling_compact(body) {
+                    fallback_chars_saved += compact_stats.chars_saved;
+                    self.metrics.record_rolling_compaction(compact_stats.chars_saved);
+                    est_tokens = crate::router::Router::estimate_tokens(body);
+                }
+            }
+
+            if est_tokens > max_context && self.config.local.adaptive_squeezing {
+                let squeeze_limit = (max_context as f64 * self.config.local.adaptive_squeeze_ratio) as u64;
+                if est_tokens <= squeeze_limit {
+                    if let Some(extra_saved) = condenser.adaptive_squeeze(body, max_context) {
+                        fallback_chars_saved += extra_saved;
+                        est_tokens = crate::router::Router::estimate_tokens(body);
+                        if est_tokens <= max_context {
+                            self.metrics
+                                .adaptive_squeezed_count
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+
+            if est_tokens > max_context {
+                if let Some(emergency_saved) = condenser.emergency_compact_to_fit(body, max_context) {
+                    fallback_chars_saved += emergency_saved;
+                    est_tokens = crate::router::Router::estimate_tokens(body);
+                }
+            }
+        }
+
+        if est_tokens > max_context {
+            return None;
+        }
+
+        let prefix_hash = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| crate::affinity::compute_prefix_hash(arr))
+            .unwrap_or(0);
+        let wait_limit_ms = self.config.local.queue_timeout_ms.min(30_000);
+
+        let (slot_id, aff_type, slot_guard) = crate::router::acquire_local_slot_with_wait(
+            &self.metrics,
+            &self.affinity_tracker,
+            max_slots,
+            total_kv_budget,
+            &decision.session_id,
+            prefix_hash,
+            est_tokens,
+            true,
+            false,
+            wait_limit_ms,
+        )
+        .await?;
+
+        warn!(
+            req_id = req_id,
+            slot = slot_id,
+            tokens = est_tokens,
+            failure = failure_label,
+            "Failing over in-flight request to local Strata engine after Cloud {}",
+            failure_label
+        );
+        self.metrics.revert_cloud_request_for_local_fallback(
+            decision.est_tokens,
+            decision.is_spillover,
+        );
+        let fallback_savings_pct = if fallback_chars_saved > chars_saved {
+            let orig_total = pre_rescue_chars + chars_saved;
+            if orig_total > 0 {
+                ((fallback_chars_saved as f64 / orig_total as f64) * 100.0).min(99.99)
+            } else {
+                savings_pct
+            }
+        } else {
+            savings_pct
+        };
+        let local_decision = RouteDecision {
+            target: TargetProvider::Local,
+            est_tokens,
+            is_spillover: false,
+            reason: format!("Failover from Cloud {} (slot {slot_id})", failure_label),
+            local_only: true,
+            slot_guard: Some(slot_guard),
+            slot_id: Some(slot_id),
+            is_affinity_hit: aff_type.is_hit(),
+            affinity_type: aff_type,
+            session_id: decision.session_id.clone(),
+        };
+        let mut resp = Box::pin(self.forward_chat(
+            body.clone(),
+            local_decision,
+            req_id,
+            fallback_chars_saved,
+            fallback_savings_pct,
+            cache_key.clone(),
+        ))
+        .await;
+        resp.headers_mut().insert(
+            HeaderName::from_static("x-ferry-failover"),
+            HeaderValue::from_static("true"),
+        );
+        Some(resp)
     }
 
     fn build_response_headers(
@@ -1338,6 +1420,7 @@ impl UpstreamClient {
 
 pub fn normalize_wire_format(body: &mut Value, target_model: &str) {
     if let Some(obj) = body.as_object_mut() {
+        obj.remove("__ferry_no_condense");
         obj.insert("model".to_string(), Value::String(target_model.to_string()));
     }
 }
@@ -1714,12 +1797,21 @@ fn try_recover_xml_tool_calls(
     let mut pos = 0;
 
     while let Some(rel_start) = content[pos..].find("<tool_call>") {
-        let block_start = pos + rel_start;
+        let mut block_start = pos + rel_start;
+        let first_inner_start = block_start + "<tool_call>".len();
+        let rel_end = content[first_inner_start..].find("</tool_call>")?;
+        let block_end = first_inner_start + rel_end;
+
+        // If prose mentioned `<tool_call>` earlier before an actual `<tool_call>...</tool_call>` block,
+        // advance `block_start` to the last `<tool_call>` opening tag before `block_end`.
+        let mut had_nested_prose_tag = false;
+        while let Some(nested_rel) = content[block_start + "<tool_call>".len()..block_end].find("<tool_call>") {
+            block_start = block_start + "<tool_call>".len() + nested_rel;
+            had_nested_prose_tag = true;
+        }
         cleaned_content.push_str(&content[pos..block_start]);
 
         let inner_start = block_start + "<tool_call>".len();
-        let rel_end = content[inner_start..].find("</tool_call>")?;
-        let block_end = inner_start + rel_end;
         let inner = &content[inner_start..block_end];
 
         let (func_name, args_json_str) =
@@ -1735,12 +1827,14 @@ fn try_recover_xml_tool_calls(
         }));
 
         pos = block_end + "</tool_call>".len();
+        let _ = had_nested_prose_tag;
     }
 
-    cleaned_content.push_str(&content[pos..]);
+    let trailing = &content[pos..];
+    cleaned_content.push_str(trailing);
 
     if recovered_calls.is_empty()
-        || cleaned_content.contains("<tool_call")
+        || trailing.contains("<tool_call")
         || cleaned_content.contains("</tool_call>")
         || cleaned_content.contains("<function=")
         || cleaned_content.contains("</function>")
@@ -1957,7 +2051,7 @@ pub fn inspect_and_repair_local_tool_response(
     if visible_content.contains("<tool_call")
         || visible_content.contains("</tool_call>")
         || visible_content.contains("<function=")
-        || reasoning_str.contains("<tool_call")
+        || (visible_content.trim().is_empty() && reasoning_str.contains("<tool_call"))
     {
         return LocalToolInspection::FailoverRequired {
             reason: "local response contains unparsed or malformed <tool_call>/<function=> tag in content"
@@ -2455,6 +2549,166 @@ mod tests {
         assert_eq!(snap2.local_tokens_est, 400);
         assert_eq!(snap2.cloud_tokens_est, 800);
         assert_eq!(snap2.total_tokens_est, 1200);
+    }
+
+    #[test]
+    fn test_reasoning_content_mentioning_tool_call_in_prose_does_not_force_false_failover() {
+        let req_body = json!({
+            "tools": [
+                { "type": "function", "function": { "name": "execute_bash" } }
+            ]
+        });
+
+        // 1. reasoning_content mentions `<tool_call>` in prose, while visible content has a valid text reply
+        let valid_reply_with_reasoning_prose = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The target service is running on port 8080 and requires no further commands.",
+                    "reasoning_content": "I already checked the port earlier, so I do not need to emit a <tool_call> block on this turn."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let outcome1 = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&valid_reply_with_reasoning_prose).unwrap(),
+        );
+        assert_eq!(
+            outcome1,
+            LocalToolInspection::ValidUnchanged,
+            "Prose mention of <tool_call> in reasoning_content with non-empty visible content must NOT trigger FailoverRequired"
+        );
+
+        // 2. reasoning_content mentions `<tool_call>` in prose BEFORE an actual `<tool_call>...</tool_call>` block at the end
+        let reasoning_prose_then_actual_xml = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I should format my invocation inside a <tool_call> block now.\n<tool_call>\n<function=execute_bash>\n<parameter=command>uname -a</parameter>\n</function>\n</tool_call>"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let outcome2 = inspect_and_repair_local_tool_response(
+            &req_body,
+            &serde_json::to_vec(&reasoning_prose_then_actual_xml).unwrap(),
+        );
+        let LocalToolInspection::Repaired(repaired_bytes) = outcome2 else {
+            panic!("Expected Repaired when reasoning_content mentions <tool_call> before actual XML block, got: {outcome2:?}");
+        };
+        let repaired_json: Value = serde_json::from_slice(&repaired_bytes).unwrap();
+        assert_eq!(
+            repaired_json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "execute_bash"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cloud_transport_error_and_http_429_trigger_inflight_local_rescue_with_failover_headers() {
+        use axum::{routing::post, Json, Router};
+
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let local_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": "chatcmpl-local-rescued",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "rescued by local strata" },
+                            "finish_reason": "stop"
+                        }]
+                    })),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(local_listener, local_app).await;
+        });
+
+        // Allocate an ephemeral port and immediately drop the listener so Cloud connection fails with transport Err
+        let dead_cloud_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_cloud_addr = dead_cloud_listener.local_addr().unwrap();
+        drop(dead_cloud_listener);
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", local_addr);
+        cfg.cloud.api_base = format!("http://{}/v1", dead_cloud_addr);
+        cfg.local.max_context_tokens = 2_000;
+        cfg.local.total_kv_token_budget = 16_000;
+        let config = Arc::new(cfg);
+
+        let metrics = Arc::new(MetricsTracker::new());
+        let cache = Arc::new(ResponseCache::new(false, 10, 60));
+        let upstream = UpstreamClient::new(config, metrics.clone(), cache);
+
+        let padding = "history ".repeat(400);
+        let body = json!({
+            "model": "ferry",
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "System" },
+                { "role": "user", "content": format!("T1 {padding}") },
+                { "role": "assistant", "content": format!("R1 {padding}") },
+                { "role": "user", "content": format!("T2 {padding}") },
+                { "role": "assistant", "content": format!("R2 {padding}") },
+                { "role": "user", "content": "Final question" }
+            ]
+        });
+        let est_tokens = crate::router::Router::estimate_tokens(&body);
+        assert!(est_tokens > 2_000);
+
+        let decision = RouteDecision {
+            target: TargetProvider::Cloud,
+            est_tokens,
+            is_spillover: true,
+            reason: "exceeds local context".to_string(),
+            local_only: false,
+            slot_guard: None,
+            slot_id: None,
+            is_affinity_hit: false,
+            affinity_type: crate::affinity::AffinityType::NewSlot,
+            session_id: "sess-transport-rescue".to_string(),
+        };
+
+        let resp = upstream
+            .forward_chat(body, decision, 42, 0, 0.0, None)
+            .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-ferry-provider").and_then(|v| v.to_str().ok()),
+            Some("local")
+        );
+        assert_eq!(
+            resp.headers().get("x-ferry-failover").and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "In-flight Cloud->Local rescue must report x-ferry-failover: true"
+        );
+        let chars_saved: usize = resp
+            .headers()
+            .get("x-ferry-chars-saved")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let savings_str = resp
+            .headers()
+            .get("x-ferry-savings-percent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0.00%");
+        assert!(chars_saved > 0);
+        assert_ne!(
+            savings_str, "0.00%",
+            "Fallback compaction savings percentage must be recomputed when fallback_chars_saved > chars_saved"
+        );
     }
 }
 
