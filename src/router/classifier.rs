@@ -105,26 +105,7 @@ pub fn estimate_tokens(body: &Value) -> u64 {
     let mut total_chars: usize = 0;
 
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
-            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                total_chars += content.len();
-            } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
-                for part in parts {
-                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        total_chars += text.len();
-                    }
-                }
-            }
-            if let Some(calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-                for call in calls {
-                    if let Some(func) = call.get("function") {
-                        if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                            total_chars += args.len();
-                        }
-                    }
-                }
-            }
-        }
+        total_chars += crate::condenser::count_message_chars(messages);
     }
 
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {

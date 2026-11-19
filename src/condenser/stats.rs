@@ -41,10 +41,27 @@ pub fn count_message_chars(messages: &[Value]) -> usize {
                 if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                     total += t.len();
                 }
+                if part.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                    if let Some(tc) = part.get("content").and_then(|c| c.as_str()) {
+                        total += tc.len();
+                    } else if let Some(tarr) = part.get("content").and_then(|c| c.as_array()) {
+                        for sub in tarr {
+                            if let Some(st) = sub.get("text").and_then(|t| t.as_str()) {
+                                total += st.len();
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(o) = msg.get("output").and_then(|o| o.as_str()) {
             total += o.len();
+        } else if let Some(arr) = msg.get("output").and_then(|o| o.as_array()) {
+            for part in arr {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    total += t.len();
+                }
+            }
         }
         if let Some(r) = msg.get("reasoning").and_then(|r| r.as_str()) {
             total += r.len();
@@ -52,9 +69,31 @@ pub fn count_message_chars(messages: &[Value]) -> usize {
         if let Some(rc) = msg.get("reasoning_content").and_then(|rc| rc.as_str()) {
             total += rc.len();
         }
+        if let Some(arr) = msg.get("summary").and_then(|s| s.as_array()) {
+            for part in arr {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    total += t.len();
+                }
+            }
+        }
+        if let Some(args) = msg.get("arguments").and_then(|a| a.as_str()) {
+            total += args.len();
+        }
+        if let Some(args) = msg
+            .get("function_call")
+            .and_then(|fc| fc.get("arguments"))
+            .and_then(|a| a.as_str())
+        {
+            total += args.len();
+        }
         if let Some(tc) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
             for call in tc {
-                if let Some(args) = call.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
+                if let Some(args) = call
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .or_else(|| call.get("arguments"))
+                    .and_then(|a| a.as_str())
+                {
                     total += args.len();
                 }
             }
