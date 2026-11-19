@@ -69,6 +69,14 @@ impl ResponseCache {
             "reasoning_effort",
             "functions",
             "function_call",
+            "system",
+            "parallel_tool_calls",
+            "n",
+            "logprobs",
+            "top_logprobs",
+            "logit_bias",
+            "presence_penalty",
+            "frequency_penalty",
         ];
         for field in KEY_FIELDS {
             field.hash(&mut hasher);
@@ -104,13 +112,28 @@ impl ResponseCache {
             return None;
         }
 
-        let map = self.store.read().await;
-        if let Some(entry) = map.get(key) {
-            if entry.created_at.elapsed() < entry.ttl {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(entry.clone());
+        let is_expired = {
+            let map = self.store.read().await;
+            if let Some(entry) = map.get(key) {
+                if entry.created_at.elapsed() < entry.ttl {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(entry.clone());
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        if is_expired {
+            let mut map = self.store.write().await;
+            if let Some(entry) = map.get(key) {
+                if entry.created_at.elapsed() >= entry.ttl {
+                    map.remove(key);
+                }
             }
         }
+
         self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
@@ -148,7 +171,13 @@ impl ResponseCache {
     }
 
     pub async fn len(&self) -> usize {
-        self.store.read().await.len()
+        let now = Instant::now();
+        self.store
+            .read()
+            .await
+            .values()
+            .filter(|v| now.duration_since(v.created_at) < v.ttl)
+            .count()
     }
 }
 
@@ -192,5 +221,68 @@ fn hash_json_value<H: Hasher>(val: &Value, hasher: &mut H) {
                 hash_json_value(v, hasher);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_cache_key_isolates_all_response_shaping_fields() {
+        let base = json!({
+            "model": "ferry",
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let base_key = ResponseCache::compute_cache_key(&base).unwrap();
+
+        let variations = [
+            json!({"system": "You are a strict JSON parser."}),
+            json!({"parallel_tool_calls": false}),
+            json!({"n": 3}),
+            json!({"logprobs": true}),
+            json!({"top_logprobs": 5}),
+            json!({"logit_bias": {"1234": -100}}),
+            json!({"presence_penalty": 0.5}),
+            json!({"frequency_penalty": 0.75}),
+        ];
+
+        for extra in variations {
+            let mut modified = base.clone();
+            for (k, v) in extra.as_object().unwrap() {
+                modified[k] = v.clone();
+            }
+            let mod_key = ResponseCache::compute_cache_key(&modified).unwrap();
+            assert_ne!(
+                base_key, mod_key,
+                "Field {:?} must produce a distinct cache key",
+                extra
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expired_entries_excluded_from_len_and_evicted_on_get() {
+        let cache = ResponseCache::new(true, 16, 0);
+        cache
+            .set(
+                "k1".to_string(),
+                bytes::Bytes::from_static(b"ok"),
+                200,
+                vec![],
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // len() must not count expired entries
+        assert_eq!(cache.len().await, 0);
+
+        // get() must return None, record a miss, and remove the expired entry from the map
+        assert!(cache.get("k1").await.is_none());
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+        assert!(cache.store.read().await.is_empty());
     }
 }

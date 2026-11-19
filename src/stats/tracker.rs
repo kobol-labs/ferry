@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub const DEFAULT_CIRCUIT_COOLDOWN_SECS: u64 = 30;
+pub const DEFAULT_CLOUD_WINDOW_SECS: u64 = 18_000;
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -85,6 +86,7 @@ pub struct MetricsTracker {
     // Quota-paced fast spillover metrics
     pub window_start_epoch_secs: AtomicU64,
     pub window_cloud_requests: AtomicU64,
+    pub cloud_window_secs: AtomicU64,
     pub fast_spillover_requests: AtomicU64,
     pub fast_spillover_throttled_skips: AtomicU64,
 }
@@ -157,6 +159,7 @@ impl Default for MetricsTracker {
 
             window_start_epoch_secs: AtomicU64::new(Self::current_epoch_secs()),
             window_cloud_requests: AtomicU64::new(0),
+            cloud_window_secs: AtomicU64::new(DEFAULT_CLOUD_WINDOW_SECS),
             fast_spillover_requests: AtomicU64::new(0),
             fast_spillover_throttled_skips: AtomicU64::new(0),
         }
@@ -348,6 +351,7 @@ impl MetricsTracker {
     }
 
     pub fn inc_cloud(&self, tokens: u64, is_spillover: bool) {
+        self.sync_cloud_window(self.cloud_window_secs.load(Ordering::Relaxed));
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.cloud_requests.fetch_add(1, Ordering::Relaxed);
         self.window_cloud_requests.fetch_add(1, Ordering::Relaxed);
@@ -365,6 +369,7 @@ impl MetricsTracker {
     /// Transitions an in-flight Local request to Cloud on failover without double-counting
     /// `total_requests` or `total_tokens_est`.
     pub fn record_local_to_cloud_failover(&self, local_tokens: u64, cloud_tokens: u64) {
+        self.sync_cloud_window(self.cloud_window_secs.load(Ordering::Relaxed));
         self.failover_requests.fetch_add(1, Ordering::Relaxed);
         Self::saturating_sub_u64(&self.local_requests, 1);
         Self::saturating_sub_u64(&self.local_tokens_est, local_tokens);
@@ -510,16 +515,15 @@ impl MetricsTracker {
         self.cloud_rate_limited_until.store(0, Ordering::Relaxed);
     }
 
-    /// Returns `true` when Cloud spillover quota is healthy:
-    /// `budget > 0`, Cloud is not rate-limited, and `used < budget * (1.0 - reserve_ratio)`.
-    /// Resets `window_cloud_requests` when `now - window_start >= window_secs`.
-    pub fn can_fast_spillover(&self, budget: u64, window_secs: u64, reserve_ratio: f64) -> bool {
-        if budget == 0 || self.is_cloud_rate_limited() {
-            return false;
+    /// Synchronizes the rolling quota window, advancing `window_start_epoch_secs` and
+    /// resetting `window_cloud_requests` when `now - window_start >= window_secs`.
+    pub fn sync_cloud_window(&self, window_secs: u64) {
+        if window_secs == 0 {
+            return;
         }
         let now = Self::current_epoch_secs();
         let start = self.window_start_epoch_secs.load(Ordering::Relaxed);
-        if window_secs > 0 && now.saturating_sub(start) >= window_secs {
+        if now.saturating_sub(start) >= window_secs {
             if self
                 .window_start_epoch_secs
                 .compare_exchange(start, now, Ordering::SeqCst, Ordering::Relaxed)
@@ -528,6 +532,19 @@ impl MetricsTracker {
                 self.window_cloud_requests.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Returns `true` when Cloud spillover quota is healthy:
+    /// `budget > 0`, Cloud is not rate-limited, and `used < budget * (1.0 - reserve_ratio)`.
+    /// Resets `window_cloud_requests` when `now - window_start >= window_secs`.
+    pub fn can_fast_spillover(&self, budget: u64, window_secs: u64, reserve_ratio: f64) -> bool {
+        if window_secs > 0 {
+            self.cloud_window_secs.store(window_secs, Ordering::Relaxed);
+        }
+        if budget == 0 || self.is_cloud_rate_limited() {
+            return false;
+        }
+        self.sync_cloud_window(window_secs);
         let used = self.window_cloud_requests.load(Ordering::Relaxed) as f64;
         let allowed = (budget as f64) * (1.0 - reserve_ratio.clamp(0.0, 1.0));
         used < allowed
@@ -743,5 +760,71 @@ impl MetricsTracker {
 
     pub fn record_loop_nudge(&self) {
         self.loop_nudges_total.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_rollover_preserves_recent_cognitive_cloud_requests() {
+        let tracker = MetricsTracker::new();
+        let now = MetricsTracker::current_epoch_secs();
+        let window_secs = 18_000;
+        let budget = 1500;
+        let reserve_ratio = 0.35; // 65% allowed for fast spillover = 975 requests
+
+        // Simulate an expired window start (e.g. idle for > 5 hours)
+        tracker
+            .window_start_epoch_secs
+            .store(now.saturating_sub(window_secs + 600), Ordering::SeqCst);
+        tracker
+            .window_cloud_requests
+            .store(450, Ordering::SeqCst);
+
+        // 1,000 cognitive escalations occur during the new window before any local slot saturation
+        for _ in 0..1000 {
+            tracker.inc_cloud(128, false);
+        }
+
+        // First call to inc_cloud in the new window must roll over the old 450 count and accumulate all 1,000 new requests
+        assert_eq!(
+            tracker.window_cloud_requests.load(Ordering::SeqCst),
+            1000,
+            "inc_cloud must roll over expired window once and preserve all 1,000 recent requests"
+        );
+
+        // Subsequent call to can_fast_spillover must NOT wipe the 1,000 recent requests
+        assert!(
+            !tracker.can_fast_spillover(budget, window_secs, reserve_ratio),
+            "can_fast_spillover must throttle because 1,000 >= 975 allowed spillover budget"
+        );
+        assert_eq!(
+            tracker.window_cloud_requests.load(Ordering::SeqCst),
+            1000,
+            "can_fast_spillover must not zero out active window requests"
+        );
+    }
+
+    #[test]
+    fn test_failover_rolls_over_expired_window_and_preserves_count() {
+        let tracker = MetricsTracker::new();
+        let now = MetricsTracker::current_epoch_secs();
+        let window_secs = 18_000;
+
+        tracker
+            .window_start_epoch_secs
+            .store(now.saturating_sub(window_secs + 100), Ordering::SeqCst);
+        tracker.window_cloud_requests.store(99, Ordering::SeqCst);
+
+        tracker.record_local_to_cloud_failover(100, 120);
+        assert_eq!(
+            tracker.window_cloud_requests.load(Ordering::SeqCst),
+            1,
+            "record_local_to_cloud_failover must reset expired window before incrementing"
+        );
+        assert!(tracker.can_fast_spillover(100, window_secs, 0.35));
+        assert_eq!(tracker.window_cloud_requests.load(Ordering::SeqCst), 1);
     }
 }
