@@ -670,9 +670,13 @@ async fn chat_completions_handler(
         .or_else(|| ferry::router::RoutingMode::parse(&state.config.routing.default_route))
         .unwrap_or(ferry::router::RoutingMode::LocalPreferred);
 
-    let requested_cloud_model = body.get("model").and_then(|m| m.as_str())
-        .map(|m| m == state.config.cloud.model || m == "cloud")
-        .unwrap_or(false);
+    let local_only = effective_mode == ferry::router::RoutingMode::LocalOnly;
+    let requested_cloud_model = !local_only
+        && body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(|m| m == state.config.cloud.model || m == "cloud")
+            .unwrap_or(false);
 
     let precomputed_hard_logic = if effective_mode == ferry::router::RoutingMode::Hybrid {
         Some(ferry::router::Router::is_hard_logic_turn_with_options(
@@ -683,9 +687,17 @@ async fn chat_completions_handler(
         None
     };
 
+    let cloud_rate_limited_to_local = state.metrics.is_cloud_rate_limited()
+        && !state.metrics.is_circuit_open()
+        && state.metrics.is_strata_online();
+
     let is_cloud_target = effective_mode == ferry::router::RoutingMode::CloudOnly
         || requested_cloud_model
-        || precomputed_hard_logic.as_ref().map(|(is_hard, _)| *is_hard).unwrap_or(false);
+        || (!cloud_rate_limited_to_local
+            && precomputed_hard_logic
+                .as_ref()
+                .map(|(is_hard, _)| *is_hard)
+                .unwrap_or(false));
 
     // Preserve post-`condense()` body before local-only `rolling_compact` / `adaptive_squeeze`
     // so Cloud spillover and Cloud failover always receive uncompacted full-fidelity history.
@@ -759,7 +771,8 @@ async fn chat_completions_handler(
 
     // Preemptive Local Strata Rescue (#26): when Cloud is rate-limited (429 backoff),
     // compact oversized prompts before routing so they land directly on local Strata.
-    if state.metrics.is_cloud_rate_limited()
+    if condense_enabled
+        && state.metrics.is_cloud_rate_limited()
         && !state.metrics.is_circuit_open()
         && state.metrics.is_strata_online()
         && effective_mode != ferry::router::RoutingMode::CloudOnly
@@ -823,7 +836,7 @@ async fn chat_completions_handler(
         ).into_response();
     }
 
-    let cloud_fallback = if decision.target == ferry::router::TargetProvider::Cloud {
+    let mut cloud_fallback = if decision.target == ferry::router::TargetProvider::Cloud {
         if let Some(uncompacted) = cloud_fidelity_body.take() {
             decision.est_tokens = ferry::router::Router::estimate_tokens(&uncompacted);
             body = uncompacted;
@@ -834,6 +847,17 @@ async fn chat_completions_handler(
     } else {
         cloud_fidelity_body.map(|uncompacted| (uncompacted, base_chars_saved, base_savings_pct))
     };
+
+    if !condense_enabled {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("__ferry_no_condense".to_string(), Value::Bool(true));
+        }
+        if let Some((ref mut uncompacted, _, _)) = cloud_fallback {
+            if let Some(obj) = uncompacted.as_object_mut() {
+                obj.insert("__ferry_no_condense".to_string(), Value::Bool(true));
+            }
+        }
+    }
 
     state
         .upstream
@@ -1327,5 +1351,239 @@ mod tests {
         let resp = chat_completions_handler(State(state), HeaderMap::new(), Json(body)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(metrics.snapshot().security_requests_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_preemptive_rescue_and_inflight_fallback_respect_x_ferry_condense_false() {
+        let local_captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let local_cap_clone = local_captured.clone();
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let local_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let cap = local_cap_clone.clone();
+                async move {
+                    cap.lock().await.push(payload);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-local",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "local ok" },
+                                "finish_reason": "stop"
+                            }]
+                        })),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(local_listener, local_app).await;
+        });
+
+        let cloud_captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let cloud_cap_clone = cloud_captured.clone();
+        let cloud_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud_addr = cloud_listener.local_addr().unwrap();
+        let cloud_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let cap = cloud_cap_clone.clone();
+                async move {
+                    cap.lock().await.push(payload);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({ "error": "rate limit" })),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(cloud_listener, cloud_app).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", local_addr);
+        cfg.cloud.api_base = format!("http://{}/v1", cloud_addr);
+        cfg.local.max_context_tokens = 2_000;
+        cfg.local.total_kv_token_budget = 16_000;
+        cfg.routing.default_route = "hybrid".to_string();
+        let config = Arc::new(cfg);
+
+        let metrics = Arc::new(MetricsTracker::new());
+        // Already in Cloud 429 backoff
+        metrics.record_cloud_rate_limit(120);
+
+        let router = HybridRouter::new(config.clone(), metrics.clone());
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(false, 10, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics: metrics.clone(),
+            router,
+            condenser,
+            upstream,
+            cache,
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        let padding = "history ".repeat(400);
+        let body = json!({
+            "model": "ferry",
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "System prompt" },
+                { "role": "user", "content": format!("Turn 1: {padding}") },
+                { "role": "assistant", "content": format!("Reply 1: {padding}") },
+                { "role": "user", "content": format!("Turn 2: {padding}") },
+                { "role": "assistant", "content": format!("Reply 2: {padding}") },
+                { "role": "user", "content": "Final turn" }
+            ]
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ferry-condense", "false".parse().unwrap());
+
+        // With X-Ferry-Condense: false, preemptive rescue AND in-flight fallback must NOT compact
+        // the oversized 6-message prompt, so it stays > max_context, routes to Cloud, and returns 429
+        // without dropping messages or dispatching truncated prompt to local.
+        let resp = chat_completions_handler(State(state), headers, Json(body)).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(local_captured.lock().await.len(), 0);
+        let cloud_reqs = cloud_captured.lock().await;
+        assert_eq!(cloud_reqs.len(), 1);
+        assert_eq!(
+            cloud_reqs[0]["messages"].as_array().unwrap().len(),
+            6,
+            "X-Ferry-Condense: false must preserve all 6 messages intact"
+        );
+        assert!(
+            cloud_reqs[0].get("__ferry_no_condense").is_none(),
+            "Internal marker must be stripped before sending upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cloud_target_aligns_with_router_for_local_only_and_hybrid_429_backoff() {
+        let local_captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let local_cap_clone = local_captured.clone();
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        let local_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let cap = local_cap_clone.clone();
+                async move {
+                    cap.lock().await.push(payload);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-local-align",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "aligned ok" },
+                                "finish_reason": "stop"
+                            }]
+                        })),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(local_listener, local_app).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", local_addr);
+        cfg.local.max_context_tokens = 3_000;
+        cfg.local.total_kv_token_budget = 16_000;
+        cfg.condensation.enabled = true;
+        cfg.condensation.rolling_compaction = true;
+        cfg.condensation.compact_threshold_tokens = 100;
+        cfg.condensation.compact_keep_recent_turns = 1;
+        cfg.routing.default_route = "hybrid".to_string();
+        let config = Arc::new(cfg);
+
+        let metrics = Arc::new(MetricsTracker::new());
+        let router = HybridRouter::new(config.clone(), metrics.clone());
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(false, 10, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics: metrics.clone(),
+            router,
+            condenser,
+            upstream,
+            cache,
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        let padding = "context ".repeat(150);
+        // Case 1: local-only mode with `"model": "cloud"` should still treat target as Local and run rolling_compact
+        let body_local_only = json!({
+            "model": "cloud",
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "System" },
+                { "role": "user", "content": format!("T1 {padding}") },
+                { "role": "assistant", "content": format!("R1 {padding}") },
+                { "role": "user", "content": format!("T2 {padding}") },
+                { "role": "assistant", "content": format!("R2 {padding}") },
+                { "role": "user", "content": "Final" }
+            ]
+        });
+        let mut headers_lo = HeaderMap::new();
+        headers_lo.insert("x-ferry-route", "local-only".parse().unwrap());
+        let resp1 = chat_completions_handler(State(state.clone()), headers_lo, Json(body_local_only)).await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(
+            resp1.headers().get("x-ferry-provider").and_then(|v| v.to_str().ok()),
+            Some("local")
+        );
+        {
+            let reqs = local_captured.lock().await;
+            assert_eq!(reqs.len(), 1);
+            assert!(
+                reqs[0]["messages"].as_array().unwrap().len() < 6,
+                "local-only with model='cloud' must run rolling_compact for local target"
+            );
+        }
+
+        // Case 2: hybrid mode hard-logic turn during Cloud 429 backoff (under max_context but > compact_threshold_tokens)
+        metrics.record_cloud_rate_limit(120);
+        let body_hard_429 = json!({
+            "model": "ferry",
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": "System" },
+                { "role": "user", "content": format!("T1 {padding}") },
+                { "role": "assistant", "content": format!("R1 {padding}") },
+                { "role": "user", "content": format!("T2 {padding}") },
+                { "role": "assistant", "content": format!("R2 {padding}") },
+                { "role": "user", "content": "Architect a distributed consensus algorithm and prove linearizability under network partitions" }
+            ]
+        });
+        let resp2 = chat_completions_handler(State(state), HeaderMap::new(), Json(body_hard_429)).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(
+            resp2.headers().get("x-ferry-provider").and_then(|v| v.to_str().ok()),
+            Some("local")
+        );
+        {
+            let reqs = local_captured.lock().await;
+            assert_eq!(reqs.len(), 2);
+            assert!(
+                reqs[1]["messages"].as_array().unwrap().len() < 6,
+                "Hard-logic turn retained on local Strata during Cloud 429 backoff must run rolling_compact"
+            );
+        }
     }
 }
