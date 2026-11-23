@@ -70,7 +70,15 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("FERRY_BIND") { self.server.bind = v; }
+        if let Ok(v) = std::env::var("FERRY_BIND") { if !v.trim().is_empty() { self.server.bind = v; } }
+        if let Ok(v) = std::env::var("FERRY_SERVER_API_KEY") { if !v.trim().is_empty() { self.server.api_key = v; } }
+        if let Ok(v) = std::env::var("FERRY_CORS_ALLOWED_ORIGINS") {
+            self.server.cors_allowed_origins = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         if let Ok(v) = std::env::var("FERRY_LOCAL_API_BASE") { if !v.trim().is_empty() { self.local.api_base = v; } }
         if let Ok(v) = std::env::var("FERRY_LOCAL_API_KEY") { if !v.trim().is_empty() { self.local.api_key = v; } }
         if let Ok(v) = std::env::var("FERRY_LOCAL_MODEL") { if !v.trim().is_empty() { self.local.model = v; } }

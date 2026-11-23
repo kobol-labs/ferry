@@ -4,16 +4,22 @@ use serde::{Deserialize, Serialize};
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 fn default_bind() -> String {
-    "0.0.0.0:4000".to_string()
+    "127.0.0.1:4000".to_string()
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            api_key: String::new(),
+            cors_allowed_origins: Vec::new(),
         }
     }
 }
