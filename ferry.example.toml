@@ -1,5 +1,7 @@
 [server]
-bind = "0.0.0.0:4000"
+bind = "127.0.0.1:4000"
+api_key = ""
+cors_allowed_origins = []
 
 [local]
 name = "strata"

@@ -16,4 +16,5 @@ COPY ferry.example.toml /app/ferry.toml
 USER ferry
 EXPOSE 4000
 ENV FERRY_CONFIG=/app/ferry.toml
+ENV FERRY_BIND=0.0.0.0:4000
 CMD ["ferry"]

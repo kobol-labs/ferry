@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Request, State},
+    http::{header, HeaderMap, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -10,12 +11,13 @@ use ferry::cache::ResponseCache;
 use ferry::condenser::ContextCondenser;
 use ferry::config::Config;
 use ferry::router::Router as HybridRouter;
+use ferry::security;
 use ferry::stats::MetricsTracker;
 use ferry::upstream::UpstreamClient;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 struct AppState {
     config: Arc<Config>,
@@ -238,7 +240,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(state, max_body_bytes);
 
     let bind_addr = &config.server.bind;
-    info!(bind = %bind_addr, "Starting Ferry server");
+    if config.server.api_key.trim().is_empty() && !security::is_loopback_bind(bind_addr) {
+        warn!(
+            bind = %bind_addr,
+            "Ferry is bound to a non-loopback address without server.api_key / FERRY_SERVER_API_KEY configured; proxy and telemetry endpoints are unauthenticated"
+        );
+    }
+    info!(
+        bind = %bind_addr,
+        auth_enabled = !config.server.api_key.trim().is_empty(),
+        cors_origins = config.server.cors_allowed_origins.len(),
+        "Starting Ferry server"
+    );
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
 
@@ -246,11 +259,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn build_router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
-    Router::new()
-        // Universal endpoints
-        .route("/health", get(health_handler))
-        .route("/stats", get(stats_handler))
-        .route("/metrics", get(metrics_handler))
+    let protected_routes = Router::new()
+        .route("/stats", get(stats_handler).options(cors_options_handler))
+        .route("/metrics", get(metrics_handler).options(cors_options_handler))
         // OpenAI standard specification routes
         .route("/v1/models", get(models_handler).options(cors_options_handler))
         .route("/v1/models/{model}", get(model_detail_handler).options(cors_options_handler))
@@ -266,26 +277,78 @@ fn build_router(state: Arc<AppState>, max_body_bytes: usize) -> Router {
             "/chat/completions",
             post(chat_completions_handler).options(cors_options_handler),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        // Public health probe endpoint
+        .route("/health", get(health_handler).options(cors_options_handler))
+        .merge(protected_routes)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cors_middleware,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Allow CORS preflight requests through without credentials; cors_middleware
+    // enforces the configured origin allowlist on the response.
+    if req.method() == Method::OPTIONS {
+        return next.run(req).await;
+    }
+
+    if !security::is_authorized(&state.config.server.api_key, req.headers()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [
+                ("www-authenticate", "Bearer"),
+                ("content-type", "application/json"),
+            ],
+            json!({
+                "error": {
+                    "message": "Invalid or missing API key",
+                    "type": "authentication_error",
+                    "code": "invalid_api_key"
+                }
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
+async fn cors_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let request_origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+
+    let mut resp = next.run(req).await;
+    security::apply_cors_headers(
+        resp.headers_mut(),
+        request_origin.as_deref(),
+        &state.config.server.cors_allowed_origins,
+    );
+    resp
+}
+
 async fn cors_options_handler() -> impl IntoResponse {
-    let mut headers = HeaderMap::new();
-    headers.insert("access-control-allow-origin", "*".parse().unwrap());
-    headers.insert(
-        "access-control-allow-methods",
-        "GET, POST, OPTIONS".parse().unwrap(),
-    );
-    headers.insert(
-        "access-control-allow-headers",
-        "content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms, x-ferry-session-id, x-session-id, x-agent-id".parse().unwrap(),
-    );
-    headers.insert(
-        "access-control-expose-headers",
-        "x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache, x-ferry-slot, x-ferry-affinity, x-ferry-session-id".parse().unwrap(),
-    );
-    (StatusCode::NO_CONTENT, headers)
+    StatusCode::NO_CONTENT
 }
 
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -465,10 +528,7 @@ async fn embeddings_handler(
 
     (
         StatusCode::OK,
-        [
-            ("access-control-allow-origin", "*"),
-            ("content-type", "application/json"),
-        ],
+        [("content-type", "application/json")],
         Json(resp),
     )
         .into_response()
@@ -606,7 +666,6 @@ async fn chat_completions_handler(
     if let Some(ref key) = cache_key {
         if let Some(cached) = state.cache.get(key).await {
             let mut res_headers = HeaderMap::new();
-            res_headers.insert("access-control-allow-origin", "*".parse().unwrap());
             res_headers.insert("content-type", "application/json".parse().unwrap());
             res_headers.insert("x-ferry-provider", "cache".parse().unwrap());
             res_headers.insert("x-ferry-cache", "HIT".parse().unwrap());
@@ -822,10 +881,7 @@ async fn chat_completions_handler(
     if decision.target == ferry::router::TargetProvider::Cloud && decision.local_only {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            [
-                ("access-control-allow-origin", "*"),
-                ("content-type", "application/json"),
-            ],
+            [("content-type", "application/json")],
             json!({
                 "error": {
                     "message": format!("Local provider unavailable and local-only routing requested: {}", decision.reason),
@@ -1585,5 +1641,262 @@ mod tests {
                 "Hard-logic turn retained on local Strata during Cloud 429 backoff must run rolling_compact"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_issue_37_inbound_auth_and_cors_allowlist_on_router() {
+        let local_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": "chatcmpl-auth-ok",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": { "role": "assistant", "content": "authorized ok" },
+                            "finish_reason": "stop"
+                        }]
+                    })),
+                )
+            }),
+        );
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(local_listener, local_app).await;
+        });
+
+        let mut cfg = Config::default();
+        cfg.local.api_base = format!("http://{}/v1", local_addr);
+        cfg.routing.default_route = "local-only".to_string();
+        cfg.server.api_key = "ferry-secret-key-123".to_string();
+        cfg.server.cors_allowed_origins = vec!["https://webui.example.com".to_string()];
+
+        let config = Arc::new(cfg);
+        let metrics = Arc::new(MetricsTracker::new());
+        let router = HybridRouter::new(config.clone(), metrics.clone());
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(false, 10, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics,
+            router,
+            condenser,
+            upstream,
+            cache,
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        let app = build_router(state, 1024 * 1024);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. /health remains unauthenticated
+        let health = client
+            .get(format!("http://{}/health", addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(health.headers().get("access-control-allow-origin").is_none());
+
+        // 2. All protected GET endpoints reject unauthenticated or wrong-token requests with 401
+        for path in [
+            "/stats",
+            "/metrics",
+            "/v1/models",
+            "/models",
+            "/v1/models/ferry",
+            "/models/ferry",
+        ] {
+            let unauth = client
+                .get(format!("http://{}{}", addr, path))
+                .header("Origin", "https://webui.example.com")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                unauth.status(),
+                StatusCode::UNAUTHORIZED,
+                "GET {path} must require auth when server.api_key is set"
+            );
+            assert_eq!(
+                unauth
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer")
+            );
+            assert_eq!(
+                unauth
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|v| v.to_str().ok()),
+                Some("https://webui.example.com")
+            );
+            assert_eq!(
+                unauth
+                    .headers()
+                    .get("vary")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Origin")
+            );
+
+            let wrong = client
+                .get(format!("http://{}{}", addr, path))
+                .header("Authorization", "Bearer wrong-key")
+                .header("Origin", "https://evil.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+            assert!(wrong.headers().get("access-control-allow-origin").is_none());
+
+            let ok = client
+                .get(format!("http://{}{}", addr, path))
+                .header("Authorization", "Bearer ferry-secret-key-123")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK, "GET {path} must succeed with valid Bearer key");
+        }
+
+        // 3. Protected POST endpoints reject unauthenticated requests and accept valid Bearer/x-api-key
+        let chat_payload = json!({
+            "model": "ferry",
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        for (path, payload) in [
+            ("/v1/chat/completions", chat_payload.clone()),
+            ("/chat/completions", chat_payload),
+            ("/v1/embeddings", json!({ "input": "hello" })),
+            ("/embeddings", json!({ "input": "hello" })),
+        ] {
+            let unauth = client
+                .post(format!("http://{}{}", addr, path))
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                unauth.status(),
+                StatusCode::UNAUTHORIZED,
+                "POST {path} must require auth"
+            );
+
+            let ok = client
+                .post(format!("http://{}{}", addr, path))
+                .header("x-api-key", "ferry-secret-key-123")
+                .header("Origin", "https://webui.example.com")
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK, "POST {path} must succeed with valid key");
+            assert_eq!(
+                ok.headers()
+                    .get("access-control-allow-origin")
+                    .and_then(|v| v.to_str().ok()),
+                Some("https://webui.example.com")
+            );
+        }
+
+        // 4. CORS preflight OPTIONS works without Authorization for allowed origins, and omits ACAO for disallowed origins
+        let allowed_preflight = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{}/v1/chat/completions", addr),
+            )
+            .header("Origin", "https://webui.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed_preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            allowed_preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://webui.example.com")
+        );
+
+        let disallowed_preflight = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{}/v1/chat/completions", addr),
+            )
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disallowed_preflight.status(), StatusCode::NO_CONTENT);
+        assert!(
+            disallowed_preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "Disallowed origin must NOT receive Access-Control-Allow-Origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_issue_37_default_empty_cors_emits_no_acao_header() {
+        let cfg = Config::default();
+        let config = Arc::new(cfg);
+        let metrics = Arc::new(MetricsTracker::new());
+        let router = HybridRouter::new(config.clone(), metrics.clone());
+        let condenser = ContextCondenser::new(config.condensation.clone());
+        let cache = Arc::new(ResponseCache::new(false, 10, 60));
+        let upstream = UpstreamClient::new(config.clone(), metrics.clone(), cache.clone());
+
+        let state = Arc::new(AppState {
+            config,
+            metrics,
+            router,
+            condenser,
+            upstream,
+            cache,
+            request_id_counter: AtomicU64::new(1),
+        });
+
+        let app = build_router(state, 1024 * 1024);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+
+        let models = client
+            .get(format!("http://{}/v1/models", addr))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+        assert!(models.headers().get("access-control-allow-origin").is_none());
+
+        let preflight = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{}/v1/chat/completions", addr),
+            )
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert!(preflight.headers().get("access-control-allow-origin").is_none());
     }
 }

@@ -369,10 +369,7 @@ impl UpstreamClient {
                                     warn!(req_id = req_id, error = %err, "Failed reading local response body");
                                     return (
                                         StatusCode::BAD_GATEWAY,
-                                        [
-                                            ("access-control-allow-origin", "*"),
-                                            ("content-type", "application/json"),
-                                        ],
+                                        [("content-type", "application/json")],
                                         serde_json::json!({
                                             "error": {
                                                 "message": format!("Failed reading upstream response body: {}", err),
@@ -443,7 +440,6 @@ impl UpstreamClient {
                             return (
                                 err_status,
                                 [
-                                    ("access-control-allow-origin", "*"),
                                     ("content-type", "application/json"),
                                     ("x-ferry-provider", "local"),
                                     ("x-ferry-failover", "false"),
@@ -506,7 +502,6 @@ impl UpstreamClient {
                             return (
                                 err_status,
                                 [
-                                    ("access-control-allow-origin", "*"),
                                     ("content-type", "application/json"),
                                     ("x-ferry-provider", "local"),
                                     ("x-ferry-failover", "false"),
@@ -554,7 +549,6 @@ impl UpstreamClient {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         [
-                            ("access-control-allow-origin", "*"),
                             ("content-type", "application/json"),
                             ("x-ferry-provider", "local"),
                             ("x-ferry-failover", "false"),
@@ -632,7 +626,6 @@ impl UpstreamClient {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 [
-                    ("access-control-allow-origin", "*"),
                     ("content-type", "application/json"),
                     ("x-ferry-provider", "local"),
                     ("x-ferry-failover", "false"),
@@ -777,10 +770,7 @@ impl UpstreamClient {
                 }
                 (
                     StatusCode::BAD_GATEWAY,
-                    [
-                        ("access-control-allow-origin", "*"),
-                        ("content-type", "application/json"),
-                    ],
+                    [("content-type", "application/json")],
                     serde_json::json!({ "error": format!("Cloud upstream failed: {}", err) }).to_string(),
                 )
                     .into_response()
@@ -957,11 +947,6 @@ impl UpstreamClient {
             }
         }
 
-        // Always ensure universal CORS headers so browser-based clients (OpenWebUI, dashboards) are never blocked
-        headers.insert(HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*"));
-        headers.insert(HeaderName::from_static("access-control-allow-methods"), HeaderValue::from_static("GET, POST, OPTIONS"));
-        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms, x-ferry-session-id, x-session-id, x-agent-id"));
-
         // Observability headers
         headers.insert(HeaderName::from_static("x-ferry-provider"), HeaderValue::from_static(meta.provider));
         if let Ok(val) = HeaderValue::from_str(&meta.model) {
@@ -999,11 +984,6 @@ impl UpstreamClient {
                 headers.insert(HeaderName::from_static("x-ferry-session-id"), val);
             }
         }
-
-        headers.insert(
-            HeaderName::from_static("access-control-expose-headers"),
-            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache, x-ferry-slot, x-ferry-affinity, x-ferry-session-id"),
-        );
 
         headers
     }
@@ -1043,10 +1023,7 @@ impl UpstreamClient {
                     warn!(error = %err, "Failed reading upstream response body; skipping cache");
                     return (
                         StatusCode::BAD_GATEWAY,
-                        [
-                            ("access-control-allow-origin", "*"),
-                            ("content-type", "application/json"),
-                        ],
+                        [("content-type", "application/json")],
                         serde_json::json!({
                             "error": {
                                 "message": format!("Failed reading upstream response body: {}", err),
@@ -1198,7 +1175,6 @@ impl UpstreamClient {
                     return (
                         out_status,
                         [
-                            ("access-control-allow-origin", "*"),
                             ("content-type", "application/json"),
                             ("x-ferry-provider", "local"),
                             ("x-ferry-failover", "false"),
@@ -1245,7 +1221,6 @@ impl UpstreamClient {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         [
-                            ("access-control-allow-origin", "*"),
                             ("content-type", "application/json"),
                             ("x-ferry-provider", "local"),
                             ("x-ferry-failover", "false"),
@@ -1377,9 +1352,6 @@ impl UpstreamClient {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        headers.insert(HeaderName::from_static("access-control-allow-origin"), HeaderValue::from_static("*"));
-        headers.insert(HeaderName::from_static("access-control-allow-methods"), HeaderValue::from_static("GET, POST, OPTIONS"));
-        headers.insert(HeaderName::from_static("access-control-allow-headers"), HeaderValue::from_static("content-type, authorization, x-ferry-condense, x-ferry-route, x-ferry-cache, x-ferry-queue-timeout-ms, x-ferry-wait-ms, x-ferry-session-id, x-session-id, x-agent-id"));
         headers.insert(HeaderName::from_static("x-ferry-provider"), HeaderValue::from_static(meta.provider));
         if let Ok(val) = HeaderValue::from_str(&meta.model) {
             headers.insert(HeaderName::from_static("x-ferry-model"), val);
@@ -1408,11 +1380,6 @@ impl UpstreamClient {
                 headers.insert(HeaderName::from_static("x-ferry-session-id"), val);
             }
         }
-        headers.insert(
-            HeaderName::from_static("access-control-expose-headers"),
-            HeaderValue::from_static("x-ferry-provider, x-ferry-model, x-ferry-est-tokens, x-ferry-chars-saved, x-ferry-savings-percent, x-ferry-duration-ms, x-ferry-failover, x-ferry-cache, x-ferry-slot, x-ferry-affinity, x-ferry-session-id"),
-        );
-
         let receiver_stream = ReceiverStream::new(rx);
         (StatusCode::OK, headers, Body::from_stream(receiver_stream)).into_response()
     }
